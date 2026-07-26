@@ -5,6 +5,7 @@
  *   read    -> read a file from the MEMFS
  *   write   -> create/overwrite a file in the MEMFS
  *   edit    -> exact string replacements in a MEMFS file
+ *   download -> save a MEMFS file through the browser
  *   git     -> local Dulwich repositories + GitHub API synchronization
  *   image   -> display an image file from the MEMFS
  *   html    -> display an HTML file in a sandboxed browser popout
@@ -28,6 +29,7 @@ import {
   createGitTool,
   type GitHubCredentials,
 } from "./git-tool.ts";
+import { downloadPyodideFile } from "./file-transfer.ts";
 
 const MAX_READ_LINES = 2000;
 const MAX_READ_BYTES = 50_000;
@@ -67,6 +69,12 @@ const EditParams = Type.Object({
     }),
     { description: "One or more exact replacements to apply in order." },
   ),
+});
+
+const DownloadParams = Type.Object({
+  path: Type.String({
+    description: "File in the in-browser filesystem to save through the browser.",
+  }),
 });
 
 const FetchParams = Type.Object({
@@ -114,6 +122,11 @@ export interface WriteDetails {
 export interface EditDetails {
   path: string;
   edits: number;
+}
+export interface DownloadDetails {
+  path: string;
+  name: string;
+  bytes: number;
 }
 export interface ImageDetails {
   path: string;
@@ -325,6 +338,28 @@ export function createEditTool(py: Pyodide): AgentTool<typeof EditParams, EditDe
   };
 }
 
+export function createDownloadTool(
+  py: Pyodide,
+): AgentTool<typeof DownloadParams, DownloadDetails> {
+  return {
+    name: "download",
+    label: "Download",
+    description:
+      "Save one file from the in-browser Pyodide filesystem to the user's browser downloads. " +
+      "Use this only when the user asks to download or save a generated file locally. " +
+      "Directories are not supported.",
+    parameters: DownloadParams,
+    executionMode: "sequential",
+    async execute(_id, params) {
+      const result = downloadPyodideFile(py, params.path);
+      return {
+        content: [text(`Started browser download: ${result.name}\n`)],
+        details: result,
+      };
+    },
+  };
+}
+
 /* -------------------------------- fetch ------------------------------- */
 
 export interface FetchDetails {
@@ -467,6 +502,7 @@ export function createAllTools(
     createReadTool(py),
     createWriteTool(py),
     createEditTool(py),
+    createDownloadTool(py),
     createGitTool(py, getGitHubCredentials),
     createFetchTool(py),
     createImageTool(py),

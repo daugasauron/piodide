@@ -43,6 +43,13 @@ import {
   verifyGitHubCredentials,
   type GitHubCredentials,
 } from "./git-tool.ts";
+import {
+  downloadPyodideFile,
+  pickHostFiles,
+  resolveUploadDirectory,
+  uploadConflicts,
+  uploadHostFiles,
+} from "./file-transfer.ts";
 
 /* ------------------------------------------------------------------ */
 /* system prompt                                                       */
@@ -55,6 +62,7 @@ Tools:
 - read: read a text file with line numbers; offset (1-based) and limit paginate large files.
 - write: create or overwrite a file; parent directories are created automatically.
 - edit: apply exact, unique string replacements (each oldText must match exactly once).
+- download: save one file from Pyodide to the user's browser downloads. Call it only when the user asks to download or save a file locally.
 - git: use a real Dulwich Git repository in /home/web for init/status/add/commit/log/diff. GitHub clone/pull/push use its browser-compatible API; private access is registered by the user with /github and is never visible to you. The remote adapter synchronizes committed snapshots, so commit before push and push before pull.
 - fetch: fetch a URL via the browser's native fetch (CORS-limited); set path to save a binary response in /home/web. Saving a file does not display it.
 - image: display a PNG, JPEG, GIF, or WebP file from /home/web directly in the terminal. This is the only display path; call it exactly once.
@@ -63,6 +71,7 @@ Tools:
 Environment and memory constraints:
 - Pyodide, Python objects, loaded packages, and MEMFS files all consume the page's WebAssembly memory. It can grow toward a hard wasm32 ceiling of about 4 GB and cannot be safely recovered after exhaustion.
 - The runtime and filesystem persist for this page only. A refresh destroys them. There are no subprocesses, native host commands, or host files.
+- The user can import host files with /upload [directory]. This opens a browser file picker and cannot be initiated by you; tell the user to run it when host input is needed.
 - Git metadata is local to MEMFS. GitHub tokens live only in browser page memory; never ask the user to reveal a token in chat or write one into a file, URL, command, or tool argument.
 - Never create unbounded lists, arrays, recursion, exhaustive Cartesian products, or whole-file/network copies when a bounded or streaming approach works.
 - Estimate memory before large work. Avoid any single allocation above roughly 128 MB or total planned working data above roughly 512 MB unless the user explicitly requires it and accepts the risk.
@@ -105,6 +114,8 @@ const COMMANDS: readonly CommandSuggestion[] = [
   { name: "/copy", description: "copy the last assistant message" },
   { name: "/export", description: "download the current session as JSON" },
   { name: "/thinking", description: "select model thinking level" },
+  { name: "/download", description: "save a Pyodide file to the host" },
+  { name: "/upload", description: "import host files into /home/web" },
   { name: "/image", description: "display an image file from /home/web" },
   { name: "/html", description: "open an HTML file from /home/web" },
   { name: "/nvim", description: "open Neovim (Ctrl+Shift+E)" },
@@ -611,6 +622,48 @@ function downloadSession() {
   URL.revokeObjectURL(link.href);
 }
 
+async function uploadFromHost(directoryArg: string) {
+  if (!pyReady || !py) throw new Error("Python filesystem is still loading.");
+  const directory = resolveUploadDirectory(py, directoryArg || undefined);
+  prompt.setBusy(true);
+  let files: File[];
+  try {
+    files = await pickHostFiles();
+  } finally {
+    prompt.setBusy(false);
+  }
+  if (files.length === 0) {
+    say(yellow("  upload cancelled"));
+    return;
+  }
+
+  const conflicts = uploadConflicts(py, directory, files);
+  let overwrite = false;
+  if (conflicts.length > 0) {
+    const answer = await prompt.ask(
+      `  ${conflicts.length} file${conflicts.length === 1 ? "" : "s"} already exist. Overwrite? [y/N] `,
+    );
+    overwrite = /^(y|yes)$/i.test(answer.trim());
+  }
+  const result = await uploadHostFiles(py, directory, files, overwrite);
+  if (result.paths.length > 0) {
+    const destination =
+      result.paths.length === 1 ? result.paths[0] : `${result.directory}/`;
+    say(
+      green(
+        `  ◆ uploaded ${result.paths.length} file${result.paths.length === 1 ? "" : "s"} · ${result.bytes} bytes → ${destination}`,
+      ),
+    );
+  }
+  if (result.skipped.length > 0) {
+    say(
+      yellow(
+        `  skipped ${result.skipped.length} existing file${result.skipped.length === 1 ? "" : "s"}`,
+      ),
+    );
+  }
+}
+
 async function runSlash(input: string) {
   const parts = input.slice(1).split(/\s+/);
   const cmd = parts[0].toLowerCase();
@@ -623,6 +676,7 @@ async function runSlash(input: string) {
       say(dim("  /new  /tree  /resume  /fork  /clone     page-local sessions"));
       say(dim("  /name  /session  /copy  /export          session utilities"));
       say(dim("  /thinking [level]                         model effort (Shift+Tab cycles)"));
+      say(dim("  /download <path>  /upload [directory]      host file transfer"));
       say(dim("  /image <path>  /html <path>                browser previews"));
       say(dim("  /nvim                                      open Neovim editor"));
       say(dim("  /status  /clear  /hotkeys                  terminal utilities"));
@@ -817,6 +871,22 @@ async function runSlash(input: string) {
     case "export":
       downloadSession();
       say(green("  ◆ downloaded current session JSON"));
+      break;
+
+    case "download": {
+      if (!pyReady || !py) {
+        say(yellow("  python filesystem is still loading"));
+      } else if (!arg) {
+        say(yellow("  usage: /download <path>"));
+      } else {
+        const result = downloadPyodideFile(py, arg);
+        say(green(`  ◆ downloading ${result.path} · ${result.bytes} bytes`));
+      }
+      break;
+    }
+
+    case "upload":
+      await uploadFromHost(arg);
       break;
 
     case "thinking": {
@@ -1063,6 +1133,7 @@ async function renderEvent(event: AgentEvent) {
           case "read": footer = `  ↳ read ${d.lines ?? 0} lines${d.path ? ` · ${d.path}` : ""}`; break;
           case "write": footer = `  ↳ wrote ${d.bytes ?? 0} bytes${d.path ? ` · ${d.path}` : ""}`; break;
           case "edit": footer = `  ↳ edited${d.path ? ` · ${d.path}` : ""} (${d.edits ?? 0})`; break;
+          case "download": footer = `  ↳ download · ${d.bytes ?? 0} bytes${d.path ? ` · ${d.path}` : ""}`; break;
           case "git": footer = `  ↳ git ${d.operation ?? "done"}${d.cwd ? ` · ${d.cwd}` : ""}`; break;
           case "fetch": footer = `  ↳ fetch · HTTP ${d.status ?? "?"} · ${d.bytes ?? 0} bytes`; break;
           case "image": footer = `  ↳ image · ${d.bytes ?? 0} bytes${d.path ? ` · ${d.path}` : ""}`; break;
@@ -1134,6 +1205,12 @@ all the way to \`/\`, Enter to open a file or directory, \`%\` to create a file,
 The agent's \`git\` tool uses Dulwich for local repositories. GitHub
 clone/pull/push use a browser-compatible snapshot transport; register private
 access for the current page with \`/github\`.
+
+## Host files
+
+Run \`/upload\` to import files from the host into \`/home/web\`. Run
+\`/download <path>\`, or ask the agent to download a file, to save it through
+the browser.
 `,
   );
   fsWriteText(
