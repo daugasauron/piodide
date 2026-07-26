@@ -1,9 +1,14 @@
 # piodide
 
-A vibe-coded proof of concept combining [pi agent](https://github.com/badlogic/pi-mono),
-[ghostty-web](https://github.com/NimbleMarkets/ghostty-web), and
-[Pyodide](https://pyodide.org). The terminal, agent, Python runtime, and
-filesystem all run in the browser.
+*Entirely vibe coded POC*
+
+The idea is simple, run pi agent in the browser and replace bash with pyodide (python in wasm).
+
+Added some extra tools (neovim, github integration), tricky part is integrating stuff with pyodide file system.
+
+Ghostty-web terminal (also wasm).
+
+Surprisingly powerful.
 
 ![piodide terminal](screens/startup.png)
 
