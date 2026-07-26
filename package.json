@@ -1,0 +1,25 @@
+{
+  "name": "piodide",
+  "private": true,
+  "version": "0.0.0",
+  "type": "module",
+  "scripts": {
+    "predev": "node scripts/copy-wasm.mjs",
+    "dev": "vite",
+    "prebuild": "node scripts/copy-wasm.mjs",
+    "build": "tsc && vite build",
+    "preview": "vite preview"
+  },
+  "devDependencies": {
+    "typescript": "~6.0.2",
+    "vite": "^8.1.1"
+  },
+  "dependencies": {
+    "@earendil-works/pi-agent-core": "^0.81.1",
+    "@earendil-works/pi-ai": "^0.81.1",
+    "ghostty-web": "https://github.com/NimbleMarkets/ghostty-web/archive/20b270562b6829dc05d3478b7c83feb2a3054713.tar.gz",
+    "markdansi": "^0.3.2",
+    "string-width": "^8.2.2",
+    "typebox": "^1.1.38"
+  }
+}

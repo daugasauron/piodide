@@ -1,0 +1,38 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>piodide</title>
+  </head>
+  <body>
+    <div id="terminal"></div>
+    <div id="command-menu" hidden></div>
+    <div id="html-preview" hidden>
+      <section class="html-preview-window" role="dialog" aria-modal="true" aria-labelledby="html-preview-title">
+        <header class="html-preview-header">
+          <span id="html-preview-title">HTML preview</span>
+          <button id="html-preview-close" type="button" aria-label="Close HTML preview">Close</button>
+        </header>
+        <iframe
+          id="html-preview-frame"
+          title="Generated HTML preview"
+          sandbox="allow-scripts allow-forms allow-downloads"
+          referrerpolicy="no-referrer"
+        ></iframe>
+      </section>
+    </div>
+    <footer id="footer" aria-label="Session status">
+      <div class="footer-row">
+        <span id="footer-location">/home/web (no model)</span>
+        <span id="footer-heap">heap loading</span>
+      </div>
+      <div class="footer-row">
+        <span id="footer-usage">↑0 ↓0 R0 CH— 0%/200k (off)</span>
+        <span id="footer-model">(no provider) —</span>
+      </div>
+    </footer>
+    <div id="status" hidden></div>
+    <script type="module" src="/src/main.ts"></script>
+  </body>
+</html>

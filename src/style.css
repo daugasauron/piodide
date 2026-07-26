@@ -1,0 +1,201 @@
+@font-face {
+  font-family: "IosevkaTerm Nerd Font";
+  src: url("/fonts/IosevkaTermNerdFont-Regular.woff2") format("woff2");
+  font-style: normal;
+  font-weight: 400;
+  font-display: block;
+}
+
+html,
+body {
+  --footer-height: 40px;
+  margin: 0;
+  height: 100%;
+  background: #0b0c10;
+  overflow: hidden;
+}
+
+body {
+  box-sizing: border-box;
+  padding: 8px;
+}
+
+#terminal {
+  width: 100%;
+  height: calc(100% - var(--footer-height));
+}
+
+#terminal canvas {
+  display: block;
+}
+
+#footer {
+  box-sizing: border-box;
+  height: var(--footer-height);
+  padding: 2px 8px;
+  border-top: 1px solid #283457;
+  background: #11131a;
+  color: #7f849c;
+  font: 12px/17px "IosevkaTerm Nerd Font", monospace;
+  white-space: nowrap;
+  user-select: text;
+}
+
+.footer-row {
+  display: flex;
+  min-width: 0;
+  justify-content: space-between;
+  gap: 16px;
+}
+
+.footer-row > span {
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+#footer-location,
+#footer-usage {
+  color: #a9b1d6;
+}
+
+#footer-heap {
+  color: #9ece6a;
+}
+
+#footer-model {
+  color: #7dcfff;
+  text-align: right;
+}
+
+#command-menu {
+  position: fixed;
+  z-index: 10;
+  left: 20px;
+  bottom: calc(var(--footer-height) + 16px);
+  box-sizing: border-box;
+  width: min(560px, calc(100vw - 40px));
+  max-height: min(280px, calc(100vh - var(--footer-height) - 40px));
+  overflow: hidden;
+  padding: 5px;
+  border: 1px solid #414868;
+  border-radius: 5px;
+  background: #15161e;
+  box-shadow: 0 8px 24px rgb(0 0 0 / 45%);
+  color: #a9b1d6;
+  font: 13px/20px "IosevkaTerm Nerd Font", monospace;
+}
+
+#command-menu[hidden] {
+  display: none;
+}
+
+.command-option {
+  display: flex;
+  gap: 14px;
+  padding: 1px 6px;
+  border-radius: 3px;
+}
+
+.command-option.selected {
+  background: #283457;
+  color: #c0caf5;
+}
+
+.command-name {
+  flex: 0 0 12ch;
+  color: #bb9af7;
+}
+
+.command-description {
+  overflow: hidden;
+  color: #7f849c;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.command-help {
+  padding: 2px 6px 0;
+  color: #565f89;
+}
+
+#html-preview {
+  position: fixed;
+  z-index: 20;
+  inset: 0;
+  display: grid;
+  place-items: center;
+  box-sizing: border-box;
+  padding: 24px;
+  background: rgb(0 0 0 / 68%);
+}
+
+#html-preview[hidden] {
+  display: none;
+}
+
+.html-preview-window {
+  display: flex;
+  width: min(1200px, 94vw);
+  height: min(860px, 90vh);
+  overflow: hidden;
+  flex-direction: column;
+  border: 1px solid #414868;
+  border-radius: 7px;
+  background: #fff;
+  box-shadow: 0 18px 60px rgb(0 0 0 / 65%);
+}
+
+.html-preview-header {
+  display: flex;
+  min-height: 38px;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  box-sizing: border-box;
+  padding: 5px 7px 5px 12px;
+  border-bottom: 1px solid #283457;
+  background: #15161e;
+  color: #a9b1d6;
+  font: 13px/20px "IosevkaTerm Nerd Font", monospace;
+}
+
+#html-preview-title {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+#html-preview-close {
+  padding: 2px 10px;
+  border: 1px solid #565f89;
+  border-radius: 4px;
+  background: #24283b;
+  color: #c0caf5;
+  font: inherit;
+  cursor: pointer;
+}
+
+#html-preview-close:hover,
+#html-preview-close:focus-visible {
+  border-color: #7aa2f7;
+  outline: none;
+}
+
+#html-preview-frame {
+  width: 100%;
+  min-height: 0;
+  flex: 1;
+  border: 0;
+  background: #fff;
+}
+
+@media (max-width: 640px) {
+  #html-preview {
+    padding: 8px;
+  }
+
+  .html-preview-window {
+    width: 100%;
+    height: 100%;
+  }
+}
