@@ -307,6 +307,11 @@ export class PromptLine {
     if (b) this.hideCommandPopup();
   }
 
+  /** True while switching views would strand an active run or modal prompt. */
+  isOccupied() {
+    return this.busy || this.resolveRead !== null || this.selection !== null;
+  }
+
   /** Draw a fresh, empty prompt at the current cursor (assumed at col 0). */
   start() {
     this.prefix = CHEVRON;

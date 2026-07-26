@@ -37,6 +37,12 @@ import {
   type ProviderDef,
 } from "./providers.ts";
 import { createAllTools, createHtmlTool, createImageTool } from "./tools.ts";
+import type { NeovimController } from "./neovim.ts";
+import {
+  normalizeGitLabBaseUrl,
+  verifyGitLabCredentials,
+  type GitLabCredentials,
+} from "./git-tool.ts";
 
 /* ------------------------------------------------------------------ */
 /* system prompt                                                       */
@@ -49,6 +55,7 @@ Tools:
 - read: read a text file with line numbers; offset (1-based) and limit paginate large files.
 - write: create or overwrite a file; parent directories are created automatically.
 - edit: apply exact, unique string replacements (each oldText must match exactly once).
+- git: use a real Dulwich Git repository in /home/web for init/status/add/commit/log/diff. GitLab clone/pull/push use the browser-compatible GitLab API; private access is registered by the user with /gitlab and is never visible to you. The remote adapter synchronizes committed snapshots, so commit before push and push before pull.
 - fetch: fetch a URL via the browser's native fetch (CORS-limited); set path to save a binary response in /home/web. Saving a file does not display it.
 - image: display a PNG, JPEG, GIF, or WebP file from /home/web directly in the terminal. This is the only display path; call it exactly once.
 - html: open a self-contained HTML file from /home/web in a closeable browser preview. Write one file with inline CSS and JavaScript, then call html exactly once; relative MEMFS assets are not available inside the preview.
@@ -56,6 +63,7 @@ Tools:
 Environment and memory constraints:
 - Pyodide, Python objects, loaded packages, and MEMFS files all consume the page's WebAssembly memory. It can grow toward a hard wasm32 ceiling of about 4 GB and cannot be safely recovered after exhaustion.
 - The runtime and filesystem persist for this page only. A refresh destroys them. There are no subprocesses, native host commands, or host files.
+- Git metadata is local to MEMFS. GitLab tokens live only in browser page memory; never ask the user to reveal a token in chat or write one into a file, URL, command, or tool argument.
 - Never create unbounded lists, arrays, recursion, exhaustive Cartesian products, or whole-file/network copies when a bounded or streaming approach works.
 - Estimate memory before large work. Avoid any single allocation above roughly 128 MB or total planned working data above roughly 512 MB unless the user explicitly requires it and accepts the risk.
 - Process large inputs incrementally, sample first, cap iteration counts and output, and keep generated files small. Do not print huge datasets.
@@ -75,7 +83,8 @@ const BANNER = [
   "\x1b[35m❯\x1b[0m \x1b[1mpiodide\x1b[0m — pi in the browser",
   "\x1b[2mghostty-web · pyodide · pi-agent-core\x1b[0m",
   "",
-  "\x1b[2mCommands:\x1b[0m  /provider   /model   /new   /tree   /thinking   /help",
+  "\x1b[2mCommands:\x1b[0m  /provider   /model   /gitlab   /new   /tree   /thinking   /nvim   /help",
+  "\x1b[2mEditor:\x1b[0m    Ctrl+Shift+E toggles agent ↔ Neovim",
   "\x1b[2mStart with:\x1b[0m /provider  →  choose one  →  /login  →  then just type.",
   "",
 ].join("\r\n");
@@ -85,6 +94,7 @@ const COMMANDS: readonly CommandSuggestion[] = [
   { name: "/model", description: "choose the active model" },
   { name: "/login", description: "set the provider API key" },
   { name: "/logout", description: "remove the current provider API key" },
+  { name: "/gitlab", description: "register a session-only GitLab access token" },
   { name: "/new", description: "start a new page-local session" },
   { name: "/tree", description: "navigate page-local session branches" },
   { name: "/resume", description: "resume another page-local session" },
@@ -97,6 +107,7 @@ const COMMANDS: readonly CommandSuggestion[] = [
   { name: "/thinking", description: "select model thinking level" },
   { name: "/image", description: "display an image file from /home/web" },
   { name: "/html", description: "open an HTML file from /home/web" },
+  { name: "/nvim", description: "open Neovim (Ctrl+Shift+E)" },
   { name: "/hotkeys", description: "show keyboard shortcuts" },
   { name: "/settings", description: "show current browser settings" },
   { name: "/status", description: "show detailed session status" },
@@ -109,6 +120,11 @@ const COMMANDS: readonly CommandSuggestion[] = [
 /* ------------------------------------------------------------------ */
 
 const mount = document.getElementById("terminal") as HTMLElement;
+const agentViewEl = document.getElementById("agent-view") as HTMLElement;
+const neovimViewEl = document.getElementById("neovim-view") as HTMLElement;
+const neovimEditorEl = document.getElementById("neovim-editor") as HTMLElement;
+const neovimCommandlineEl = document.getElementById("neovim-commandline") as HTMLElement;
+const neovimStatusEl = document.getElementById("neovim-status") as HTMLElement;
 const commandMenuEl = document.getElementById("command-menu") as HTMLElement;
 const htmlPreviewEl = document.getElementById("html-preview") as HTMLElement;
 const htmlPreviewTitleEl = document.getElementById("html-preview-title") as HTMLElement;
@@ -129,9 +145,14 @@ let spinner!: Spinner;
 let agent: Agent | null = null;
 let py: Pyodide | null = null;
 let pyReady = false;
+let activeView: "agent" | "nvim" = "agent";
+let neovim: NeovimController | null = null;
+let neovimStarting: Promise<NeovimController> | null = null;
+let viewToggleRunning = false;
 
 let provider: ProviderDef | null = null;
 const apiKeys = new Map<string, string>();
+let gitLabCredentials: GitLabCredentials | null = null;
 let modelOverride: string | null = null;
 const sessions = new BrowserSessions();
 
@@ -173,8 +194,21 @@ document.addEventListener("keydown", (event) => {
   if (event.key === "Escape" && !htmlPreviewEl.hidden) {
     event.preventDefault();
     closeHtmlPreview();
+    return;
   }
-});
+  if (
+    htmlPreviewEl.hidden &&
+    event.ctrlKey &&
+    event.shiftKey &&
+    !event.altKey &&
+    !event.metaKey &&
+    event.code === "KeyE"
+  ) {
+    event.preventDefault();
+    event.stopImmediatePropagation();
+    void toggleNeovim();
+  }
+}, true);
 
 function currentModelId() {
   return modelOverride ?? provider?.defaultModel ?? "";
@@ -202,7 +236,8 @@ function renderFooter() {
   const cacheTotal = usage.input + usage.cacheRead;
   const cacheHit = cacheTotal > 0 ? `${((usage.cacheRead / cacheTotal) * 100).toFixed(1)}%` : "—";
 
-  footerLocationEl.textContent = `/home/web (${model})`;
+  footerLocationEl.textContent =
+    activeView === "nvim" ? "/home/web (nvim)" : `/home/web (${model})`;
   footerHeapEl.textContent = `heap ${currentHeapUsage()}`;
   footerUsageEl.textContent =
     `↑${formatTokenCount(usage.input)} ↓${formatTokenCount(usage.output)} ` +
@@ -317,6 +352,101 @@ function cycleThinkingLevel() {
 }
 
 /* ------------------------------------------------------------------ */
+/* Neovim view                                                        */
+/* ------------------------------------------------------------------ */
+
+function setNeovimStatus(message: string, warning = false) {
+  neovimStatusEl.textContent = message.replace(/\s+/g, " ").trim();
+  neovimStatusEl.classList.toggle("warning", warning);
+}
+
+async function getNeovim(): Promise<NeovimController> {
+  if (neovim) return neovim;
+  if (!py) throw new Error("Python filesystem is not ready.");
+  if (!neovimStarting) {
+    setNeovimStatus("loading Neovim WASM…");
+    neovimStarting = import("./neovim.ts")
+      .then(({ createNeovimController }) =>
+        createNeovimController(
+          py!,
+          neovimEditorEl,
+          neovimCommandlineEl,
+          setNeovimStatus,
+        ),
+      )
+      .then((controller) => {
+        neovim = controller;
+        return controller;
+      })
+      .finally(() => {
+        neovimStarting = null;
+      });
+  }
+  return neovimStarting;
+}
+
+async function toggleNeovim() {
+  if (viewToggleRunning) return;
+  if (activeView === "agent" && (!pyReady || !py)) {
+    footerLocationEl.textContent = "Neovim will be available when Python is ready";
+    window.setTimeout(renderFooter, 1500);
+    return;
+  }
+  if (activeView === "agent" && prompt.isOccupied()) {
+    footerLocationEl.textContent = "Finish the current run or menu before opening Neovim";
+    window.setTimeout(renderFooter, 1500);
+    return;
+  }
+
+  viewToggleRunning = true;
+  try {
+    if (activeView === "agent") {
+      activeView = "nvim";
+      agentViewEl.hidden = true;
+      neovimViewEl.hidden = false;
+      renderFooter();
+
+      const alreadyRunning = neovim !== null;
+      const controller = await getNeovim();
+      if (alreadyRunning) {
+        setNeovimStatus("syncing from /home/web…");
+        setNeovimStatus(await controller.syncFromPyodide());
+      }
+      requestAnimationFrame(() => controller.focus());
+      return;
+    }
+
+    if (neovim) {
+      setNeovimStatus("saving to /home/web…");
+      try {
+        setNeovimStatus(await neovim.syncToPyodide());
+      } catch (error) {
+        setNeovimStatus(
+          `sync failed: ${error instanceof Error ? error.message : String(error)}`,
+          true,
+        );
+        return;
+      }
+    }
+    activeView = "agent";
+    neovimViewEl.hidden = true;
+    agentViewEl.hidden = false;
+    renderFooter();
+    requestAnimationFrame(() => {
+      handle.fit.fit();
+      handle.term.focus();
+    });
+  } catch (error) {
+    setNeovimStatus(
+      `failed: ${error instanceof Error ? error.message : String(error)}`,
+      true,
+    );
+  } finally {
+    viewToggleRunning = false;
+  }
+}
+
+/* ------------------------------------------------------------------ */
 /* input dispatch                                                      */
 /* ------------------------------------------------------------------ */
 
@@ -397,6 +527,7 @@ function showStatus() {
   const lines = [
     `  python : ${pyReady ? green("ready") : yellow("loading…")}`,
     `  heap   : ${pyReady ? currentHeapUsage() : dim("unavailable")}`,
+    `  view   : ${activeView}${neovim ? " · Neovim loaded" : ""}`,
     `  provider: ${
       provider
         ? `${provider.label} (${agent?.state.model.api ?? provider.api})`
@@ -405,6 +536,11 @@ function showStatus() {
     `  model  : ${currentModelId() || dim("(none)")}`,
     `  thinking: ${agent?.state.thinkingLevel ?? "off"}`,
     `  key    : ${currentApiKey() ? green("set") : dim("(none — /login)")}`,
+    `  gitlab : ${
+      gitLabCredentials
+        ? `${green("connected")} · ${gitLabCredentials.username}@${gitLabCredentials.baseUrl}`
+        : dim("(none — /gitlab)")
+    }`,
   ];
   for (const line of lines) say(line);
 }
@@ -483,10 +619,12 @@ async function runSlash(input: string) {
   switch (cmd) {
     case "help":
       say(dim("  /provider  /model  /login  /logout       provider configuration"));
+      say(dim("  /gitlab [url|status|logout]               session-only GitLab access"));
       say(dim("  /new  /tree  /resume  /fork  /clone     page-local sessions"));
       say(dim("  /name  /session  /copy  /export          session utilities"));
       say(dim("  /thinking [level]                         model effort (Shift+Tab cycles)"));
       say(dim("  /image <path>  /html <path>                browser previews"));
+      say(dim("  /nvim                                      open Neovim editor"));
       say(dim("  /status  /clear  /hotkeys                  terminal utilities"));
       break;
 
@@ -558,6 +696,42 @@ async function runSlash(input: string) {
         say(green(`  ◆ key removed for ${provider.label}`));
       }
       break;
+
+    case "gitlab": {
+      if (arg.toLowerCase() === "logout") {
+        gitLabCredentials = null;
+        say(green("  ◆ GitLab token removed"));
+        break;
+      }
+      if (arg.toLowerCase() === "status") {
+        if (gitLabCredentials) {
+          say(
+            `  gitlab : ${green("connected")} · ${gitLabCredentials.username}@${gitLabCredentials.baseUrl}`,
+          );
+        } else {
+          say(dim("  gitlab : (none — run /gitlab)"));
+        }
+        break;
+      }
+      const baseUrl = normalizeGitLabBaseUrl(
+        arg || gitLabCredentials?.baseUrl || "https://gitlab.com",
+      );
+      const token = (
+        await prompt.ask(`  GitLab token for ${baseUrl} (api scope for push, hidden): `, true)
+      ).trim();
+      if (!token) {
+        say(yellow("  GitLab login cancelled"));
+        break;
+      }
+      say(dim("  verifying GitLab token…"));
+      gitLabCredentials = await verifyGitLabCredentials(baseUrl, token);
+      say(
+        green(
+          `  ◆ GitLab connected · ${gitLabCredentials.username}@${gitLabCredentials.baseUrl}`,
+        ),
+      );
+      break;
+    }
 
     case "new":
       if (!agent) break;
@@ -695,7 +869,14 @@ async function runSlash(input: string) {
       break;
     }
 
+    case "nvim":
+      // Leave a ready prompt behind for when the terminal view is restored.
+      prompt.start();
+      await toggleNeovim();
+      return;
+
     case "hotkeys":
+      say(dim("  Ctrl+Shift+E  toggle agent / Neovim"));
       say(dim("  Shift+Tab  cycle thinking level"));
       say(dim("  ↑/↓        history or menu selection"));
       say(dim("  Tab        complete selected slash command"));
@@ -735,6 +916,18 @@ function toolCallLabel(name: string, args: unknown): string {
     const url = typeof values.url === "string" ? values.url.replaceAll("\x1b", "\\x1b") : "";
     const maxUrlLength = Math.max(24, Math.min(96, writer.cols - method.length - 14));
     return `${name} ${method}${url ? ` ${truncateText(url, maxUrlLength)}` : ""}`;
+  }
+  if (name === "git") {
+    const operation = typeof values.operation === "string" ? values.operation : "";
+    const target =
+      operation === "clone" && typeof values.project === "string"
+        ? values.project
+        : typeof values.cwd === "string"
+          ? values.cwd
+          : "";
+    return `${name}${operation ? ` ${operation}` : ""}${
+      target ? ` ${truncateText(target, Math.max(24, writer.cols - 18))}` : ""
+    }`;
   }
   if (name !== "python" && typeof values.path === "string") {
     return `${name} ${truncateText(values.path, Math.max(24, writer.cols - name.length - 8))}`;
@@ -867,6 +1060,7 @@ async function renderEvent(event: AgentEvent) {
           case "read": footer = `  ↳ read ${d.lines ?? 0} lines${d.path ? ` · ${d.path}` : ""}`; break;
           case "write": footer = `  ↳ wrote ${d.bytes ?? 0} bytes${d.path ? ` · ${d.path}` : ""}`; break;
           case "edit": footer = `  ↳ edited${d.path ? ` · ${d.path}` : ""} (${d.edits ?? 0})`; break;
+          case "git": footer = `  ↳ git ${d.operation ?? "done"}${d.cwd ? ` · ${d.cwd}` : ""}`; break;
           case "fetch": footer = `  ↳ fetch · HTTP ${d.status ?? "?"} · ${d.bytes ?? 0} bytes`; break;
           case "image": footer = `  ↳ image · ${d.bytes ?? 0} bytes${d.path ? ` · ${d.path}` : ""}`; break;
           case "html": footer = `  ↳ html · ${d.bytes ?? 0} bytes${d.path ? ` · ${d.path}` : ""}`; break;
@@ -912,7 +1106,33 @@ async function renderEvent(event: AgentEvent) {
 /* ------------------------------------------------------------------ */
 
 function seedWelcome(p: Pyodide) {
-  fsWriteText(p, "/home/web/README.md", "# piodide\nIn-browser Python sandbox. Try the python tool.\n");
+  fsWriteText(
+    p,
+    "/home/web/README.md",
+    `# piodide workspace
+
+This is the shared in-browser filesystem. Python, the agent tools, Git, and
+Neovim all read and write these same files under \`/home/web\`. Everything is
+held in memory and disappears when the page is refreshed.
+
+## Neovim
+
+Press \`Ctrl+Shift+E\` (or run \`/nvim\`) to toggle between the agent and
+Neovim. Neovim itself runs as WebAssembly; its editor buffers are synchronized
+with Pyodide whenever the view changes.
+
+Run \`:Ex\` to browse the actual Pyodide filesystem. The explorer header shows
+Neovim's working directory and the full directory path. Use \`..\` to navigate
+all the way to \`/\`, Enter to open a file or directory, \`%\` to create a file,
+\`d\` to create a directory, and \`D\` to delete an entry.
+
+## Git
+
+The agent's \`git\` tool uses Dulwich for local repositories. GitLab
+clone/pull/push use a browser-compatible snapshot transport; register private
+access for the current page with \`/gitlab\`.
+`,
+  );
   fsWriteText(
     p,
     "/home/web/demo.py",
@@ -956,7 +1176,7 @@ async function main() {
           systemPrompt: SYSTEM_PROMPT,
           model: makeModel({ baseUrl: "", modelId: "", api: "openai-completions", provider: "none" }),
           thinkingLevel: "off",
-          tools: createAllTools(p),
+          tools: createAllTools(p, () => gitLabCredentials),
           messages: [],
         },
         streamFn: streamDispatch,
@@ -983,6 +1203,13 @@ async function main() {
           term,
           writer,
           run: (text: string) => handleSubmit(text),
+          toggleEditor: () => toggleNeovim(),
+          get neovim() {
+            return neovim;
+          },
+          get view() {
+            return activeView;
+          },
           get heap() {
             return currentHeapUsage();
           },

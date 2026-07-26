@@ -3,6 +3,12 @@ import { defineConfig } from "vite";
 
 export default defineConfig({
   base: "/piodide/",
+  optimizeDeps: {
+    exclude: [
+      "@monaco-neovim-wasm/lib",
+      "@monaco-neovim-wasm/wasm-async",
+    ],
+  },
   resolve: {
     alias: {
       // markdansi's detector publishes this browser entry through the legacy

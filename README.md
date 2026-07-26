@@ -19,7 +19,8 @@ npm run dev
 ```
 
 Open http://localhost:5173, then use `/provider`, `/login`, and `/model`.
-Typing `/` shows the available commands.
+Typing `/` shows the available commands. Press `Ctrl+Shift+E` to toggle Neovim;
+`:Ex` browses the same `/home/web` files used by the agent and Python.
 
 ## Agent tools
 
@@ -28,11 +29,13 @@ Typing `/` shows the available commands.
 - `read` — reads text files from `/home/web` with line numbers and pagination.
 - `write` — creates or replaces files in the in-browser filesystem.
 - `edit` — applies exact, unique text replacements to existing files.
+- `git` — uses Dulwich locally; GitLab clone/pull/push use its browser API
+  (`/gitlab` registers a page-local token for private projects).
 - `fetch` — uses browser `fetch` (and its CORS rules), optionally saving the
   response to `/home/web`.
 - `image` — renders a saved PNG, JPEG, GIF, or WebP directly in the terminal
   through Kitty graphics.
 - `html` — opens a self-contained HTML file in a sandboxed, closeable preview.
 
-All tools share the same temporary in-memory filesystem. API keys stay in page
-memory, and refreshing the page clears the runtime and its files.
+All tools share the same temporary in-memory filesystem. API keys and GitLab
+tokens stay in page memory, and refreshing the page clears the runtime and files.

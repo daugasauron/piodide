@@ -15,9 +15,15 @@ export interface PyodideFS {
   mkdirTree(path: string): void;
   readdir(path: string): string[];
   stat(path: string): { mode: number; size: number };
+  lstat(path: string): { mode: number; size: number };
   unlink(path: string): void;
+  rmdir(path: string): void;
+  chmod(path: string, mode: number): void;
+  symlink(target: string, path: string): void;
+  readlink(path: string): string;
   analyzePath(path: string): { exists: boolean };
-  isDir(path: string): boolean;
+  isDir(mode: number): boolean;
+  isLink?(mode: number): boolean;
   chdir(path: string): void;
 }
 
@@ -81,6 +87,16 @@ export async function loadPyodideRuntime(onProgress?: (msg: string) => void): Pr
     // A project directory so paths feel natural.
     py.FS.mkdirTree("/home/web");
     py.FS.chdir("/home/web");
+    // Emscripten creates this empty placeholder home. The app consistently
+    // uses /home/web, so remove it instead of exposing a misleading directory.
+    try {
+      const entries = py.FS
+        .readdir("/home/web_user")
+        .filter((name) => name !== "." && name !== "..");
+      if (entries.length === 0) py.FS.rmdir("/home/web_user");
+    } catch {
+      // Some Pyodide builds do not create it.
+    }
     return py;
   })();
   return pyodidePromise;
@@ -171,7 +187,7 @@ export function fsExists(py: Pyodide, path: string): boolean {
 
 export function fsIsDir(py: Pyodide, path: string): boolean {
   try {
-    return py.FS.isDir(path);
+    return py.FS.isDir(py.FS.stat(path).mode);
   } catch {
     return false;
   }

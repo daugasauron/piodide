@@ -5,6 +5,7 @@
  *   read    -> read a file from the MEMFS
  *   write   -> create/overwrite a file in the MEMFS
  *   edit    -> exact string replacements in a MEMFS file
+ *   git     -> local Dulwich repositories + GitLab API synchronization
  *   image   -> display an image file from the MEMFS
  *   html    -> display an HTML file in a sandboxed browser popout
  *
@@ -23,6 +24,10 @@ import {
   fsWriteText,
   runPythonCapture,
 } from "./pyodide-host.ts";
+import {
+  createGitTool,
+  type GitLabCredentials,
+} from "./git-tool.ts";
 
 const MAX_READ_LINES = 2000;
 const MAX_READ_BYTES = 50_000;
@@ -453,12 +458,16 @@ function byteLength(s: string): number {
 }
 
 export type AnyTool = AgentTool<any, any>;
-export function createAllTools(py: Pyodide): AnyTool[] {
+export function createAllTools(
+  py: Pyodide,
+  getGitLabCredentials: () => GitLabCredentials | null,
+): AnyTool[] {
   return [
     createPythonTool(py),
     createReadTool(py),
     createWriteTool(py),
     createEditTool(py),
+    createGitTool(py, getGitLabCredentials),
     createFetchTool(py),
     createImageTool(py),
     createHtmlTool(py),

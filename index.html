@@ -6,8 +6,19 @@
     <title>piodide</title>
   </head>
   <body>
-    <div id="terminal"></div>
-    <div id="command-menu" hidden></div>
+    <main id="agent-view">
+      <div id="terminal"></div>
+      <div id="command-menu" hidden></div>
+    </main>
+    <main id="neovim-view" hidden>
+      <header id="neovim-toolbar">
+        <span>nvim.wasm</span>
+        <span id="neovim-status">not loaded</span>
+        <span>Ctrl+Shift+E → agent</span>
+      </header>
+      <div id="neovim-editor"></div>
+      <div id="neovim-commandline" aria-live="polite"></div>
+    </main>
     <div id="html-preview" hidden>
       <section class="html-preview-window" role="dialog" aria-modal="true" aria-labelledby="html-preview-title">
         <header class="html-preview-header">

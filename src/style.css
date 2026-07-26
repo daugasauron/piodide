@@ -20,12 +20,89 @@ body {
   padding: 8px;
 }
 
-#terminal {
+#agent-view,
+#neovim-view {
   width: 100%;
   height: calc(100% - var(--footer-height));
 }
 
+#agent-view[hidden],
+#neovim-view[hidden] {
+  display: none;
+}
+
+#terminal {
+  width: 100%;
+  height: 100%;
+}
+
 #terminal canvas {
+  display: block;
+}
+
+#neovim-view {
+  position: relative;
+  display: flex;
+  min-width: 0;
+  overflow: hidden;
+  flex-direction: column;
+  border: 1px solid #283457;
+  background: #1a1b26;
+}
+
+#neovim-toolbar {
+  display: flex;
+  min-height: 28px;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  box-sizing: border-box;
+  padding: 3px 8px;
+  border-bottom: 1px solid #283457;
+  color: #7f849c;
+  font: 12px/20px "IosevkaTerm Nerd Font", monospace;
+  white-space: nowrap;
+}
+
+#neovim-toolbar > :first-child {
+  color: #bb9af7;
+}
+
+#neovim-status {
+  min-width: 0;
+  overflow: hidden;
+  color: #9ece6a;
+  text-overflow: ellipsis;
+}
+
+#neovim-status.warning {
+  color: #f7768e;
+}
+
+#neovim-editor {
+  width: 100%;
+  min-height: 0;
+  flex: 1;
+}
+
+#neovim-commandline {
+  position: absolute;
+  z-index: 30;
+  right: 0;
+  bottom: 0;
+  left: 0;
+  display: none;
+  min-height: 23px;
+  box-sizing: border-box;
+  padding: 2px 8px;
+  border-top: 1px solid #414868;
+  background: #15161e;
+  color: #c0caf5;
+  font: 14px/19px "IosevkaTerm Nerd Font", monospace;
+  white-space: pre-wrap;
+}
+
+#neovim-commandline.visible {
   display: block;
 }
 
