@@ -17,6 +17,7 @@ const MAX_BLOB_BYTES = 8 * 1024 * 1024;
 const MAX_REPOSITORY_FILES = 3_000;
 const MAX_PUSH_BYTES = 8 * 1024 * 1024;
 const MAX_PUSH_ACTIONS = 100;
+const GITHUB_API_VERSION = "2026-03-10";
 
 const GitParams = Type.Object({
   operation: Type.Union([
@@ -51,12 +52,12 @@ const GitParams = Type.Object({
   project: Type.Optional(
     Type.String({
       description:
-        "GitLab project URL, numeric project ID, or namespace/project. Required for clone.",
+        "GitHub repository URL or owner/repository. Required for clone.",
       maxLength: 2_000,
     }),
   ),
   branch: Type.Optional(
-    Type.String({ description: "GitLab branch. Defaults to the project's default branch." }),
+    Type.String({ description: "Remote branch. Defaults to the repository's default branch." }),
   ),
   staged: Type.Optional(
     Type.Boolean({ description: "For diff, compare staged changes instead of the worktree." }),
@@ -72,10 +73,11 @@ const GitParams = Type.Object({
 
 type GitParamsValue = Static<typeof GitParams>;
 
-export interface GitLabCredentials {
-  baseUrl: string;
+export interface GitHubCredentials {
+  apiBaseUrl: string;
   token: string;
-  username: string;
+  login: string;
+  id: number;
   name: string;
   email?: string;
 }
@@ -87,36 +89,41 @@ export interface GitDetails {
   commit?: string;
 }
 
-interface GitLabProject {
-  id: number;
-  path: string;
-  path_with_namespace: string;
-  default_branch: string | null;
-}
-
-interface GitLabCommit {
-  id: string;
-  short_id: string;
-  title: string;
-}
-
-interface GitLabTreeEntry {
-  id: string;
-  mode: string;
-  path: string;
-  type: "blob" | "tree" | "commit";
-}
-
 interface BaselineEntry {
   id: string;
   mode: string;
 }
 
-interface GitLabMetadata {
+interface GitHubRepository {
+  name: string;
+  full_name: string;
+  default_branch: string;
+}
+
+interface GitHubCommit {
+  sha: string;
+  commit: {
+    message: string;
+    tree: { sha: string };
+  };
+}
+
+interface GitHubTree {
+  sha: string;
+  truncated: boolean;
+  tree: Array<{
+    path: string;
+    mode: string;
+    type: "blob" | "tree" | "commit";
+    sha: string;
+    size?: number;
+  }>;
+}
+
+interface GitHubMetadata {
   version: 1;
-  baseUrl: string;
-  projectId: string;
-  projectPath: string;
+  apiBaseUrl: string;
+  repository: string;
   branch: string;
   remoteCommit: string;
   localHead: string;
@@ -142,58 +149,57 @@ function text(value: string) {
   return { type: "text" as const, text: value };
 }
 
-export function normalizeGitLabBaseUrl(value: string): string {
-  const url = new URL(value.trim() || "https://gitlab.com");
+export function normalizeGitHubApiUrl(value: string): string {
+  const url = new URL(value.trim() || "https://api.github.com");
   if (url.protocol !== "https:" && url.protocol !== "http:") {
-    throw new Error("GitLab URL must use http or https.");
+    throw new Error("GitHub API URL must use http or https.");
   }
   if (url.username || url.password) {
-    throw new Error("Do not put credentials in the GitLab URL.");
+    throw new Error("Do not put credentials in the GitHub API URL.");
   }
   url.search = "";
   url.hash = "";
   return url.toString().replace(/\/+$/, "");
 }
 
-export async function verifyGitLabCredentials(
-  baseUrl: string,
+export async function verifyGitHubCredentials(
+  apiBaseUrl: string,
   token: string,
-): Promise<GitLabCredentials> {
-  const normalized = normalizeGitLabBaseUrl(baseUrl);
-  if (!token.trim()) throw new Error("GitLab token is empty.");
-  const response = await fetch(`${normalized}/api/v4/user`, {
-    headers: { "PRIVATE-TOKEN": token },
-  });
-  if (!response.ok) throw await gitLabError(response);
-  const user = (await response.json()) as {
-    username?: string;
-    name?: string;
-    public_email?: string;
-    email?: string;
-  };
-  if (!user.username) throw new Error("GitLab returned an invalid user response.");
+): Promise<GitHubCredentials> {
+  const normalized = normalizeGitHubApiUrl(apiBaseUrl);
+  if (!token.trim()) throw new Error("GitHub token is empty.");
+  const user = await gitHubJson<{
+    login?: string;
+    id?: number;
+    name?: string | null;
+    email?: string | null;
+  }>(normalized, "/user", { apiBaseUrl: normalized, token }, undefined);
+  if (!user.login || !Number.isFinite(user.id)) {
+    throw new Error("GitHub returned an invalid user response.");
+  }
   return {
-    baseUrl: normalized,
+    apiBaseUrl: normalized,
     token,
-    username: user.username,
-    name: user.name || user.username,
-    email: user.public_email || user.email || undefined,
+    login: user.login,
+    id: user.id!,
+    name: user.name || user.login,
+    email: user.email || undefined,
   };
 }
 
 export function createGitTool(
   py: Pyodide,
-  getCredentials: () => GitLabCredentials | null,
+  getCredentials: () => GitHubCredentials | null,
 ): AgentTool<typeof GitParams, GitDetails> {
   return {
     name: "git",
     label: "Git",
     description:
       "Use a real local Git repository in the shared Pyodide filesystem, powered by " +
-      "Dulwich. Supports init, status, add, commit, log, and diff. GitLab clone/pull/push " +
-      "use GitLab's browser-compatible API because browser CORS blocks normal Git smart " +
-      "HTTP. Run /gitlab to register a private-project token. Remote synchronization is " +
-      "snapshot-based: commit local changes before push, and push before pull.",
+      "Dulwich. Supports init, status, add, commit, log, and diff. GitHub clone/pull/push " +
+      "use its browser-compatible API because browser CORS blocks normal Git smart HTTP. " +
+      "Run /github to register a private-repository token. Remote " +
+      "synchronization is snapshot-based: commit before push, and push before pull.",
     parameters: GitParams,
     executionMode: "sequential",
     async execute(_id, params, signal) {
@@ -304,13 +310,13 @@ json.dumps(_out.getvalue().decode("utf-8", "replace"))
         }
 
         case "clone":
-          return cloneFromGitLab(py, params, credentials, identity, signal);
+          return cloneFromGitHub(py, params, credentials, identity, signal);
 
         case "pull":
-          return pullFromGitLab(py, params, credentials, identity, signal);
+          return pullFromGitHub(py, params, credentials, identity, signal);
 
         case "push":
-          return pushToGitLab(py, params, credentials, signal);
+          return pushToGitHub(py, params, credentials, signal);
       }
     },
   };
@@ -382,9 +388,13 @@ function assertRepository(py: Pyodide, cwd: string): void {
   }
 }
 
-function gitIdentity(credentials: GitLabCredentials | null): string {
-  const name = credentials?.name || credentials?.username || "piodide";
-  const email = credentials?.email || `${credentials?.username || "piodide"}@browser.local`;
+function gitIdentity(credentials: GitHubCredentials | null): string {
+  const name = credentials?.name || credentials?.login || "piodide";
+  const email =
+    credentials?.email ||
+    (credentials
+      ? `${credentials.id}+${credentials.login}@users.noreply.github.com`
+      : "piodide@browser.local");
   return `${name.replace(/[<>\n\r]/g, "")} <${email.replace(/[<>\n\r]/g, "")}>`;
 }
 
@@ -453,38 +463,38 @@ json.dumps(Repo(${pythonString(cwd)}).head().decode())
 `);
 }
 
-async function cloneFromGitLab(
+async function cloneFromGitHub(
   py: Pyodide,
   params: GitParamsValue,
-  credentials: GitLabCredentials | null,
+  credentials: GitHubCredentials | null,
   identity: string,
   signal: AbortSignal | undefined,
 ): Promise<{ content: ReturnType<typeof text>[]; details: GitDetails }> {
   if (!params.project?.trim()) throw new Error("clone requires project.");
-  const target = parseGitLabTarget(params.project, credentials);
-  const project = await gitLabJson<GitLabProject>(
-    target.baseUrl,
-    `/projects/${encodeURIComponent(target.project)}`,
+  const target = parseGitHubTarget(params.project, credentials);
+  const repository = await gitHubJson<GitHubRepository>(
+    target.apiBaseUrl,
+    `/repos/${githubRepositoryPath(target.repository)}`,
     credentials,
     signal,
   );
-  const branch = params.branch?.trim() || project.default_branch;
-  if (!branch) throw new Error("The GitLab project has no default branch.");
+  const branch = params.branch?.trim() || repository.default_branch;
+  if (!branch) throw new Error("The GitHub repository has no default branch.");
   const cwd = params.cwd?.trim()
     ? repositoryPath(py, params.cwd)
-    : repositoryPath(py, `/home/web/${project.path}`);
+    : repositoryPath(py, `/home/web/${repository.name}`);
   assertCloneDestination(py, cwd);
 
-  const snapshot = await fetchSnapshot(
-    target.baseUrl,
-    String(project.id),
+  const snapshot = await fetchGitHubSnapshot(
+    target.apiBaseUrl,
+    repository.full_name,
     branch,
     credentials,
     signal,
   );
-  const files = await fetchSnapshotFiles(
-    target.baseUrl,
-    String(project.id),
+  const files = await fetchGitHubSnapshotFiles(
+    target.apiBaseUrl,
+    repository.full_name,
     snapshot.baseline,
     credentials,
     signal,
@@ -499,25 +509,24 @@ json.dumps(True)
   const localCommit = await commitLocal(
     py,
     cwd,
-    `Import ${project.path_with_namespace}@${snapshot.commit.short_id}`,
+    `Import ${repository.full_name}@${snapshot.commit.sha.slice(0, 7)}`,
     identity,
     true,
   );
-  writeMetadata(py, cwd, {
+  writeGitHubMetadata(py, cwd, {
     version: 1,
-    baseUrl: target.baseUrl,
-    projectId: String(project.id),
-    projectPath: project.path_with_namespace,
+    apiBaseUrl: target.apiBaseUrl,
+    repository: repository.full_name,
     branch,
-    remoteCommit: snapshot.commit.id,
+    remoteCommit: snapshot.commit.sha,
     localHead: localCommit,
     baseline: snapshot.baseline,
   });
   return {
     content: [
       text(
-        `Cloned GitLab snapshot ${project.path_with_namespace}@${branch} into ${cwd}\n` +
-          `${Object.keys(snapshot.baseline).length} files · remote ${snapshot.commit.short_id}\n`,
+        `Cloned GitHub snapshot ${repository.full_name}@${branch} into ${cwd}\n` +
+          `${Object.keys(snapshot.baseline).length} files · remote ${snapshot.commit.sha.slice(0, 7)}\n`,
       ),
     ],
     details: {
@@ -529,15 +538,15 @@ json.dumps(True)
   };
 }
 
-async function pullFromGitLab(
+async function pullFromGitHub(
   py: Pyodide,
   params: GitParamsValue,
-  credentials: GitLabCredentials | null,
+  credentials: GitHubCredentials | null,
   identity: string,
   signal: AbortSignal | undefined,
 ): Promise<{ content: ReturnType<typeof text>[]; details: GitDetails }> {
   const cwd = repositoryPath(py, params.cwd);
-  const metadata = readMetadata(py, cwd);
+  const metadata = readGitHubMetadata(py, cwd);
   const status = await readStatus(py, cwd);
   if (!status.clean) throw new Error("Working tree is not clean; commit or remove changes first.");
   const head = await localHead(py, cwd);
@@ -545,30 +554,30 @@ async function pullFromGitLab(
     throw new Error("Local commits have not been pushed; push before pulling.");
   }
 
-  const remote = await getRemoteCommit(
-    metadata.baseUrl,
-    metadata.projectId,
+  const remote = await getGitHubCommit(
+    metadata.apiBaseUrl,
+    metadata.repository,
     metadata.branch,
     credentials,
     signal,
   );
-  if (remote.id === metadata.remoteCommit) {
+  if (remote.sha === metadata.remoteCommit) {
     return {
-      content: [text(`Already up to date with ${metadata.projectPath}@${metadata.branch}\n`)],
+      content: [text(`Already up to date with ${metadata.repository}@${metadata.branch}\n`)],
       details: { operation: "pull", cwd, commit: head },
     };
   }
 
-  const snapshot = await fetchSnapshot(
-    metadata.baseUrl,
-    metadata.projectId,
+  const snapshot = await fetchGitHubSnapshot(
+    metadata.apiBaseUrl,
+    metadata.repository,
     metadata.branch,
     credentials,
     signal,
   );
-  const files = await fetchSnapshotFiles(
-    metadata.baseUrl,
-    metadata.projectId,
+  const files = await fetchGitHubSnapshotFiles(
+    metadata.apiBaseUrl,
+    metadata.repository,
     snapshot.baseline,
     credentials,
     signal,
@@ -580,21 +589,21 @@ async function pullFromGitLab(
   const localCommit = await commitLocal(
     py,
     cwd,
-    `Pull ${metadata.projectPath}@${snapshot.commit.short_id}`,
+    `Pull ${metadata.repository}@${snapshot.commit.sha.slice(0, 7)}`,
     identity,
     true,
   );
-  writeMetadata(py, cwd, {
+  writeGitHubMetadata(py, cwd, {
     ...metadata,
-    remoteCommit: snapshot.commit.id,
+    remoteCommit: snapshot.commit.sha,
     localHead: localCommit,
     baseline: snapshot.baseline,
   });
   return {
     content: [
       text(
-        `Pulled GitLab snapshot ${metadata.projectPath}@${metadata.branch}\n` +
-          `${Object.keys(snapshot.baseline).length} files · remote ${snapshot.commit.short_id}\n`,
+        `Pulled GitHub snapshot ${metadata.repository}@${metadata.branch}\n` +
+          `${Object.keys(snapshot.baseline).length} files · remote ${snapshot.commit.sha.slice(0, 7)}\n`,
       ),
     ],
     details: {
@@ -606,14 +615,14 @@ async function pullFromGitLab(
   };
 }
 
-async function pushToGitLab(
+async function pushToGitHub(
   py: Pyodide,
   params: GitParamsValue,
-  credentials: GitLabCredentials | null,
+  credentials: GitHubCredentials | null,
   signal: AbortSignal | undefined,
 ): Promise<{ content: ReturnType<typeof text>[]; details: GitDetails }> {
   const cwd = repositoryPath(py, params.cwd);
-  const metadata = readMetadata(py, cwd);
+  const metadata = readGitHubMetadata(py, cwd);
   const status = await readStatus(py, cwd);
   if (!status.clean) throw new Error("Working tree is not clean; add and commit changes first.");
   const head = await localHead(py, cwd);
@@ -623,51 +632,41 @@ async function pushToGitLab(
       details: { operation: "push", cwd, commit: head },
     };
   }
-  const authorized = requireCredentials(credentials, metadata.baseUrl);
-
-  const remote = await getRemoteCommit(
-    metadata.baseUrl,
-    metadata.projectId,
+  const authorized = requireGitHubCredentials(credentials, metadata.apiBaseUrl);
+  const remote = await getGitHubCommit(
+    metadata.apiBaseUrl,
+    metadata.repository,
     metadata.branch,
     authorized,
     signal,
   );
-  if (remote.id !== metadata.remoteCommit) {
-    throw new Error("The GitLab branch changed remotely; pull before pushing.");
+  if (remote.sha !== metadata.remoteCommit) {
+    throw new Error("The GitHub branch changed remotely; pull before pushing.");
   }
 
   const worktree = await readCommittedTree(py, cwd);
-  const actions: Array<Record<string, unknown>> = [];
+  const changed: Array<{ path: string; entry: WorktreeEntry }> = [];
+  const deleted: Array<{ path: string; entry: BaselineEntry }> = [];
   let pushBytes = 0;
-
   for (const [path, entry] of worktree) {
     const previous = metadata.baseline[path];
     if (previous?.id === entry.id && previous.mode === entry.mode) continue;
-    if (entry.mode === "120000") {
-      throw new Error(`GitLab API sync cannot push a changed symbolic link: ${path}`);
-    }
     pushBytes += entry.bytes.byteLength;
-    actions.push({
-      action: previous ? "update" : "create",
-      file_path: path,
-      content: bytesToBase64(entry.bytes),
-      encoding: "base64",
-      execute_filemode: entry.mode === "100755",
-    });
+    changed.push({ path, entry });
   }
-  for (const path of Object.keys(metadata.baseline)) {
-    if (!worktree.has(path)) actions.push({ action: "delete", file_path: path });
+  for (const [path, entry] of Object.entries(metadata.baseline)) {
+    if (!worktree.has(path)) deleted.push({ path, entry });
   }
-
-  if (actions.length === 0) {
-    writeMetadata(py, cwd, { ...metadata, localHead: head });
+  const actionCount = changed.length + deleted.length;
+  if (actionCount === 0) {
+    writeGitHubMetadata(py, cwd, { ...metadata, localHead: head });
     return {
       content: [text("Nothing to push\n")],
       details: { operation: "push", cwd, commit: head },
     };
   }
-  if (actions.length > MAX_PUSH_ACTIONS) {
-    throw new Error(`Push has ${actions.length} file actions; limit is ${MAX_PUSH_ACTIONS}.`);
+  if (actionCount > MAX_PUSH_ACTIONS) {
+    throw new Error(`Push has ${actionCount} file actions; limit is ${MAX_PUSH_ACTIONS}.`);
   }
   if (pushBytes > MAX_PUSH_BYTES) {
     throw new Error(
@@ -675,40 +674,96 @@ async function pushToGitLab(
     );
   }
 
-  const message = params.message?.trim() || (await localCommitMessage(py, cwd));
-  const response = await gitLabJson<GitLabCommit>(
-    metadata.baseUrl,
-    `/projects/${encodeURIComponent(metadata.projectId)}/repository/commits`,
+  const apiRepository = githubRepositoryPath(metadata.repository);
+  const treeEntries: Array<{
+    path: string;
+    mode: string;
+    type: "blob";
+    sha: string | null;
+  }> = [];
+  for (const { path, entry } of changed) {
+    const blob = await gitHubJson<{ sha: string }>(
+      metadata.apiBaseUrl,
+      `/repos/${apiRepository}/git/blobs`,
+      authorized,
+      signal,
+      {
+        method: "POST",
+        body: JSON.stringify({
+          content: bytesToBase64(entry.bytes),
+          encoding: "base64",
+        }),
+      },
+    );
+    treeEntries.push({ path, mode: entry.mode, type: "blob", sha: blob.sha });
+  }
+  for (const { path, entry } of deleted) {
+    treeEntries.push({ path, mode: entry.mode, type: "blob", sha: null });
+  }
+
+  const tree = await gitHubJson<{ sha: string }>(
+    metadata.apiBaseUrl,
+    `/repos/${apiRepository}/git/trees`,
     authorized,
     signal,
     {
       method: "POST",
       body: JSON.stringify({
-        branch: metadata.branch,
-        commit_message: message,
-        actions,
-        author_name: authorized.name,
-        author_email: authorized.email || `${authorized.username}@users.noreply.gitlab.com`,
+        base_tree: remote.commit.tree.sha,
+        tree: treeEntries,
       }),
+    },
+  );
+  const message = params.message?.trim() || (await localCommitMessage(py, cwd));
+  const author = {
+    name: authorized.name,
+    email:
+      authorized.email ||
+      `${authorized.id}+${authorized.login}@users.noreply.github.com`,
+  };
+  const commit = await gitHubJson<{ sha: string; message: string }>(
+    metadata.apiBaseUrl,
+    `/repos/${apiRepository}/git/commits`,
+    authorized,
+    signal,
+    {
+      method: "POST",
+      body: JSON.stringify({
+        message,
+        tree: tree.sha,
+        parents: [remote.sha],
+        author,
+        committer: author,
+      }),
+    },
+  );
+  await gitHubJson(
+    metadata.apiBaseUrl,
+    `/repos/${apiRepository}/git/refs/heads/${githubRefPath(metadata.branch)}`,
+    authorized,
+    signal,
+    {
+      method: "PATCH",
+      body: JSON.stringify({ sha: commit.sha, force: false }),
     },
   );
 
   const baseline: Record<string, BaselineEntry> = {};
   for (const [path, entry] of worktree) baseline[path] = { id: entry.id, mode: entry.mode };
-  writeMetadata(py, cwd, {
+  writeGitHubMetadata(py, cwd, {
     ...metadata,
-    remoteCommit: response.id,
+    remoteCommit: commit.sha,
     localHead: head,
     baseline,
   });
   return {
     content: [
       text(
-        `Pushed ${actions.length} file action(s) to ${metadata.projectPath}@${metadata.branch}\n` +
-          `remote ${response.short_id} · ${response.title}\n`,
+        `Pushed ${actionCount} file action(s) to ${metadata.repository}@${metadata.branch}\n` +
+          `remote ${commit.sha.slice(0, 7)} · ${message.split(/\r?\n/, 1)[0]}\n`,
       ),
     ],
-    details: { operation: "push", cwd, files: actions.length, commit: response.id },
+    details: { operation: "push", cwd, files: actionCount, commit: commit.sha },
   };
 }
 
@@ -719,179 +774,225 @@ function assertCloneDestination(py: Pyodide, cwd: string): void {
   if (entries.length > 0) throw new Error(`Clone destination is not empty: ${cwd}`);
 }
 
-function metadataPath(cwd: string): string {
-  return `${cwd}/.git/piodide-gitlab.json`;
+function gitHubMetadataPath(cwd: string): string {
+  return `${cwd}/.git/piodide-github.json`;
 }
 
-function readMetadata(py: Pyodide, cwd: string): GitLabMetadata {
+function readGitHubMetadata(py: Pyodide, cwd: string): GitHubMetadata {
   assertRepository(py, cwd);
-  const path = metadataPath(cwd);
+  const path = gitHubMetadataPath(cwd);
   if (!fsExists(py, path)) {
-    throw new Error("This repository is not linked to GitLab; use git clone first.");
+    throw new Error("This repository is not linked to GitHub; use git clone first.");
   }
-  const metadata = JSON.parse(fsReadText(py, path)) as GitLabMetadata;
-  if (metadata.version !== 1 || !metadata.projectId || !metadata.branch) {
-    throw new Error("The GitLab repository metadata is invalid.");
+  const metadata = JSON.parse(fsReadText(py, path)) as GitHubMetadata;
+  if (
+    metadata.version !== 1 ||
+    !metadata.apiBaseUrl ||
+    !metadata.repository ||
+    !metadata.branch
+  ) {
+    throw new Error("The GitHub repository metadata is invalid.");
   }
   return metadata;
 }
 
-function writeMetadata(py: Pyodide, cwd: string, metadata: GitLabMetadata): void {
-  fsWriteText(py, metadataPath(cwd), JSON.stringify(metadata));
+function writeGitHubMetadata(py: Pyodide, cwd: string, metadata: GitHubMetadata): void {
+  fsWriteText(py, gitHubMetadataPath(cwd), JSON.stringify(metadata));
 }
 
-function parseGitLabTarget(
+function parseGitHubTarget(
   value: string,
-  credentials: GitLabCredentials | null,
-): { baseUrl: string; project: string } {
+  credentials: GitHubCredentials | null,
+): { apiBaseUrl: string; repository: string } {
   const trimmed = value.trim();
-  if (/^https?:\/\//i.test(trimmed)) {
+  let repository = trimmed;
+  let apiBaseUrl = normalizeGitHubApiUrl(
+    credentials?.apiBaseUrl || "https://api.github.com",
+  );
+  if (/^git@github\.com:/i.test(trimmed)) {
+    repository = trimmed.slice(trimmed.indexOf(":") + 1);
+    apiBaseUrl = "https://api.github.com";
+  } else if (/^https?:\/\//i.test(trimmed)) {
     const url = new URL(trimmed);
-    const credentialBase = credentials ? new URL(credentials.baseUrl) : null;
-    let baseUrl = `${url.protocol}//${url.host}`;
-    let projectPath = url.pathname.replace(/^\/+|\/+$/g, "");
-    if (
-      credentialBase &&
-      credentialBase.origin === url.origin &&
-      credentialBase.pathname !== "/" &&
-      url.pathname.startsWith(credentialBase.pathname.replace(/\/+$/, "") + "/")
-    ) {
-      baseUrl = credentials!.baseUrl;
-      projectPath = url.pathname
-        .slice(credentialBase.pathname.replace(/\/+$/, "").length)
-        .replace(/^\/+|\/+$/g, "");
+    if (url.username || url.password) {
+      throw new Error("Do not put credentials in a GitHub URL.");
     }
-    return { baseUrl, project: projectPath.replace(/\.git$/, "") };
+    if (
+      url.hostname.toLowerCase() === "github.com" ||
+      url.hostname.toLowerCase() === "www.github.com"
+    ) {
+      repository = url.pathname;
+      apiBaseUrl = "https://api.github.com";
+    } else if (url.hostname.toLowerCase() === "api.github.com") {
+      repository = url.pathname.replace(/^\/?repos\//, "");
+      apiBaseUrl = "https://api.github.com";
+    } else if (
+      credentials &&
+      url.origin === new URL(credentials.apiBaseUrl).origin
+    ) {
+      const apiUrl = new URL(apiBaseUrl);
+      const apiPrefix = apiUrl.pathname.replace(/\/+$/, "");
+      repository = url.pathname.slice(apiPrefix.length).replace(/^\/?repos\//, "");
+    } else {
+      throw new Error("GitHub repository URL must use github.com or the registered API host.");
+    }
+  }
+  repository = repository.replace(/^\/+|\/+$/g, "").replace(/\.git$/i, "");
+  const parts = repository.split("/");
+  if (
+    parts.length !== 2 ||
+    parts.some((part) => !/^[A-Za-z0-9_.-]+$/.test(part))
+  ) {
+    throw new Error("GitHub repository must be owner/repository.");
   }
   return {
-    baseUrl: credentials?.baseUrl || "https://gitlab.com",
-    project: trimmed.replace(/^\/+|\/+$/g, "").replace(/\.git$/, ""),
+    apiBaseUrl,
+    repository: parts.join("/"),
   };
 }
 
-function credentialsFor(
-  credentials: GitLabCredentials | null,
-  baseUrl: string,
-): GitLabCredentials | null {
+function githubRepositoryPath(repository: string): string {
+  const parts = repository.split("/");
+  if (parts.length !== 2 || parts.some((part) => !part)) {
+    throw new Error("Invalid GitHub repository metadata.");
+  }
+  return parts.map(encodeURIComponent).join("/");
+}
+
+function githubRefPath(branch: string): string {
+  if (
+    !branch ||
+    branch.startsWith("/") ||
+    branch.endsWith("/") ||
+    branch.includes("\0") ||
+    branch.split("/").some((part) => !part || part === "." || part === "..")
+  ) {
+    throw new Error("Invalid GitHub branch.");
+  }
+  return branch.split("/").map(encodeURIComponent).join("/");
+}
+
+type GitHubAuth = Pick<GitHubCredentials, "apiBaseUrl" | "token">;
+
+function gitHubCredentialsFor<T extends GitHubAuth>(
+  credentials: T | null,
+  apiBaseUrl: string,
+): T | null {
   if (!credentials) return null;
-  return normalizeGitLabBaseUrl(credentials.baseUrl) === normalizeGitLabBaseUrl(baseUrl)
+  return normalizeGitHubApiUrl(credentials.apiBaseUrl) === normalizeGitHubApiUrl(apiBaseUrl)
     ? credentials
     : null;
 }
 
-function requireCredentials(
-  credentials: GitLabCredentials | null,
-  baseUrl: string,
-): GitLabCredentials {
-  const matching = credentialsFor(credentials, baseUrl);
-  if (!matching) throw new Error(`Run /gitlab ${baseUrl} before pushing.`);
+function requireGitHubCredentials(
+  credentials: GitHubCredentials | null,
+  apiBaseUrl: string,
+): GitHubCredentials {
+  const matching = gitHubCredentialsFor(credentials, apiBaseUrl);
+  if (!matching) throw new Error("Run /github before pushing.");
   return matching;
 }
 
-async function gitLabJson<T>(
-  baseUrl: string,
+async function gitHubJson<T>(
+  apiBaseUrl: string,
   path: string,
-  credentials: GitLabCredentials | null,
+  credentials: GitHubAuth | null,
   signal: AbortSignal | undefined,
   init: RequestInit = {},
 ): Promise<T> {
   const headers = new Headers(init.headers);
-  const matching = credentialsFor(credentials, baseUrl);
-  if (matching) headers.set("PRIVATE-TOKEN", matching.token);
+  headers.set("Accept", "application/vnd.github+json");
+  headers.set("X-GitHub-Api-Version", GITHUB_API_VERSION);
+  const matching = gitHubCredentialsFor(credentials, apiBaseUrl);
+  if (matching) headers.set("Authorization", `Bearer ${matching.token}`);
   if (init.body) headers.set("Content-Type", "application/json");
-  const response = await fetch(`${normalizeGitLabBaseUrl(baseUrl)}/api/v4${path}`, {
+  const response = await fetch(`${normalizeGitHubApiUrl(apiBaseUrl)}${path}`, {
     ...init,
     headers,
     signal,
   });
-  if (!response.ok) throw await gitLabError(response);
+  if (!response.ok) throw await gitHubError(response);
   return (await response.json()) as T;
 }
 
-async function gitLabError(response: Response): Promise<Error> {
+async function gitHubError(response: Response): Promise<Error> {
   const body = (await response.text()).slice(0, 1_000);
   let message = body;
   try {
-    const parsed = JSON.parse(body) as { message?: unknown; error?: unknown };
-    message =
-      typeof parsed.message === "string"
-        ? parsed.message
-        : typeof parsed.error === "string"
-          ? parsed.error
-          : body;
+    const parsed = JSON.parse(body) as { message?: unknown };
+    message = typeof parsed.message === "string" ? parsed.message : body;
   } catch {
     // Keep the bounded text response.
   }
-  return new Error(`GitLab HTTP ${response.status}: ${message || response.statusText}`);
+  return new Error(`GitHub HTTP ${response.status}: ${message || response.statusText}`);
 }
 
-async function getRemoteCommit(
-  baseUrl: string,
-  projectId: string,
+async function getGitHubCommit(
+  apiBaseUrl: string,
+  repository: string,
   branch: string,
-  credentials: GitLabCredentials | null,
+  credentials: GitHubCredentials | null,
   signal: AbortSignal | undefined,
-): Promise<GitLabCommit> {
-  return gitLabJson<GitLabCommit>(
-    baseUrl,
-    `/projects/${encodeURIComponent(projectId)}/repository/commits/${encodeURIComponent(branch)}`,
+): Promise<GitHubCommit> {
+  return gitHubJson<GitHubCommit>(
+    apiBaseUrl,
+    `/repos/${githubRepositoryPath(repository)}/commits/${encodeURIComponent(branch)}`,
     credentials,
     signal,
   );
 }
 
-async function fetchSnapshot(
-  baseUrl: string,
-  projectId: string,
+async function fetchGitHubSnapshot(
+  apiBaseUrl: string,
+  repository: string,
   branch: string,
-  credentials: GitLabCredentials | null,
+  credentials: GitHubCredentials | null,
   signal: AbortSignal | undefined,
 ): Promise<{
-  commit: GitLabCommit;
+  commit: GitHubCommit;
   baseline: Record<string, BaselineEntry>;
 }> {
-  const [commit, baseline] = await Promise.all([
-    getRemoteCommit(baseUrl, projectId, branch, credentials, signal),
-    fetchRemoteTree(baseUrl, projectId, branch, credentials, signal),
-  ]);
+  const commit = await getGitHubCommit(
+    apiBaseUrl,
+    repository,
+    branch,
+    credentials,
+    signal,
+  );
+  const tree = await gitHubJson<GitHubTree>(
+    apiBaseUrl,
+    `/repos/${githubRepositoryPath(repository)}/git/trees/${commit.commit.tree.sha}?recursive=1`,
+    credentials,
+    signal,
+  );
+  if (tree.truncated) {
+    throw new Error("GitHub truncated the repository tree; this repository is too large.");
+  }
+  const baseline: Record<string, BaselineEntry> = {};
+  for (const entry of tree.tree) {
+    if (entry.type === "commit") {
+      throw new Error(`GitHub submodules are not supported: ${entry.path}`);
+    }
+    if (entry.type !== "blob") continue;
+    validateRelativePath(entry.path);
+    if ((entry.size ?? 0) > MAX_BLOB_BYTES) {
+      throw new Error(
+        `GitHub file exceeds the ${formatBytes(MAX_BLOB_BYTES)} browser limit: ${entry.path}`,
+      );
+    }
+    baseline[entry.path] = { id: entry.sha, mode: entry.mode };
+  }
+  if (Object.keys(baseline).length > MAX_REPOSITORY_FILES) {
+    throw new Error(`Repository exceeds the ${MAX_REPOSITORY_FILES}-file browser limit.`);
+  }
   return { commit, baseline };
 }
 
-async function fetchRemoteTree(
-  baseUrl: string,
-  projectId: string,
-  branch: string,
-  credentials: GitLabCredentials | null,
-  signal: AbortSignal | undefined,
-): Promise<Record<string, BaselineEntry>> {
-  const baseline: Record<string, BaselineEntry> = {};
-  let page = 1;
-  while (true) {
-    const entries = await gitLabJson<GitLabTreeEntry[]>(
-      baseUrl,
-      `/projects/${encodeURIComponent(projectId)}/repository/tree` +
-        `?recursive=true&per_page=100&page=${page}&ref=${encodeURIComponent(branch)}`,
-      credentials,
-      signal,
-    );
-    for (const entry of entries) {
-      if (entry.type === "blob") baseline[entry.path] = { id: entry.id, mode: entry.mode };
-    }
-    if (Object.keys(baseline).length > MAX_REPOSITORY_FILES) {
-      throw new Error(`Repository exceeds the ${MAX_REPOSITORY_FILES}-file browser limit.`);
-    }
-    if (entries.length < 100) break;
-    page++;
-    if (page > 100) throw new Error("Repository tree has too many API pages.");
-  }
-  return baseline;
-}
-
-async function fetchSnapshotFiles(
-  baseUrl: string,
-  projectId: string,
+async function fetchGitHubSnapshotFiles(
+  apiBaseUrl: string,
+  repository: string,
   baseline: Record<string, BaselineEntry>,
-  credentials: GitLabCredentials | null,
+  credentials: GitHubCredentials | null,
   signal: AbortSignal | undefined,
 ): Promise<Map<string, { bytes: Uint8Array; mode: string }>> {
   const pending = Object.entries(baseline);
@@ -902,15 +1003,26 @@ async function fetchSnapshotFiles(
     while (cursor < pending.length) {
       const [path, entry] = pending[cursor++];
       validateRelativePath(path);
-      const headers = new Headers();
-      const matching = credentialsFor(credentials, baseUrl);
-      if (matching) headers.set("PRIVATE-TOKEN", matching.token);
-      const url =
-        `${normalizeGitLabBaseUrl(baseUrl)}/api/v4/projects/${encodeURIComponent(projectId)}` +
-        `/repository/blobs/${encodeURIComponent(entry.id)}/raw`;
-      const response = await fetch(url, { headers, signal });
-      if (!response.ok) throw await gitLabError(response);
-      const bytes = await readBoundedResponse(response, MAX_BLOB_BYTES);
+      const blob = await gitHubJson<{
+        content: string;
+        encoding: string;
+        size: number;
+      }>(
+        apiBaseUrl,
+        `/repos/${githubRepositoryPath(repository)}/git/blobs/${encodeURIComponent(entry.id)}`,
+        credentials,
+        signal,
+      );
+      if (blob.encoding !== "base64") {
+        throw new Error(`GitHub returned an unsupported blob encoding: ${blob.encoding}`);
+      }
+      if (blob.size > MAX_BLOB_BYTES) {
+        throw new Error(`GitHub file exceeds the ${formatBytes(MAX_BLOB_BYTES)} browser limit.`);
+      }
+      const bytes = base64ToBytes(blob.content);
+      if (bytes.byteLength !== blob.size) {
+        throw new Error(`GitHub returned an invalid blob size for ${path}.`);
+      }
       total += bytes.byteLength;
       if (total > MAX_REPOSITORY_BYTES) {
         throw new Error(
@@ -921,38 +1033,6 @@ async function fetchSnapshotFiles(
     }
   };
   await Promise.all(Array.from({ length: Math.min(4, pending.length) }, () => worker()));
-  return result;
-}
-
-async function readBoundedResponse(response: Response, limit: number): Promise<Uint8Array> {
-  const length = Number(response.headers.get("content-length") || "0");
-  if (length > limit) {
-    throw new Error(`GitLab file exceeds the ${formatBytes(limit)} browser limit.`);
-  }
-  if (!response.body) {
-    const bytes = new Uint8Array(await response.arrayBuffer());
-    if (bytes.byteLength > limit) throw new Error(`Response exceeds ${formatBytes(limit)}.`);
-    return bytes;
-  }
-  const reader = response.body.getReader();
-  const chunks: Uint8Array[] = [];
-  let total = 0;
-  while (true) {
-    const { done, value } = await reader.read();
-    if (done) break;
-    total += value.byteLength;
-    if (total > limit) {
-      await reader.cancel();
-      throw new Error(`GitLab file exceeds the ${formatBytes(limit)} browser limit.`);
-    }
-    chunks.push(value);
-  }
-  const result = new Uint8Array(total);
-  let offset = 0;
-  for (const chunk of chunks) {
-    result.set(chunk, offset);
-    offset += chunk.byteLength;
-  }
   return result;
 }
 
@@ -983,7 +1063,7 @@ function validateRelativePath(path: string): void {
     path.includes("\0") ||
     path.split("/").some((part) => part === "" || part === "." || part === "..")
   ) {
-    throw new Error(`GitLab returned an unsafe repository path: ${path}`);
+    throw new Error(`Remote returned an unsafe repository path: ${path}`);
   }
 }
 
@@ -1023,7 +1103,7 @@ json.dumps([
   for (const entry of tracked) {
     validateRelativePath(entry.path);
     if (entry.mode === "160000") {
-      throw new Error(`GitLab API sync cannot push a changed submodule: ${entry.path}`);
+      throw new Error(`Remote API sync cannot push a changed submodule: ${entry.path}`);
     }
     const path = `${cwd}/${entry.path}`;
     const bytes =
@@ -1056,6 +1136,17 @@ function bytesToBase64(bytes: Uint8Array): string {
     chunks.push(String.fromCharCode(...bytes.subarray(offset, offset + 0x8000)));
   }
   return btoa(chunks.join(""));
+}
+
+function base64ToBytes(value: string): Uint8Array {
+  const normalized = value.replace(/\s+/g, "");
+  if (normalized.length > Math.ceil(MAX_BLOB_BYTES / 3) * 4 + 4) {
+    throw new Error(`Base64 blob exceeds the ${formatBytes(MAX_BLOB_BYTES)} browser limit.`);
+  }
+  const binary = atob(normalized);
+  const bytes = new Uint8Array(binary.length);
+  for (let index = 0; index < binary.length; index++) bytes[index] = binary.charCodeAt(index);
+  return bytes;
 }
 
 function capOutput(value: string): string {

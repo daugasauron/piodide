@@ -29,13 +29,13 @@ Typing `/` shows the available commands. Press `Ctrl+Shift+E` to toggle Neovim;
 - `read` — reads text files from `/home/web` with line numbers and pagination.
 - `write` — creates or replaces files in the in-browser filesystem.
 - `edit` — applies exact, unique text replacements to existing files.
-- `git` — uses Dulwich locally; GitLab clone/pull/push use its browser API
-  (`/gitlab` registers a page-local token for private projects).
+- `git` — uses Dulwich locally; GitHub clone, pull, and push use its browser API
+  (`/github` registers a page-local token).
 - `fetch` — uses browser `fetch` (and its CORS rules), optionally saving the
   response to `/home/web`.
 - `image` — renders a saved PNG, JPEG, GIF, or WebP directly in the terminal
   through Kitty graphics.
 - `html` — opens a self-contained HTML file in a sandboxed, closeable preview.
 
-All tools share the same temporary in-memory filesystem. API keys and GitLab
+All tools share the same temporary in-memory filesystem. API keys and GitHub
 tokens stay in page memory, and refreshing the page clears the runtime and files.
