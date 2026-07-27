@@ -1,25 +1,24 @@
 import { WASI } from "@runno/wasi";
 import type { WASIFS, WASIExecutionResult } from "@runno/wasi";
 import type {
-  CompileRequest,
-  CompileResponse,
-  CompilerFile,
+  ToolchainRequest,
+  ToolchainResponse,
 } from "./c-compiler.ts";
+import type { WorkspaceFile } from "./wasm-workspace.ts";
 
 const ASSET_BASE_URL = "https://runno.dev/langs";
-const OBJECT_PATH = "/program.o";
 const TAR_BLOCK_SIZE = 512;
 const DIRECTORY_SENTINEL = ".piodide-compiler-directory";
 
 interface WorkerScope {
-  onmessage: ((event: MessageEvent<CompileRequest>) => void) | null;
-  postMessage(message: CompileResponse, transfer?: Transferable[]): void;
+  onmessage: ((event: MessageEvent<ToolchainRequest>) => void) | null;
+  postMessage(message: ToolchainResponse, transfer?: Transferable[]): void;
 }
 
 const workerScope = globalThis as unknown as WorkerScope;
 
 workerScope.onmessage = (event) => {
-  void compile(event.data)
+  void runToolchain(event.data)
     .then((response) => {
       const transfer = response.output
         ? [response.output.content.buffer as ArrayBuffer]
@@ -35,10 +34,9 @@ workerScope.onmessage = (event) => {
     });
 };
 
-async function compile(request: CompileRequest): Promise<CompileResponse> {
-  const [clang, linker, sysroot] = await Promise.all([
-    fetchModule("clang.wasm"),
-    fetchModule("wasm-ld.wasm"),
+async function runToolchain(request: ToolchainRequest): Promise<ToolchainResponse> {
+  const [module, sysroot] = await Promise.all([
+    fetchModule(request.operation === "compile" ? "clang.wasm" : "wasm-ld.wasm"),
     fetchSysroot(),
   ]);
   const fs: WASIFS = {
@@ -47,7 +45,37 @@ async function compile(request: CompileRequest): Promise<CompileResponse> {
   };
   ensureParentDirectory(fs, request.outputPath);
 
-  const compiled = await run(clang, [
+  const command = request.operation === "compile"
+    ? compileCommand(request.sourcePath, request.outputPath)
+    : linkCommand(request.objectPaths, request.outputPath);
+  const executed = await run(module, command, fs);
+  if (executed.result.exitCode !== 0) {
+    return {
+      ok: false,
+      diagnostics: executed.output,
+      error:
+        `${request.operation === "compile" ? "Clang" : "wasm-ld"} exited with ` +
+        `status ${executed.result.exitCode}.`,
+    };
+  }
+
+  const output = executed.result.fs[request.outputPath];
+  if (!output || output.mode !== "binary") {
+    return {
+      ok: false,
+      diagnostics: executed.output,
+      error: `${request.operation === "compile" ? "Clang" : "wasm-ld"} produced no output.`,
+    };
+  }
+  return {
+    ok: true,
+    diagnostics: executed.output,
+    output: { path: request.outputPath, content: output.content.slice() },
+  };
+}
+
+function compileCommand(sourcePath: string, outputPath: string): string[] {
+  return [
     "clang",
     "-cc1",
     "-triple",
@@ -63,18 +91,13 @@ async function compile(request: CompileRequest): Promise<CompileResponse> {
     "-O2",
     "-emit-obj",
     "-o",
-    OBJECT_PATH,
-    request.sourcePath,
-  ], fs);
-  if (compiled.result.exitCode !== 0) {
-    return {
-      ok: false,
-      diagnostics: compiled.output,
-      error: `Clang exited with status ${compiled.result.exitCode}.`,
-    };
-  }
+    outputPath,
+    sourcePath,
+  ];
+}
 
-  const linked = await run(linker, [
+function linkCommand(objectPaths: string[], outputPath: string): string[] {
+  return [
     "wasm-ld",
     "--no-threads",
     "--export-dynamic",
@@ -82,32 +105,14 @@ async function compile(request: CompileRequest): Promise<CompileResponse> {
     "stack-size=1048576",
     "-L/sys/lib/wasm32-wasi",
     "/sys/lib/wasm32-wasi/crt1.o",
-    OBJECT_PATH,
+    ...objectPaths,
     "-lc",
     "-o",
-    request.outputPath,
-  ], compiled.result.fs);
-  const diagnostics = compiled.output + linked.output;
-  if (linked.result.exitCode !== 0) {
-    return {
-      ok: false,
-      diagnostics,
-      error: `wasm-ld exited with status ${linked.result.exitCode}.`,
-    };
-  }
-
-  const output = linked.result.fs[request.outputPath];
-  if (!output || output.mode !== "binary") {
-    return { ok: false, diagnostics, error: "The linker did not produce a WebAssembly file." };
-  }
-  return {
-    ok: true,
-    diagnostics,
-    output: { path: request.outputPath, content: output.content.slice() },
-  };
+    outputPath,
+  ];
 }
 
-function workspaceFS(files: CompilerFile[]): WASIFS {
+function workspaceFS(files: WorkspaceFile[]): WASIFS {
   const fs: WASIFS = {};
   for (const file of files) {
     fs[file.path] = {

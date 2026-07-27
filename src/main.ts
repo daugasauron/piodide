@@ -59,7 +59,9 @@ const SYSTEM_PROMPT = `You are pi, a coding assistant running entirely inside th
 
 Tools:
 - python: run focused Python 3 code; stdout/stderr is shown live and returned to you. Install a pure-Python package only when needed with: import micropip; await micropip.install("pkg").
-- compile_c: compile one small C source file to a wasm32-wasi executable. It sees a bounded snapshot of /home/web, so quoted local headers and project files are available, and writes the result back to Pyodide. The first compile lazily downloads about 52 MB of compiler assets. This is a C-only POC; do not claim native libraries, multiple translation units, Rust, or Zig support.
+- compile_c: compile one small C source file from /home/web to a wasm32-wasi .o object. It sees the Pyodide workspace, including quoted local headers.
+- link_wasi: link one or more .o files stored in /home/web into a WASI .wasm executable with wasm-ld and WASI libc. The compiler/linker assets are lazily downloaded.
+- run_wasi: run a WASI .wasm file from /home/web with arguments, stdin, and environment variables. The program sees /home/web and its file changes are synchronized back to Pyodide after exit. Use absolute /home/web paths for file access inside C.
 - read: read a text file with line numbers; offset (1-based) and limit paginate large files.
 - write: create or overwrite a file; parent directories are created automatically.
 - edit: apply exact, unique string replacements (each oldText must match exactly once).
@@ -1107,7 +1109,7 @@ async function renderEvent(event: AgentEvent) {
     }
 
     case "tool_execution_update":
-      if (event.toolName === "python") {
+      if (event.toolName === "python" || event.toolName === "run_wasi") {
         for (const c of event.partialResult?.content ?? []) if (c?.type === "text") writer.write(c.text);
       }
       break;
@@ -1133,6 +1135,12 @@ async function renderEvent(event: AgentEvent) {
             break;
           case "compile_c":
             footer = `  ↳ compiled ${d.bytes ?? 0} bytes${d.output ? ` · ${d.output}` : ""} · ${((d.durationMs ?? 0) / 1000).toFixed(1)}s`;
+            break;
+          case "link_wasi":
+            footer = `  ↳ linked ${d.objects ?? 0} object${d.objects === 1 ? "" : "s"} · ${d.bytes ?? 0} bytes${d.output ? ` · ${d.output}` : ""} · ${((d.durationMs ?? 0) / 1000).toFixed(1)}s`;
+            break;
+          case "run_wasi":
+            footer = `  ↳ WASI exit ${d.exitCode ?? "?"} · ${d.outputBytes ?? 0} output bytes · ${d.written ?? 0} written · ${d.deleted ?? 0} deleted`;
             break;
           case "read": footer = `  ↳ read ${d.lines ?? 0} lines${d.path ? ` · ${d.path}` : ""}`; break;
           case "write": footer = `  ↳ wrote ${d.bytes ?? 0} bytes${d.path ? ` · ${d.path}` : ""}`; break;
