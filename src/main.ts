@@ -59,6 +59,7 @@ const SYSTEM_PROMPT = `You are pi, a coding assistant running entirely inside th
 
 Tools:
 - python: run focused Python 3 code; stdout/stderr is shown live and returned to you. Install a pure-Python package only when needed with: import micropip; await micropip.install("pkg").
+- compile_c: compile one small C source file to a wasm32-wasi executable in /home/web. The first compile lazily downloads about 52 MB of compiler assets. This is a C-only POC; do not claim native libraries, multiple translation units, Rust, or Zig support.
 - read: read a text file with line numbers; offset (1-based) and limit paginate large files.
 - write: create or overwrite a file; parent directories are created automatically.
 - edit: apply exact, unique string replacements (each oldText must match exactly once).
@@ -1129,6 +1130,9 @@ async function renderEvent(event: AgentEvent) {
         switch (event.toolName) {
           case "python":
             footer = `  ↳ python · ${d.bytes ?? 0} bytes · heap ${currentHeapUsage()}`;
+            break;
+          case "compile_c":
+            footer = `  ↳ compiled ${d.bytes ?? 0} bytes${d.output ? ` · ${d.output}` : ""} · ${((d.durationMs ?? 0) / 1000).toFixed(1)}s`;
             break;
           case "read": footer = `  ↳ read ${d.lines ?? 0} lines${d.path ? ` · ${d.path}` : ""}`; break;
           case "write": footer = `  ↳ wrote ${d.bytes ?? 0} bytes${d.path ? ` · ${d.path}` : ""}`; break;

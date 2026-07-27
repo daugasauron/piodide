@@ -37,6 +37,8 @@ Typing `/` shows the available commands. Press `Ctrl+Shift+E` to toggle Neovim;
 
 - `python` — runs Python in the shared Pyodide runtime with live output;
   pure-Python packages can be installed with `micropip`.
+- `compile_c` — POC compiler for one C file to WASI WebAssembly; its roughly
+  52 MB toolchain is downloaded only on first use.
 - `read` — reads text files from `/home/web` with line numbers and pagination.
 - `write` — creates or replaces files in the in-browser filesystem.
 - `edit` — applies exact, unique text replacements to existing files.

@@ -9,6 +9,7 @@
  *   git     -> local Dulwich repositories + GitHub API synchronization
  *   image   -> display an image file from the MEMFS
  *   html    -> display an HTML file in a sandboxed browser popout
+ *   compile_c -> compile one C source file to a WASI WebAssembly module
  *
  * `read`/`write`/`edit` deliberately use the *same* MEMFS that `python` sees,
  * so a file written by `write` is immediately importable / readable by Python.
@@ -30,12 +31,15 @@ import {
   type GitHubCredentials,
 } from "./git-tool.ts";
 import { downloadPyodideFile } from "./file-transfer.ts";
+import { compileC } from "./c-compiler.ts";
 
 const MAX_READ_LINES = 2000;
 const MAX_READ_BYTES = 50_000;
 const MAX_FETCH_BYTES = 50_000;
 const MAX_IMAGE_BYTES = 12 * 1024 * 1024;
 const MAX_HTML_BYTES = 2 * 1024 * 1024;
+const MAX_C_SOURCE_BYTES = 256 * 1024;
+const MAX_C_WASM_BYTES = 16 * 1024 * 1024;
 
 function text(t: string) {
   return { type: "text" as const, text: t };
@@ -104,6 +108,17 @@ const HtmlParams = Type.Object({
   }),
 });
 
+const CompileCParams = Type.Object({
+  path: Type.String({
+    description: "C source file in the in-browser filesystem.",
+  }),
+  output: Type.Optional(
+    Type.String({
+      description: "Destination .wasm file. Defaults to the source path with a .wasm suffix.",
+    }),
+  ),
+});
+
 /* ------------------------------- details ------------------------------- */
 
 export interface PythonDetails {
@@ -137,6 +152,12 @@ export interface HtmlDetails {
   path: string;
   bytes: number;
 }
+export interface CompileCDetails {
+  path: string;
+  output: string;
+  bytes: number;
+  durationMs: number;
+}
 
 /* ------------------------------- python -------------------------------- */
 
@@ -163,6 +184,59 @@ export function createPythonTool(py: Pyodide): AgentTool<typeof PythonParams, Py
       return {
         content: [text(output.length > 0 ? output : "(no output)\n")],
         details: { ok: true, bytes: output.length },
+      };
+    },
+  };
+}
+
+/* ------------------------------ compile C ------------------------------ */
+
+export function createCompileCTool(
+  py: Pyodide,
+): AgentTool<typeof CompileCParams, CompileCDetails> {
+  return {
+    name: "compile_c",
+    label: "Compile C",
+    description:
+      "Compile one C source file from the in-browser filesystem to a wasm32-wasi " +
+      "executable. The compiler runs in a disposable browser worker. This POC supports " +
+      "a single C file and the bundled WASI libc; it does not support native libraries.",
+    parameters: CompileCParams,
+    executionMode: "sequential",
+    async execute(_id, params, signal) {
+      const path = fsResolve(py, params.path);
+      if (!fsExists(py, path)) throw new Error(`File not found: ${path}`);
+      if (fsIsDir(py, path)) throw new Error(`Path is a directory: ${path}`);
+
+      const source = fsReadText(py, path);
+      const sourceBytes = byteLength(source);
+      if (sourceBytes > MAX_C_SOURCE_BYTES) {
+        throw new Error(`C source exceeds the ${MAX_C_SOURCE_BYTES / 1024} KiB POC limit.`);
+      }
+
+      const defaultOutput = path.toLowerCase().endsWith(".c")
+        ? `${path.slice(0, -2)}.wasm`
+        : `${path}.wasm`;
+      const output = fsResolve(py, params.output ?? defaultOutput);
+      if (!output.toLowerCase().endsWith(".wasm")) {
+        throw new Error("C compiler output must end in .wasm.");
+      }
+      if (output === path) throw new Error("C compiler output cannot overwrite the source file.");
+
+      const startedAt = performance.now();
+      const result = await compileC(source, signal);
+      if (result.wasm.byteLength > MAX_C_WASM_BYTES) {
+        throw new Error(`Compiler output exceeds the ${MAX_C_WASM_BYTES / 1024 / 1024} MiB limit.`);
+      }
+
+      const slash = output.lastIndexOf("/");
+      if (slash > 0) py.FS.mkdirTree(output.slice(0, slash));
+      py.FS.writeFile(output, result.wasm);
+      const durationMs = Math.round(performance.now() - startedAt);
+      const summary = `Compiled ${path} -> ${output} (${result.wasm.byteLength} bytes).`;
+      return {
+        content: [text(result.diagnostics ? `${summary}\n${result.diagnostics}` : `${summary}\n`)],
+        details: { path, output, bytes: result.wasm.byteLength, durationMs },
       };
     },
   };
@@ -499,6 +573,7 @@ export function createAllTools(
 ): AnyTool[] {
   return [
     createPythonTool(py),
+    createCompileCTool(py),
     createReadTool(py),
     createWriteTool(py),
     createEditTool(py),
