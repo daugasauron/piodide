@@ -16,6 +16,12 @@ Surprisingly powerful.
 
 ![Closeable HTML preview](screens/html-tool.png)
 
+## WASI
+
+"Investigate your environment and try to figure out how to run WASI compiled binaries that share the pyodide FS."
+
+![WASI](screens/wasi-summary.png)
+
 ## Quickstart
 
 ```bash

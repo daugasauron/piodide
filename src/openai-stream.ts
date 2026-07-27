@@ -141,10 +141,7 @@ async function run(
   try {
     resp = await fetch(url, {
       method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        Authorization: `Bearer ${apiKey}`,
-      },
+      headers: browserRequestHeaders(model, context, apiKey),
       body: JSON.stringify(body),
       signal: options.signal,
     });
@@ -332,6 +329,46 @@ async function run(
 
 /* --------------------------- request building --------------------------- */
 
+function browserRequestHeaders(
+  model: Model<Api>,
+  context: Context,
+  apiKey: string,
+): Record<string, string> {
+  const headers: Record<string, string> = {
+    Accept: "application/json",
+    "Content-Type": "application/json",
+    Authorization: `Bearer ${apiKey}`,
+  };
+  for (const [name, value] of Object.entries(model.headers ?? {})) {
+    // Fetch owns these headers in a browser. In particular, setting the
+    // native pi Copilot User-Agent would be silently discarded.
+    if (
+      ["user-agent", "host", "content-length", "cookie"].includes(
+        name.toLowerCase(),
+      )
+    ) {
+      continue;
+    }
+    headers[name] = value;
+  }
+  if (model.provider === "github-copilot") {
+    const last = context.messages[context.messages.length - 1];
+    headers["X-Initiator"] = last && last.role !== "user" ? "agent" : "user";
+    headers["Openai-Intent"] = "conversation-edits";
+    if (
+      context.messages.some(
+        (message) =>
+          (message.role === "user" || message.role === "toolResult") &&
+          Array.isArray(message.content) &&
+          message.content.some((content) => content.type === "image"),
+      )
+    ) {
+      headers["Copilot-Vision-Request"] = "true";
+    }
+  }
+  return headers;
+}
+
 function buildRequestBody(
   model: Model<Api>,
   context: Context,
@@ -349,6 +386,9 @@ function buildRequestBody(
     // OpenAI-compatible servers (Moonshot, Zhipu, …) reject unknown fields.
     // Usage is still consumed when a provider includes it without this flag.
   };
+  if (model.provider === "github-copilot") {
+    body.stream_options = { include_usage: true };
+  }
   body[completionTokenLimitField(model)] = model.maxTokens || 8192;
   if (context.tools && context.tools.length > 0) {
     body.tools = context.tools.map((t) => ({
@@ -383,6 +423,7 @@ export function completionTokenLimitField(
   // field as the conservative default for third-party compatible endpoints.
   const isOpenAI =
     model.provider === "openai" ||
+    model.provider === "github-copilot" ||
     /^https:\/\/api\.openai\.com(?:\/|$)/i.test(model.baseUrl);
   return isOpenAI ? "max_completion_tokens" : "max_tokens";
 }
