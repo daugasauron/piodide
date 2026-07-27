@@ -49,23 +49,6 @@ export const PROVIDERS: Record<string, ProviderDef> = {
       import("@earendil-works/pi-ai/providers/openai.models").then((module) => module.OPENAI_MODELS),
     ),
   },
-  "github-copilot": {
-    name: "github-copilot",
-    label: "GitHub Copilot",
-    api: "openai-completions",
-    baseUrl: "https://api.individual.githubcopilot.com",
-    defaultModel: "gpt-4.1",
-    loadModels: modelCatalogue(
-      "github-copilot",
-      "gpt-4.1",
-      () =>
-        import("@earendil-works/pi-ai/providers/github-copilot.models").then(
-          (module) => module.GITHUB_COPILOT_MODELS,
-        ),
-      (model) => model.api === "openai-completions",
-    ),
-    note: "Copilot subscription · browser-compatible models",
-  },
   openrouter: {
     name: "openrouter",
     label: "OpenRouter",
@@ -178,7 +161,6 @@ export function getProvider(name: string): ProviderDef | undefined {
 
 // Friendly alternates so `/provider kimi` and `/provider glm` also work.
 const ALIASES: Record<string, ProviderDef> = {
-  copilot: PROVIDERS["github-copilot"],
   kimi: PROVIDERS.moonshot,
   glm: PROVIDERS.zhipu,
   "glm-coding": PROVIDERS["zhipu-coding"],
@@ -192,7 +174,6 @@ export interface ProviderModelInfo {
   contextWindow: number;
   maxTokens: number;
   reasoning: boolean;
-  headers?: Record<string, string>;
   thinkingLevelMap?: Model<ApiKind>["thinkingLevelMap"];
   compat?: Model<ApiKind>["compat"];
 }
@@ -206,13 +187,7 @@ export function getLoadedModelInfo(
   return MODEL_INFO.get(`${providerName}\0${modelId}`);
 }
 
-function modelIds(
-  providerName: string,
-  defaultModel: string,
-  catalogue: object,
-  include: (model: Partial<Model<ApiKind>>) => boolean = () => true,
-): string[] {
-  const includedIds: string[] = [];
+function modelIds(providerName: string, defaultModel: string, catalogue: object): string[] {
   for (const [id, value] of Object.entries(catalogue)) {
     const model = value as Partial<ProviderModelInfo>;
     if (
@@ -224,27 +199,22 @@ function modelIds(
         contextWindow: model.contextWindow,
         maxTokens: model.maxTokens,
         reasoning: model.reasoning === true,
-        headers: (model as Partial<Model<ApiKind>>).headers,
         thinkingLevelMap: (model as Partial<Model<ApiKind>>).thinkingLevelMap,
         compat: (model as Partial<Model<ApiKind>>).compat,
       });
-      if (include(model as Partial<Model<ApiKind>>)) includedIds.push(id);
     }
   }
-  return includedIds.includes(defaultModel)
-    ? [defaultModel, ...includedIds.filter((id) => id !== defaultModel)]
-    : includedIds;
+  return [defaultModel, ...Object.keys(catalogue).filter((id) => id !== defaultModel)];
 }
 
 function modelCatalogue(
   providerName: string,
   defaultModel: string,
   load: () => Promise<object>,
-  include?: (model: Partial<Model<ApiKind>>) => boolean,
 ): () => Promise<readonly string[]> {
   let cached: readonly string[] | null = null;
   return async () => {
-    cached ??= modelIds(providerName, defaultModel, await load(), include);
+    cached ??= modelIds(providerName, defaultModel, await load());
     return cached;
   };
 }

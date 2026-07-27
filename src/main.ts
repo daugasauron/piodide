@@ -50,7 +50,6 @@ import {
   uploadConflicts,
   uploadHostFiles,
 } from "./file-transfer.ts";
-import { GitHubCopilotAuth } from "./copilot-auth.ts";
 
 /* ------------------------------------------------------------------ */
 /* system prompt                                                       */
@@ -73,7 +72,7 @@ Environment and memory constraints:
 - Pyodide, Python objects, loaded packages, and MEMFS files all consume the page's WebAssembly memory. It can grow toward a hard wasm32 ceiling of about 4 GB and cannot be safely recovered after exhaustion.
 - The runtime and filesystem persist for this page only. A refresh destroys them. There are no subprocesses, native host commands, or host files.
 - The user can import host files with /upload [directory]. This opens a browser file picker and cannot be initiated by you; tell the user to run it when host input is needed.
-- Git metadata is local to MEMFS. GitHub and GitHub Copilot tokens live only in browser page memory; never ask the user to reveal a token in chat or write one into a file, URL, command, or tool argument.
+- Git metadata is local to MEMFS. GitHub tokens live only in browser page memory; never ask the user to reveal a token in chat or write one into a file, URL, command, or tool argument.
 - Never create unbounded lists, arrays, recursion, exhaustive Cartesian products, or whole-file/network copies when a bounded or streaming approach works.
 - Estimate memory before large work. Avoid any single allocation above roughly 128 MB or total planned working data above roughly 512 MB unless the user explicitly requires it and accepts the risk.
 - Process large inputs incrementally, sample first, cap iteration counts and output, and keep generated files small. Do not print huge datasets.
@@ -164,7 +163,6 @@ let viewToggleRunning = false;
 
 let provider: ProviderDef | null = null;
 const apiKeys = new Map<string, string>();
-const copilotAuth = new GitHubCopilotAuth();
 let gitHubCredentials: GitHubCredentials | null = null;
 let modelOverride: string | null = null;
 const sessions = new BrowserSessions();
@@ -229,27 +227,6 @@ function currentModelId() {
 
 function currentApiKey() {
   return provider ? (apiKeys.get(provider.name) ?? "") : "";
-}
-
-function isCopilotProvider(value = provider): boolean {
-  return value?.name === "github-copilot";
-}
-
-function hasCurrentAuth(): boolean {
-  return isCopilotProvider() ? copilotAuth.configured : currentApiKey().length > 0;
-}
-
-async function currentRequestApiKey(): Promise<string> {
-  if (!isCopilotProvider()) return currentApiKey();
-  const previousBaseUrl = copilotAuth.info?.baseUrl;
-  const token = await copilotAuth.getAccessToken();
-  if (copilotAuth.info?.baseUrl !== previousBaseUrl) applyConfigToAgent();
-  if (!copilotAuth.info?.availableModelIds.includes(currentModelId())) {
-    throw new Error(
-      `Copilot model ${currentModelId()} is no longer available. Run /model to choose another.`,
-    );
-  }
-  return token;
 }
 
 function currentHeapUsage() {
@@ -345,10 +322,7 @@ function formatTokenCount(value: number): string {
 function applyConfigToAgent() {
   if (agent && provider) {
     const model = makeModel({
-      baseUrl:
-        isCopilotProvider(provider) && copilotAuth.info
-          ? copilotAuth.info.baseUrl
-          : provider.baseUrl,
+      baseUrl: provider.baseUrl,
       modelId: currentModelId(),
       api: provider.api,
       provider: provider.name,
@@ -521,7 +495,7 @@ async function handleSubmit(text: string) {
     prompt.start();
     return;
   }
-  if (!hasCurrentAuth()) {
+  if (!currentApiKey()) {
     say(yellow(`  not logged in. run: /login   (to use ${provider.label})`));
     prompt.start();
     return;
@@ -544,15 +518,7 @@ function activateProvider(next: ProviderDef) {
   applyConfigToAgent();
   say(cyan(`  ◇ provider: ${next.label}   model: ${currentModelId()}`));
   if (next.note) say(dim(`    ${next.note}`));
-  if (!hasCurrentAuth()) {
-    say(
-      yellow(
-        isCopilotProvider(next)
-          ? "  now run /login to connect your Copilot subscription"
-          : "  now run /login to set your API key",
-      ),
-    );
-  }
+  if (!currentApiKey()) say(yellow("  now run /login to set your API key"));
   void next.loadModels().then(() => {
     if (provider === next) applyConfigToAgent();
   });
@@ -562,14 +528,6 @@ function activateModel(modelId: string) {
   modelOverride = modelId === provider?.defaultModel ? null : modelId;
   applyConfigToAgent();
   say(cyan(`  ◇ model: ${modelId}`));
-}
-
-async function selectableProviderModels(): Promise<readonly string[]> {
-  if (!provider) return [];
-  const known = await provider.loadModels();
-  if (!isCopilotProvider() || !copilotAuth.info) return known;
-  const available = new Set(copilotAuth.info.availableModelIds);
-  return known.filter((id) => available.has(id));
 }
 
 /* ------------------------------------------------------------------ */
@@ -588,7 +546,7 @@ function showStatus() {
     }`,
     `  model  : ${currentModelId() || dim("(none)")}`,
     `  thinking: ${agent?.state.thinkingLevel ?? "off"}`,
-    `  auth   : ${hasCurrentAuth() ? green("connected") : dim("(none — /login)")}`,
+    `  key    : ${currentApiKey() ? green("set") : dim("(none — /login)")}`,
     `  github : ${
       gitHubCredentials
         ? `${green("connected")} · ${gitHubCredentials.login}@${gitHubCredentials.apiBaseUrl}`
@@ -751,17 +709,7 @@ async function runSlash(input: string) {
       if (!provider) {
         say(yellow("  pick a provider first: /provider"));
       } else if (!arg) {
-        const models = await selectableProviderModels();
-        if (models.length === 0) {
-          say(
-            yellow(
-              isCopilotProvider()
-                ? "  no browser-compatible Copilot models are enabled for this account"
-                : "  no models available",
-            ),
-          );
-          break;
-        }
+        const models = await provider.loadModels();
         const modelId = await prompt.select({
           title: `Select model · ${provider.label}`,
           active: currentModelId(),
@@ -773,17 +721,6 @@ async function runSlash(input: string) {
         });
         if (modelId) activateModel(modelId);
       } else {
-        if (isCopilotProvider()) {
-          const models = await selectableProviderModels();
-          if (!models.includes(arg)) {
-            say(
-              red(
-                `  unavailable Copilot model: ${arg} (run /model to see browser-compatible choices)`,
-              ),
-            );
-            break;
-          }
-        }
         activateModel(arg);
       }
       break;
@@ -794,49 +731,11 @@ async function runSlash(input: string) {
         say(yellow("  pick a provider first: /provider <name>"));
         break;
       }
-      if (isCopilotProvider()) {
-        say(
-          dim(
-            "  create a fine-grained PAT at https://github.com/settings/personal-access-tokens/new",
-          ),
-        );
-        say(dim("  Account permissions → Copilot Requests: Read-only"));
-      }
-      const key = await prompt.ask(
-        isCopilotProvider()
-          ? "  GitHub OAuth/fine-grained token (Copilot Requests; hidden): "
-          : `  API key for ${provider.label} (hidden): `,
-        true,
-      );
+      const key = await prompt.ask(`  API key for ${provider.label} (hidden): `, true);
       const trimmed = key.trim();
       if (trimmed) {
-        if (isCopilotProvider()) {
-          say(dim("  connecting GitHub Copilot…"));
-          const known = await provider.loadModels();
-          const info = await copilotAuth.login(trimmed, known);
-          const selectable = known.filter((id) =>
-            info.availableModelIds.includes(id),
-          );
-          if (selectable.length === 0) {
-            copilotAuth.logout();
-            throw new Error(
-              "No browser-compatible models are enabled for this Copilot account.",
-            );
-          }
-          if (!selectable.includes(currentModelId())) {
-            modelOverride =
-              selectable[0] === provider.defaultModel ? null : selectable[0];
-          }
-          applyConfigToAgent();
-          say(
-            green(
-              `  ◆ GitHub Copilot connected · ${selectable.length} browser-compatible model${selectable.length === 1 ? "" : "s"}`,
-            ),
-          );
-        } else {
-          apiKeys.set(provider.name, trimmed);
-          say(green(`  ◆ key set for ${provider.label}`));
-        }
+        apiKeys.set(provider.name, trimmed);
+        say(green(`  ◆ key set for ${provider.label}`));
       } else {
         say(yellow("  login cancelled"));
       }
@@ -846,10 +745,6 @@ async function runSlash(input: string) {
     case "logout":
       if (!provider) {
         say(yellow("  no provider selected"));
-      } else if (isCopilotProvider()) {
-        copilotAuth.logout();
-        applyConfigToAgent();
-        say(green("  ◆ GitHub Copilot disconnected"));
       } else {
         apiKeys.delete(provider.name);
         say(green(`  ◆ key removed for ${provider.label}`));
@@ -1366,7 +1261,7 @@ async function main() {
         },
         streamFn: streamDispatch,
         convertToLlm: (m) => m as Message[],
-        getApiKey: currentRequestApiKey,
+        getApiKey: async () => currentApiKey(),
         toolExecution: "sequential",
       });
       agent.subscribe(renderEvent);

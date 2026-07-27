@@ -28,7 +28,6 @@ export function makeModel(cfg: ModelConfig): Model<ApiKind> {
     cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
     contextWindow: cfg.info?.contextWindow ?? 200_000,
     maxTokens: cfg.info?.maxTokens ?? 16_384,
-    headers: cfg.info?.headers,
     compat: cfg.info?.compat,
   };
   // Stash provider-specific request extras for
