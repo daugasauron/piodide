@@ -1,22 +1,15 @@
 import { WASI } from "@runno/wasi";
 import type { WASIFS, WASIExecutionResult } from "@runno/wasi";
+import type {
+  CompileRequest,
+  CompileResponse,
+  CompilerFile,
+} from "./c-compiler.ts";
 
 const ASSET_BASE_URL = "https://runno.dev/langs";
-const SOURCE_PATH = "/source.c";
 const OBJECT_PATH = "/program.o";
-const OUTPUT_PATH = "/program.wasm";
 const TAR_BLOCK_SIZE = 512;
-
-interface CompileRequest {
-  source: string;
-}
-
-interface CompileResponse {
-  ok: boolean;
-  wasm?: Uint8Array;
-  diagnostics: string;
-  error?: string;
-}
+const DIRECTORY_SENTINEL = ".piodide-compiler-directory";
 
 interface WorkerScope {
   onmessage: ((event: MessageEvent<CompileRequest>) => void) | null;
@@ -26,9 +19,11 @@ interface WorkerScope {
 const workerScope = globalThis as unknown as WorkerScope;
 
 workerScope.onmessage = (event) => {
-  void compile(event.data.source)
+  void compile(event.data)
     .then((response) => {
-      const transfer = response.wasm ? [response.wasm.buffer as ArrayBuffer] : [];
+      const transfer = response.output
+        ? [response.output.content.buffer as ArrayBuffer]
+        : [];
       workerScope.postMessage(response, transfer);
     })
     .catch((error: unknown) => {
@@ -40,22 +35,17 @@ workerScope.onmessage = (event) => {
     });
 };
 
-async function compile(source: string): Promise<CompileResponse> {
+async function compile(request: CompileRequest): Promise<CompileResponse> {
   const [clang, linker, sysroot] = await Promise.all([
     fetchModule("clang.wasm"),
     fetchModule("wasm-ld.wasm"),
     fetchSysroot(),
   ]);
-  const timestamp = timestamps();
   const fs: WASIFS = {
     ...sysroot,
-    [SOURCE_PATH]: {
-      path: SOURCE_PATH,
-      mode: "string",
-      content: source,
-      timestamps: timestamp,
-    },
+    ...workspaceFS(request.workspace),
   };
+  ensureParentDirectory(fs, request.outputPath);
 
   const compiled = await run(clang, [
     "clang",
@@ -74,7 +64,7 @@ async function compile(source: string): Promise<CompileResponse> {
     "-emit-obj",
     "-o",
     OBJECT_PATH,
-    SOURCE_PATH,
+    request.sourcePath,
   ], fs);
   if (compiled.result.exitCode !== 0) {
     return {
@@ -95,7 +85,7 @@ async function compile(source: string): Promise<CompileResponse> {
     OBJECT_PATH,
     "-lc",
     "-o",
-    OUTPUT_PATH,
+    request.outputPath,
   ], compiled.result.fs);
   const diagnostics = compiled.output + linked.output;
   if (linked.result.exitCode !== 0) {
@@ -106,11 +96,43 @@ async function compile(source: string): Promise<CompileResponse> {
     };
   }
 
-  const output = linked.result.fs[OUTPUT_PATH];
+  const output = linked.result.fs[request.outputPath];
   if (!output || output.mode !== "binary") {
     return { ok: false, diagnostics, error: "The linker did not produce a WebAssembly file." };
   }
-  return { ok: true, diagnostics, wasm: output.content.slice() };
+  return {
+    ok: true,
+    diagnostics,
+    output: { path: request.outputPath, content: output.content.slice() },
+  };
+}
+
+function workspaceFS(files: CompilerFile[]): WASIFS {
+  const fs: WASIFS = {};
+  for (const file of files) {
+    fs[file.path] = {
+      path: file.path,
+      mode: "binary",
+      content: file.content,
+      timestamps: timestamps(),
+    };
+  }
+  return fs;
+}
+
+function ensureParentDirectory(fs: WASIFS, path: string): void {
+  const slash = path.lastIndexOf("/");
+  if (slash <= 0) return;
+  const parent = path.slice(0, slash);
+  const prefix = `${parent}/`;
+  if (Object.keys(fs).some((candidate) => candidate.startsWith(prefix))) return;
+  const sentinel = `${prefix}${DIRECTORY_SENTINEL}`;
+  fs[sentinel] = {
+    path: sentinel,
+    mode: "binary",
+    content: new Uint8Array(),
+    timestamps: timestamps(),
+  };
 }
 
 async function run(

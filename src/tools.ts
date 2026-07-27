@@ -31,7 +31,7 @@ import {
   type GitHubCredentials,
 } from "./git-tool.ts";
 import { downloadPyodideFile } from "./file-transfer.ts";
-import { compileC } from "./c-compiler.ts";
+import { compileC, snapshotCompilerWorkspace } from "./c-compiler.ts";
 
 const MAX_READ_LINES = 2000;
 const MAX_READ_BYTES = 50_000;
@@ -199,17 +199,20 @@ export function createCompileCTool(
     label: "Compile C",
     description:
       "Compile one C source file from the in-browser filesystem to a wasm32-wasi " +
-      "executable. The compiler runs in a disposable browser worker. This POC supports " +
-      "a single C file and the bundled WASI libc; it does not support native libraries.",
+      "executable. The compiler sees a bounded snapshot of /home/web, including local " +
+      "headers and existing files, and writes its output back to that same Pyodide " +
+      "workspace. This POC supports one translation unit and the bundled WASI libc.",
     parameters: CompileCParams,
     executionMode: "sequential",
     async execute(_id, params, signal) {
       const path = fsResolve(py, params.path);
       if (!fsExists(py, path)) throw new Error(`File not found: ${path}`);
       if (fsIsDir(py, path)) throw new Error(`Path is a directory: ${path}`);
+      if (!path.startsWith("/home/web/")) {
+        throw new Error("C source must be inside the shared /home/web workspace.");
+      }
 
-      const source = fsReadText(py, path);
-      const sourceBytes = byteLength(source);
+      const sourceBytes = py.FS.stat(path).size;
       if (sourceBytes > MAX_C_SOURCE_BYTES) {
         throw new Error(`C source exceeds the ${MAX_C_SOURCE_BYTES / 1024} KiB POC limit.`);
       }
@@ -218,25 +221,34 @@ export function createCompileCTool(
         ? `${path.slice(0, -2)}.wasm`
         : `${path}.wasm`;
       const output = fsResolve(py, params.output ?? defaultOutput);
+      if (!output.startsWith("/home/web/")) {
+        throw new Error("C compiler output must be inside the shared /home/web workspace.");
+      }
       if (!output.toLowerCase().endsWith(".wasm")) {
         throw new Error("C compiler output must end in .wasm.");
       }
       if (output === path) throw new Error("C compiler output cannot overwrite the source file.");
 
       const startedAt = performance.now();
-      const result = await compileC(source, signal);
-      if (result.wasm.byteLength > MAX_C_WASM_BYTES) {
+      const workspace = snapshotCompilerWorkspace(py, new Set([output]));
+      const result = await compileC(
+        { sourcePath: path, outputPath: output, workspace: workspace.files },
+        signal,
+      );
+      if (result.output.content.byteLength > MAX_C_WASM_BYTES) {
         throw new Error(`Compiler output exceeds the ${MAX_C_WASM_BYTES / 1024 / 1024} MiB limit.`);
       }
 
       const slash = output.lastIndexOf("/");
       if (slash > 0) py.FS.mkdirTree(output.slice(0, slash));
-      py.FS.writeFile(output, result.wasm);
+      py.FS.writeFile(output, result.output.content);
       const durationMs = Math.round(performance.now() - startedAt);
-      const summary = `Compiled ${path} -> ${output} (${result.wasm.byteLength} bytes).`;
+      const summary =
+        `Compiled ${path} -> ${output} (${result.output.content.byteLength} bytes) ` +
+        `with ${workspace.files.length} workspace files (${workspace.bytes} bytes).`;
       return {
         content: [text(result.diagnostics ? `${summary}\n${result.diagnostics}` : `${summary}\n`)],
-        details: { path, output, bytes: result.wasm.byteLength, durationMs },
+        details: { path, output, bytes: result.output.content.byteLength, durationMs },
       };
     },
   };
