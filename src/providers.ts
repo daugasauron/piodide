@@ -112,14 +112,17 @@ export const PROVIDERS: Record<string, ProviderDef> = {
     name: "moonshot",
     label: "Moonshot (Kimi)",
     api: "openai-completions",
-    baseUrl: "https://api.moonshot.cn/v1",
-    defaultModel: "kimi-k2-0905-preview",
-    loadModels: modelCatalogue("moonshot", "kimi-k2-0905-preview", () =>
-      import("@earendil-works/pi-ai/providers/moonshotai-cn.models").then(
-        (module) => module.MOONSHOTAI_CN_MODELS,
+    // International endpoint. A key created on platform.moonshot.ai is
+    // rejected with HTTP 401 by the China endpoint (api.moonshot.cn), and the
+    // .cn model IDs (e.g. kimi-k2-0905-preview) are not permissioned on .ai.
+    baseUrl: "https://api.moonshot.ai/v1",
+    defaultModel: "kimi-k3",
+    loadModels: modelCatalogue("moonshot", "kimi-k3", () =>
+      import("@earendil-works/pi-ai/providers/moonshotai.models").then(
+        (module) => module.MOONSHOTAI_MODELS,
       ),
     ),
-    note: "api.moonshot.cn; /model kimi-k3 or moonshot-v1-8k",
+    note: "api.moonshot.ai (intl); /model kimi-k3, kimi-k2.6, kimi-k2.7-code",
   },
   zhipu: {
     name: "zhipu",
