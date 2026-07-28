@@ -19,7 +19,7 @@
  * as the trailing blob. BigInts cross as {"$bigint": decimal-string}.
  * Reads and writes larger than the data region are chunked by the client.
  */
-import { errnoOf, type WasiStat } from "./abi.ts";
+import { errnoOf, WasiError, type Errno, type WasiStat } from "./abi.ts";
 import type { WasiDirEntry, WasiFs, WasiHandle, WasiOpenOptions } from "./fs.ts";
 
 const STATE = 0;
@@ -104,8 +104,9 @@ export class RpcFsClient implements WasiFs {
 
     const length = Atomics.load(this.control, PAYLOAD_LENGTH);
     const jsonLength = this.view.getUint32(this.dataStart, true);
+    // Browsers refuse TextDecoder on shared-buffer views: copy out first.
     const response = decodeJson(
-      this.data.subarray(this.dataStart + 4, this.dataStart + 4 + jsonLength),
+      this.data.slice(this.dataStart + 4, this.dataStart + 4 + jsonLength),
     );
     const responseBlob = this.data.slice(
       this.dataStart + 4 + jsonLength,
@@ -223,13 +224,13 @@ export class RpcFsClient implements WasiFs {
   }
 }
 
-/** Error carrying the remote errno. Converted back to WasiError semantics
- * by `errnoOf` through the numeric `errno` field. */
-class RpcRemoteError extends Error {
-  readonly errno: number;
+/**
+ * Error carrying the remote errno. Must be a WasiError so `errnoOf` (and
+ * therefore the guest) sees the remote errno instead of a generic EIO.
+ */
+class RpcRemoteError extends WasiError {
   constructor(errno: number, message: string) {
-    super(message);
-    this.errno = errno;
+    super(errno as Errno, message);
   }
 }
 
@@ -398,7 +399,8 @@ export function serveWasiFsRpc(options: RpcFsServerOptions): RpcFsServer {
     let args: Record<string, unknown>;
     let blob: Uint8Array;
     try {
-      args = decodeJson(data.subarray(dataStart + 4, dataStart + 4 + jsonLength));
+      // Browsers refuse TextDecoder on shared-buffer views: copy out first.
+      args = decodeJson(data.slice(dataStart + 4, dataStart + 4 + jsonLength));
       blob = data.slice(dataStart + 4 + jsonLength, dataStart + length);
     } catch (error) {
       respondError(error);
