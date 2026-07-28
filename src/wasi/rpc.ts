@@ -128,11 +128,33 @@ export class RpcFsClient implements WasiFs {
 
   /**
    * Ask the main thread to run another program (the "piodide" spawn API).
-   * Blocks the worker until the child exits; returns its exit code.
+   * Blocks the worker until the child exits. `stdinText` is fed as the
+   * child's stdin instead of the session input; `capture` asks for the
+   * child's stdout back; `outFile`/`append` streams stdout to a file.
    */
-  spawnRpc(path: string, args: string[], cwd: string): number {
-    const { response } = this.request("spawn", { path, args, cwd });
-    return response.exitCode as number;
+  spawnRpc(request: {
+    path: string;
+    args: string[];
+    cwd: string;
+    stdinText?: Uint8Array;
+    capture?: boolean;
+    outFile?: string;
+    append?: boolean;
+  }): { exitCode: number; stdout?: Uint8Array } {
+    const { response, blob } = this.request(
+      "spawn",
+      {
+        path: request.path,
+        args: request.args,
+        cwd: request.cwd,
+        capture: request.capture ?? false,
+        outFile: request.outFile ?? null,
+        append: request.append ?? false,
+      },
+      request.stdinText,
+    );
+    const exitCode = response.exitCode as number;
+    return request.capture ? { exitCode, stdout: blob } : { exitCode };
   }
 
   open(path: string, options: WasiOpenOptions, mode: number): WasiHandle {
@@ -258,7 +280,15 @@ export interface RpcFsServerOptions {
    * Must be available on this thread (it orchestrates workers + stdio).
    * Absent → spawn requests fail with ENOSYS.
    */
-  spawn?: (request: { path: string; args: string[]; cwd: string }) => Promise<number>;
+  spawn?: (request: {
+    path: string;
+    args: string[];
+    cwd: string;
+    stdinText?: Uint8Array;
+    capture?: boolean;
+    outFile?: string;
+    append?: boolean;
+  }) => Promise<{ exitCode: number; stdout?: Uint8Array }>;
   signal?: AbortSignal;
 }
 
@@ -409,12 +439,16 @@ export function serveWasiFsRpc(options: RpcFsServerOptions): RpcFsServer {
           return;
         }
         try {
-          const exitCode = await options.spawn({
+          const result = await options.spawn({
             path: args.path as string,
             args: args.args as string[],
             cwd: args.cwd as string,
+            stdinText: blob.byteLength > 0 ? blob : undefined,
+            capture: args.capture === true,
+            outFile: (args.outFile as string) ?? undefined,
+            append: args.append === true,
           });
-          respond({ errno: 0, exitCode });
+          respond({ errno: 0, exitCode: result.exitCode }, result.stdout);
         } catch (error) {
           respond({
             errno: 0,

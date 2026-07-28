@@ -21,6 +21,19 @@ const SHELL_BINARIES = ["slop", "ls", "cat", "fd-find", "echo", "env", "grep"];
 const SHELL_SOURCES = ["slop.c", "ls.c", "cat.c", "fd-find.c", "echo.c", "env.c", "grep.c"];
 const SHELL_PREOPENS = ["/home/web", "/", "/bin"];
 const MAX_CHILDREN = 32;
+/** Pipe captures are bounded so a runaway producer can't eat the page. */
+const MAX_CAPTURE_BYTES = 1024 * 1024;
+
+function concatChunks(chunks: Uint8Array[], total: number): Uint8Array {
+  const out = new Uint8Array(Math.min(total, MAX_CAPTURE_BYTES));
+  let offset = 0;
+  for (const chunk of chunks) {
+    if (offset + chunk.byteLength > out.byteLength) break;
+    out.set(chunk, offset);
+    offset += chunk.byteLength;
+  }
+  return out;
+}
 
 /**
  * One shared input buffer for the session, like a tty: input typed while a
@@ -147,36 +160,104 @@ export class SlopSession {
     this.input.push(chunk);
   }
 
-  /* ------------------------------ spawning ------------------------------ */
+/* ------------------------------ spawning ------------------------------ */
 
-  private async onSpawn(request: { path: string; args: string[]; cwd: string }): Promise<number> {
-    const { path, args, cwd } = request;
-    if (path === "compile") return this.toolchainCompile(args.slice(1), cwd);
-    if (path === "link") return this.toolchainLink(args.slice(1), cwd);
+  private async onSpawn(request: {
+    path: string;
+    args: string[];
+    cwd: string;
+    stdinText?: Uint8Array;
+    capture?: boolean;
+    outFile?: string;
+    append?: boolean;
+  }): Promise<{ exitCode: number; stdout?: Uint8Array }> {
+    const { path, args, cwd, stdinText, capture, outFile, append } = request;
+    if (path === "compile") {
+      return { exitCode: await this.toolchainCompile(args.slice(1), cwd) };
+    }
+    if (path === "link") {
+      return { exitCode: await this.toolchainLink(args.slice(1), cwd) };
+    }
 
     if (this.activeChildren >= MAX_CHILDREN) {
       this.deps.writeOut(`slop: too many nested programs\r\n`);
-      return 126;
+      return { exitCode: 126 };
     }
     this.activeChildren++;
+
+    // stdout routing: capture for pipes, stream to a file for redirects,
+    // or straight to the terminal.
+    const captured: Uint8Array[] = [];
+    let capturedBytes = 0;
+    let fileStream: unknown = null;
+    let fileError: string | null = null;
+    if (outFile) {
+      try {
+        fileStream = this.deps.py.FS.open(outFile, append ? "a" : "w");
+      } catch (error) {
+        fileError = error instanceof Error ? error.message : String(error);
+      }
+    }
+    if (fileError) {
+      this.deps.writeOut(`slop: ${outFile}: ${fileError}\r\n`);
+      this.activeChildren--;
+      return { exitCode: 1 };
+    }
+
+    const writeChunk = (chunk: Uint8Array) => {
+      if (capture) {
+        if (capturedBytes + chunk.byteLength <= MAX_CAPTURE_BYTES) {
+          captured.push(chunk.slice());
+        } else if (capturedBytes < MAX_CAPTURE_BYTES) {
+          captured.push(chunk.slice(0, MAX_CAPTURE_BYTES - capturedBytes));
+        }
+        capturedBytes += chunk.byteLength;
+        return;
+      }
+      if (fileStream !== null) {
+        const py = this.deps.py;
+        py.FS.write(fileStream, chunk, 0, chunk.byteLength);
+        return;
+      }
+      this.deps.writeOut(new TextDecoder().decode(chunk, { stream: true }));
+    };
+
+    // Piped stdin replaces the session input for this child.
+    const stdinProvider = stdinText
+      ? (() => {
+          let sent = false;
+          return () => {
+            if (sent) return null;
+            sent = true;
+            return stdinText;
+          };
+        })()
+      : () => this.input.next();
+
     const handle = startWasiProgram(this.deps.py, {
       executablePath: path,
       args: args.slice(1),
       env: { PATH: "/bin", PWD: cwd, TERM: "ghostty" },
       preopens: SHELL_PREOPENS,
       interactiveStdin: true,
-      stdinProvider: () => this.input.next(),
+      stdinProvider,
       timeoutMs: 0,
       spawnHandler: (nested) => this.onSpawn(nested),
-      onStdout: this.deps.writeOut,
+      onStdoutBytes: capture || outFile ? writeChunk : undefined,
+      onStdout: capture || outFile ? undefined : this.deps.writeOut,
       onStderr: this.deps.writeOut,
     });
     this.foreground = handle;
     try {
       const result = await handle.result;
-      return result.exitCode;
+      if (fileStream !== null) this.deps.py.FS.close(fileStream);
+      if (capture) {
+        return { exitCode: result.exitCode, stdout: concatChunks(captured, capturedBytes) };
+      }
+      return { exitCode: result.exitCode };
     } catch {
-      return 130; // SIGINT-style: killed (Ctrl+C) or crashed
+      if (fileStream !== null) this.deps.py.FS.close(fileStream);
+      return { exitCode: 130 }; // SIGINT-style: killed (Ctrl+C) or crashed
     } finally {
       this.foreground = null;
       this.activeChildren--;

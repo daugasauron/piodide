@@ -54,10 +54,20 @@ export interface WasiProgramRequest {
    * for foreground routing). Default: run the child with inherited output
    * and EOF stdin, up to a bounded nesting depth.
    */
-  spawnHandler?: (request: { path: string; args: string[]; cwd: string }) => Promise<number>;
+  spawnHandler?: (request: {
+    path: string;
+    args: string[];
+    cwd: string;
+    stdinText?: Uint8Array;
+    capture?: boolean;
+    outFile?: string;
+    append?: boolean;
+  }) => Promise<{ exitCode: number; stdout?: Uint8Array }>;
   /** Internal: current spawn nesting depth. */
   spawnDepth?: number;
   onStdout?: (text: string) => void;
+  /** Raw stdout bytes (takes precedence over onStdout; for pipes/files). */
+  onStdoutBytes?: (chunk: Uint8Array) => void;
   onStderr?: (text: string) => void;
   /** Worker mode only; 0 disables. Default 30s. */
   timeoutMs?: number;
@@ -196,8 +206,23 @@ function startInWorker(
   const spawnDepth = request.spawnDepth ?? 0;
   const spawn =
     request.spawnHandler ??
-    (async ({ path, args, cwd }: { path: string; args: string[]; cwd: string }) => {
-      if (spawnDepth >= MAX_SPAWN_DEPTH) return 126;
+    (async ({
+      path,
+      args,
+      cwd,
+      stdinText,
+      capture,
+    }: {
+      path: string;
+      args: string[];
+      cwd: string;
+      stdinText?: Uint8Array;
+      capture?: boolean;
+      outFile?: string;
+      append?: boolean;
+    }): Promise<{ exitCode: number; stdout?: Uint8Array }> => {
+      if (spawnDepth >= MAX_SPAWN_DEPTH) return { exitCode: 126 };
+      const captured: Uint8Array[] = [];
       const child = startWasiProgram(py, {
         executablePath: path,
         args: args.slice(1),
@@ -205,14 +230,35 @@ function startInWorker(
         preopens: ["/home/web", "/", "/bin"],
         timeoutMs: request.timeoutMs ?? DEFAULT_TIMEOUT_MS,
         spawnDepth: spawnDepth + 1,
-        onStdout: request.onStdout,
+        stdinProvider: stdinText
+          ? (() => {
+              let sent = false;
+              return () => {
+                if (sent) return null;
+                sent = true;
+                return stdinText;
+              };
+            })()
+          : undefined,
+        onStdoutBytes: capture ? (chunk) => captured.push(chunk.slice()) : undefined,
+        onStdout: capture ? undefined : request.onStdout,
         onStderr: request.onStderr,
       });
       try {
         const result = await child.result;
-        return result.exitCode;
+        if (capture) {
+          const total = captured.reduce((sum, chunk) => sum + chunk.byteLength, 0);
+          const stdout = new Uint8Array(total);
+          let offset = 0;
+          for (const chunk of captured) {
+            stdout.set(chunk, offset);
+            offset += chunk.byteLength;
+          }
+          return { exitCode: result.exitCode, stdout };
+        }
+        return { exitCode: result.exitCode };
       } catch {
-        return 130;
+        return { exitCode: 130 };
       }
     });
   const server = serveWasiFsRpc({
@@ -253,7 +299,8 @@ function startInWorker(
     worker.onmessage = (event: MessageEvent<WasiWorkerMessage>) => {
       const message = event.data;
       if (message.type === "stdout") {
-        request.onStdout?.(decoder.decode(message.chunk, { stream: true }));
+        if (request.onStdoutBytes) request.onStdoutBytes(message.chunk);
+        else request.onStdout?.(decoder.decode(message.chunk, { stream: true }));
         return;
       }
       if (message.type === "stderr") {

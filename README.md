@@ -64,9 +64,14 @@ on the same live filesystem. It keeps its own cwd, and `$PATH` is exactly
   name**, first hit on `$PATH` — no implicit extensions.
 - `cd`, `pwd`, `exit`, `help` are shell builtins (`cd` must be: a child
   can't change its parent's cwd).
+- `cat f.txt | grep x | grep -v y` pipes, `cmd > f` / `cmd >> f` redirects
+  (redirect beats pipe, like bash), and `$VAR` / `${VAR}` / `$?` / `\$`
+  expansion (single quotes inhibit). Pipes are captured child-to-child
+  (bounded at 1 MiB); redirects stream straight into the MEMFS file.
 - Programs spawn through a `piodide.spawn` host import: the shell asks the
-  runtime to run a sibling process, the terminal foreground switches to it,
-  and the exit code comes back. Children can spawn children.
+  runtime to run a sibling process with explicit stdin/stdout routing
+  (pipe in/out, file, or terminal), the terminal foreground switches to
+  it, and the exit code comes back. Children can spawn children.
 - Every built-in command does `chdir(getenv("PWD"))` at startup, adopting
   the shell's cwd — that's how relative paths work (WASI has no process
   cwd). Your own programs should do the same; snippets live in

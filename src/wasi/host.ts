@@ -335,6 +335,26 @@ export class WasiHost {
     return decoder.decode(bytes.subarray(pointer, end));
   }
 
+  /** Copy bytes out of guest memory (for custom imports). */
+  readBytes(pointer: number, length: number): Uint8Array {
+    return this.bytes().slice(pointer, pointer + length);
+  }
+
+  /** Copy bytes into guest memory (for custom imports). */
+  writeBytes(pointer: number, data: Uint8Array): void {
+    this.bytes().set(data, pointer);
+  }
+
+  /** Read a little-endian u32 from guest memory (for custom imports). */
+  readUint32(pointer: number): number {
+    return this.view().getUint32(pointer, true);
+  }
+
+  /** Write a little-endian u32 into guest memory (for custom imports). */
+  writeUint32(pointer: number, value: number): void {
+    this.view().setUint32(pointer, value >>> 0, true);
+  }
+
   /** Read a sequence of NUL-terminated strings, ended by an empty string. */
   readCStringArray(pointer: number): string[] {
     const values: string[] = [];
