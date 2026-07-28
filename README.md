@@ -51,6 +51,31 @@ clang-compile → wasm-ld-link → run cycle (see `test/README.md`).
 
 ![WASI](screens/wasi-summary.png)
 
+## slop — the piodide shell
+
+Press **Ctrl+Shift+S** to toggle between the agent and `slop`, a minimal
+bash-ish shell written in C (`shell/src/slop.c`) running as a WASI program
+on the same live filesystem. It keeps its own cwd, and `$PATH` is exactly
+`/bin`:
+
+- `/bin/ls.wasm`, `/bin/cat.wasm`, `/bin/fd-find.wasm` — tiny C utilities
+  (sources in `shell/src/`, also fetched to `/home/web/slop/`).
+- `cd`, `pwd`, `exit`, `help` are shell builtins (`cd` must be: a child
+  can't change its parent's cwd).
+- Programs spawn through a `piodide.spawn` host import: the shell asks the
+  runtime to run a sibling process, the terminal foreground switches to it,
+  and the exit code comes back. Children can spawn children.
+- `compile hello.c` / `link hello.o -o /bin/hello.wasm` are pseudo-commands
+  routed to the in-browser clang toolchain — so you can write C, build it
+  into `/bin`, and immediately run it, entirely inside the sandbox.
+- Ctrl+C kills the foreground program (or cancels the line), Ctrl+D sends
+  EOF (or exits the shell).
+
+Interactive mode needs cross-origin isolation. Dev/`vite preview` send the
+headers; on GitHub Pages a tiny service worker (`public/coi-serviceworker.js`)
+adds them so the deployed shell works too. Without isolation everything
+falls back to main-thread (non-interactive) execution.
+
 ## Quickstart
 
 ```bash
@@ -59,8 +84,9 @@ npm run dev
 ```
 
 Open http://localhost:5173, then use `/provider`, `/login`, and `/model`.
-Typing `/` shows the available commands. Press `Ctrl+Shift+E` to toggle Neovim;
-`:Ex` browses the same `/home/web` files used by the agent and Python.
+Typing `/` shows the available commands. Press `Ctrl+Shift+E` to toggle Neovim
+(`:Ex` browses the same `/home/web` files used by the agent and Python) and
+`Ctrl+Shift+S` to toggle the slop shell.
 
 ## Agent tools
 

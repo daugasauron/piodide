@@ -21,12 +21,14 @@ import { serveWasiFsRpc } from "./rpc.ts";
 import { executeWasi } from "./runner.ts";
 import type { WasiWorkerInit, WasiWorkerMessage } from "./worker-runner.ts";
 import type { WasiRunJs } from "./python-module.ts";
+import type { WasiPreopen } from "./host.ts";
 
 const RPC_BUFFER_BYTES = 2 * 1024 * 1024;
 const DEFAULT_TIMEOUT_MS = 30_000;
 const MAX_CAPTURE_CHARS = 100_000;
+const MAX_SPAWN_DEPTH = 4;
 
-export const WASI_PREOPENS = ["/home/web", "/"];
+export const WASI_PREOPENS: (string | WasiPreopen)[] = ["/home/web", "/"];
 
 export interface WasiProgramRequest {
   executablePath: string;
@@ -40,6 +42,16 @@ export interface WasiProgramRequest {
    * program after any pre-fed `stdin` is consumed. `push(null)` sends EOF.
    */
   interactiveStdin?: boolean;
+  /** Preopen override (defaults to /home/web + /). */
+  preopens?: (string | WasiPreopen)[];
+  /**
+   * Custom handler for the "piodide" spawn import (shell sessions use this
+   * for foreground routing). Default: run the child with inherited output
+   * and EOF stdin, up to a bounded nesting depth.
+   */
+  spawnHandler?: (request: { path: string; args: string[]; cwd: string }) => Promise<number>;
+  /** Internal: current spawn nesting depth. */
+  spawnDepth?: number;
   onStdout?: (text: string) => void;
   onStderr?: (text: string) => void;
   /** Worker mode only; 0 disables. Default 30s. */
@@ -175,10 +187,38 @@ function startInWorker(
 
   const rpcBuffer = new SharedArrayBuffer(RPC_BUFFER_BYTES);
   const fs = new EmscriptenFs(py.FS);
+  const spawnDepth = request.spawnDepth ?? 0;
+  const spawn =
+    request.spawnHandler ??
+    (async ({ path, args, cwd }: { path: string; args: string[]; cwd: string }) => {
+      if (spawnDepth >= MAX_SPAWN_DEPTH) return 126;
+      const child = startWasiProgram(py, {
+        executablePath: path,
+        args: args.slice(1),
+        env: { PATH: "/bin", PWD: cwd, ...(request.env ?? {}) },
+        preopens: [
+          "/home/web",
+          "/",
+          "/bin",
+          { name: ".", path: cwd || "/" },
+        ],
+        timeoutMs: request.timeoutMs ?? DEFAULT_TIMEOUT_MS,
+        spawnDepth: spawnDepth + 1,
+        onStdout: request.onStdout,
+        onStderr: request.onStderr,
+      });
+      try {
+        const result = await child.result;
+        return result.exitCode;
+      } catch {
+        return 130;
+      }
+    });
   const server = serveWasiFsRpc({
     fs,
     buffer: rpcBuffer,
     stdin: () => stdin.next(),
+    spawn,
   });
 
   const worker = new WasiWorker();
@@ -236,8 +276,9 @@ function startInWorker(
       binary: binary.slice().buffer as ArrayBuffer,
       args: [request.executablePath, ...(request.args ?? [])],
       env: { PWD: "/home/web", ...(request.env ?? {}) },
-      preopens: WASI_PREOPENS,
+      preopens: request.preopens ?? WASI_PREOPENS,
       rpcBuffer,
+      spawnApi: true,
     };
     worker.postMessage(init, [init.binary]);
   });
@@ -273,7 +314,7 @@ function startOnMainThread(
       args: [request.executablePath, ...(request.args ?? [])],
       env: { PWD: "/home/web", ...(request.env ?? {}) },
       fs: new EmscriptenFs(py.FS),
-      preopens: WASI_PREOPENS,
+      preopens: request.preopens ?? WASI_PREOPENS,
       stdin: () => {
         if (stdinSent) return null;
         stdinSent = true;

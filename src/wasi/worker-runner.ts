@@ -9,13 +9,16 @@
  */
 import { RpcFsClient } from "./rpc.ts";
 import { executeWasi } from "./runner.ts";
+import type { WasiHost, WasiPreopen } from "./host.ts";
 
 export interface WasiWorkerInit {
   binary: ArrayBuffer;
   args: string[];
   env: Record<string, string>;
-  preopens: string[];
+  preopens: (string | WasiPreopen)[];
   rpcBuffer: SharedArrayBuffer;
+  /** Expose the "piodide" spawn import to the guest. */
+  spawnApi?: boolean;
 }
 
 export type WasiWorkerMessage =
@@ -45,6 +48,18 @@ export function startWasiWorker(port: WorkerPort): void {
           stdin: () => fs.stdinRead(65_536),
           stdout: (chunk) => post({ type: "stdout", chunk }, [chunk.buffer as ArrayBuffer]),
           stderr: (chunk) => post({ type: "stderr", chunk }, [chunk.buffer as ArrayBuffer]),
+          extendImports: init.spawnApi
+            ? (host: WasiHost) => ({
+                piodide: {
+                  spawn: (pathPtr: number, argvPtr: number, cwdPtr: number): number => {
+                    const path = host.readCString(pathPtr);
+                    const args = host.readCStringArray(argvPtr);
+                    const cwd = host.readCString(cwdPtr);
+                    return fs.spawnRpc(path, args, cwd);
+                  },
+                },
+              })
+            : undefined,
         });
         post({ type: "result", exitCode: result.exitCode });
       } catch (error) {

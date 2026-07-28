@@ -45,13 +45,24 @@ const FD_STDERR = 2;
 
 /* ------------------------------- options --------------------------------- */
 
+/**
+ * A preopened directory. `name` is what fd_prestat_dir_name advertises to
+ * the guest libc (wasi-libc computes path prefixes from it); `path` is the
+ * real directory in the backing filesystem. A preopen named "." gives the
+ * guest cwd semantics: wasi-libc resolves relative paths against it.
+ */
+export interface WasiPreopen {
+  name: string;
+  path: string;
+}
+
 export interface WasiHostOptions {
   /** Full argv including argv[0]. */
   args?: string[];
   env?: Record<string, string> | string[];
   fs: WasiFs;
   /** Directories exposed to wasi-libc as preopens (fd 3..n), in order. */
-  preopens?: string[];
+  preopens?: (string | WasiPreopen)[];
   /**
    * ABI generation: modern "wasi_snapshot_preview1" or legacy snapshot0
    * ("wasi_unstable"). runner.ts auto-detects from the module's imports;
@@ -70,6 +81,12 @@ export interface WasiHostOptions {
   random?: (buffer: Uint8Array) => void;
   /** Synchronous sleep in milliseconds (used by poll_oneoff clock waits). */
   sleepSync?: (ms: number) => void;
+  /**
+   * Extra import modules merged into the guest import object (e.g. the
+   * "piodide" spawn API). The callback receives the host so imports can
+   * read guest memory via its helpers.
+   */
+  extendImports?: (host: WasiHost) => Record<string, Record<string, WebAssembly.ImportValue>>;
 }
 
 /** Thrown by proc_exit; caught by `WasiHost.start`. */
@@ -86,6 +103,8 @@ interface FdEntry {
   kind: FdKind;
   /** Absolute path (file/dir/preopen entries). */
   path?: string;
+  /** Advertised preopen name (preopen entries only). */
+  preopenName?: string;
   handle?: WasiHandle;
   rightsBase: bigint;
   rightsInheriting: bigint;
@@ -146,6 +165,7 @@ export class WasiHost {
   private readonly randomFill: (buffer: Uint8Array) => void;
   private readonly sleepSync: (ms: number) => void;
   private readonly abiVersion: "preview1" | "snapshot0";
+  private readonly extendImports?: WasiHostOptions["extendImports"];
 
   private memory: WebAssembly.Memory | null = null;
   private fds = new Map<number, FdEntry>();
@@ -169,15 +189,19 @@ export class WasiHost {
     this.randomFill = options.random ?? defaultRandom;
     this.sleepSync = options.sleepSync ?? defaultSleepSync;
     this.abiVersion = options.abiVersion ?? "preview1";
+    this.extendImports = options.extendImports;
 
     this.fds.set(FD_STDIN, stdEntry("stdin", RIGHTS.FD_READ));
     this.fds.set(FD_STDOUT, stdEntry("stdout", RIGHTS.FD_WRITE));
     this.fds.set(FD_STDERR, stdEntry("stderr", RIGHTS.FD_WRITE));
     for (const preopen of options.preopens ?? ["/"]) {
+      const { name, path } =
+        typeof preopen === "string" ? { name: preopen, path: preopen } : preopen;
       const fd = this.nextFd++;
       this.fds.set(fd, {
         kind: "preopen",
-        path: preopen,
+        path,
+        preopenName: name,
         rightsBase: RIGHTS_ALL,
         rightsInheriting: RIGHTS_ALL,
         fdflags: 0,
@@ -295,10 +319,33 @@ export class WasiHost {
       sock_send: () => ERRNO.NOTSUP,
       sock_shutdown: () => ERRNO.NOTSUP,
     };
+    const extra = this.extendImports ? this.extendImports(this) : {};
     return {
       wasi_snapshot_preview1: imports,
       wasi_unstable: imports,
+      ...extra,
     };
+  }
+
+  /** Read a NUL-terminated string from guest memory (for custom imports). */
+  readCString(pointer: number): string {
+    const bytes = this.bytes();
+    let end = pointer;
+    while (end < bytes.byteLength && bytes[end] !== 0) end++;
+    return decoder.decode(bytes.subarray(pointer, end));
+  }
+
+  /** Read a sequence of NUL-terminated strings, ended by an empty string. */
+  readCStringArray(pointer: number): string[] {
+    const values: string[] = [];
+    let cursor = pointer;
+    for (;;) {
+      const value = this.readCString(cursor);
+      if (value === "") break;
+      values.push(value);
+      cursor += encoder.encode(value).byteLength + 1;
+    }
+    return values;
   }
 
   /** Wrap a syscall so thrown WasiErrors become errnos. */
@@ -542,6 +589,10 @@ export class WasiHost {
         let filled = 0;
         while (filled < iov.length) {
           if (this.stdinBuffer.byteLength === 0) {
+            // Terminal semantics: only block for more input when nothing has
+            // been delivered yet. Once any byte is available, finish the
+            // read as a short read (like a tty returning after a line).
+            if (total > 0 || filled > 0) break;
             const next = this.stdinSource?.() ?? null;
             if (next === null || next.byteLength === 0) break;
             this.stdinBuffer = next;
@@ -552,7 +603,7 @@ export class WasiHost {
           filled += take;
         }
         total += filled;
-        if (filled < iov.length) break; // EOF
+        if (filled < iov.length) break; // short read or EOF
       }
       this.view().setUint32(nreadPtr, total, true);
       return ERRNO.SUCCESS;
@@ -746,14 +797,14 @@ export class WasiHost {
     if (entry.kind !== "preopen") throw new WasiError(ERRNO.BADF, "not a preopen fd");
     const view = this.view();
     view.setUint8(bufPtr, 0); // preopen tag
-    view.setUint32(bufPtr + 4, encoder.encode(entry.path ?? "/").byteLength, true);
+    view.setUint32(bufPtr + 4, encoder.encode(entry.preopenName ?? "/").byteLength, true);
     return ERRNO.SUCCESS;
   }
 
   private fdPrestatDirName(fd: number, pathPtr: number, pathLength: number): number {
     const entry = this.entry(fd);
     if (entry.kind !== "preopen") throw new WasiError(ERRNO.BADF, "not a preopen fd");
-    const encoded = encoder.encode(entry.path ?? "/");
+    const encoded = encoder.encode(entry.preopenName ?? "/");
     if (encoded.byteLength > pathLength) return ERRNO.NAMETOOLONG;
     this.bytes().set(encoded, pathPtr);
     return ERRNO.SUCCESS;

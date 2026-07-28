@@ -53,8 +53,9 @@ import {
   uploadConflicts,
   uploadHostFiles,
 } from "./file-transfer.ts";
-import { makeJsRunner, startWasiProgram } from "./wasi/browser-runner.ts";
+import { makeJsRunner, startWasiProgram, supportsWorkerWasi } from "./wasi/browser-runner.ts";
 import { installWasiPythonModule } from "./wasi/python-module.ts";
+import { SlopSession } from "./slop.ts";
 
 /* ------------------------------------------------------------------ */
 /* system prompt                                                       */
@@ -101,7 +102,7 @@ const BANNER = [
   "\x1b[2mghostty-web · pyodide · pi-agent-core\x1b[0m",
   "",
   "\x1b[2mCommands:\x1b[0m  /provider   /model   /github   /new   /tree   /thinking   /nvim   /help",
-  "\x1b[2mEditor:\x1b[0m    Ctrl+Shift+E toggles agent ↔ Neovim",
+  "\x1b[2mEditor:\x1b[0m    Ctrl+Shift+E toggles agent ↔ Neovim · Ctrl+Shift+S toggles slop shell",
   "\x1b[2mStart with:\x1b[0m /provider  →  choose one  →  /login  →  then just type.",
   "",
 ].join("\r\n");
@@ -165,8 +166,9 @@ let spinner!: Spinner;
 let agent: Agent | null = null;
 let py: Pyodide | null = null;
 let pyReady = false;
-let activeView: "agent" | "nvim" = "agent";
+let activeView: "agent" | "nvim" | "slop" = "agent";
 let neovim: NeovimController | null = null;
+let slop: SlopSession | null = null;
 let neovimStarting: Promise<NeovimController> | null = null;
 let viewToggleRunning = false;
 
@@ -234,6 +236,18 @@ document.addEventListener("keydown", (event) => {
     event.stopImmediatePropagation();
     void toggleNeovim();
   }
+  if (
+    htmlPreviewEl.hidden &&
+    event.ctrlKey &&
+    event.shiftKey &&
+    !event.altKey &&
+    !event.metaKey &&
+    event.code === "KeyS"
+  ) {
+    event.preventDefault();
+    event.stopImmediatePropagation();
+    void toggleSlop();
+  }
 }, true);
 
 function currentModelId() {
@@ -263,7 +277,11 @@ function renderFooter() {
   const cacheHit = cacheTotal > 0 ? `${((usage.cacheRead / cacheTotal) * 100).toFixed(1)}%` : "—";
 
   footerLocationEl.textContent =
-    activeView === "nvim" ? "/home/web (nvim)" : `/home/web (${model})`;
+    activeView === "nvim"
+      ? "/home/web (nvim)"
+      : activeView === "slop"
+        ? "/home/web (slop)"
+        : `/home/web (${model})`;
   footerHeapEl.textContent = `heap ${currentHeapUsage()}`;
   footerUsageEl.textContent =
     `↑${formatTokenCount(usage.input)} ↓${formatTokenCount(usage.output)} ` +
@@ -470,6 +488,65 @@ async function toggleNeovim() {
   } finally {
     viewToggleRunning = false;
   }
+}
+
+/* ------------------------------------------------------------------ */
+/* slop shell view (Ctrl+Shift+S)                                      */
+/* ------------------------------------------------------------------ */
+
+async function toggleSlop() {
+  if (activeView === "slop") {
+    activeView = "agent";
+    inputHandler = (data) => prompt.feed(data);
+    renderFooter();
+    say(dim("  — agent view · Ctrl+Shift+S returns to slop —"));
+    if (!prompt.isOccupied()) prompt.start();
+    return;
+  }
+  if (activeView !== "agent") return;
+  if (!pyReady || !py) {
+    footerLocationEl.textContent = "slop will be available when Python is ready";
+    window.setTimeout(renderFooter, 1500);
+    return;
+  }
+  if (prompt.isOccupied()) {
+    footerLocationEl.textContent = "Finish the current run or menu before opening slop";
+    window.setTimeout(renderFooter, 1500);
+    return;
+  }
+  if (!supportsWorkerWasi()) {
+    say(yellow("  slop needs cross-origin isolation (npm run dev / vite preview / coi service worker)"));
+    return;
+  }
+
+  activeView = "slop";
+  renderFooter();
+  if (!slop || !slop.alive) {
+    slop = new SlopSession({
+      py,
+      writeOut: writeProgramOutput,
+      note: (text) => say(dim(text)),
+      onExit: () => {
+        if (activeView === "slop") {
+          activeView = "agent";
+          inputHandler = (data) => prompt.feed(data);
+          renderFooter();
+          if (!prompt.isOccupied()) prompt.start();
+        }
+      },
+    });
+    try {
+      await slop.start();
+    } catch (error) {
+      activeView = "agent";
+      renderFooter();
+      say(red(`  slop failed to start: ${error instanceof Error ? error.message : String(error)}`));
+      return;
+    }
+  } else {
+    say(dim("  — slop shell · Ctrl+Shift+S returns to the agent —"));
+  }
+  inputHandler = (data) => slop!.feed(data);
 }
 
 /* ------------------------------------------------------------------ */
@@ -1063,6 +1140,7 @@ async function runSlash(input: string) {
 
     case "hotkeys":
       say(dim("  Ctrl+Shift+E  toggle agent / Neovim"));
+      say(dim("  Ctrl+Shift+S  toggle agent / slop shell"));
       say(dim("  Shift+Tab  cycle thinking level"));
       say(dim("  ↑/↓        history or menu selection"));
       say(dim("  Tab        complete selected slash command"));
@@ -1342,7 +1420,30 @@ the browser.
   );
 }
 
+/**
+ * GitHub Pages cannot send COOP/COEP headers, so register a service worker
+ * that adds them; one reload later the page is cross-origin isolated and the
+ * WASI worker mode (interactive slop, killable runs) works in production.
+ */
+async function ensureCrossOriginIsolation() {
+  if (typeof crossOriginIsolated === "undefined" || crossOriginIsolated) return;
+  if (!("serviceWorker" in navigator)) return;
+  try {
+    await navigator.serviceWorker.register(`${import.meta.env.BASE_URL}coi-serviceworker.js`);
+    if (
+      !navigator.serviceWorker.controller &&
+      !sessionStorage.getItem("coi-reloaded")
+    ) {
+      sessionStorage.setItem("coi-reloaded", "1");
+      location.reload();
+    }
+  } catch {
+    // No isolation: everything still works in main-thread fallback mode.
+  }
+}
+
 async function main() {
+  void ensureCrossOriginIsolation();
   handle = await createTerminal(mount);
   writer = handle.writer;
   markdown = new AssistantMarkdown(writer);

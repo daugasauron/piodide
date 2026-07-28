@@ -126,6 +126,15 @@ export class RpcFsClient implements WasiFs {
     return blob;
   }
 
+  /**
+   * Ask the main thread to run another program (the "piodide" spawn API).
+   * Blocks the worker until the child exits; returns its exit code.
+   */
+  spawnRpc(path: string, args: string[], cwd: string): number {
+    const { response } = this.request("spawn", { path, args, cwd });
+    return response.exitCode as number;
+  }
+
   open(path: string, options: WasiOpenOptions, mode: number): WasiHandle {
     const { response } = this.request("open", { path, options, mode });
     return response.handle as number;
@@ -244,6 +253,12 @@ export interface RpcFsServerOptions {
    * late (the worker stays parked). Return null to signal EOF.
    */
   stdin?: () => Uint8Array | null | Promise<Uint8Array | null>;
+  /**
+   * Run a child program on behalf of the guest (the "piodide" spawn API).
+   * Must be available on this thread (it orchestrates workers + stdio).
+   * Absent → spawn requests fail with ENOSYS.
+   */
+  spawn?: (request: { path: string; args: string[]; cwd: string }) => Promise<number>;
   signal?: AbortSignal;
 }
 
@@ -386,6 +401,27 @@ export function serveWasiFsRpc(options: RpcFsServerOptions): RpcFsServer {
         const chunk = (await options.stdin?.()) ?? null;
         if (chunk === null || chunk.byteLength === 0) respond({ errno: 0, eof: true });
         else respond({ errno: 0 }, chunk);
+        return;
+      }
+      case "spawn": {
+        if (!options.spawn) {
+          respond({ errno: 52 /* ENOSYS */, error: "spawn not available" });
+          return;
+        }
+        try {
+          const exitCode = await options.spawn({
+            path: args.path as string,
+            args: args.args as string[],
+            cwd: args.cwd as string,
+          });
+          respond({ errno: 0, exitCode });
+        } catch (error) {
+          respond({
+            errno: 0,
+            exitCode: 127,
+            error: error instanceof Error ? error.message : String(error),
+          });
+        }
         return;
       }
       default:
