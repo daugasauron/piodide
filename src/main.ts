@@ -20,7 +20,10 @@ import {
 } from "./termui.ts";
 import {
   formatWasmHeapUsage,
+  fsExists,
+  fsIsDir,
   fsReadText,
+  fsResolve,
   fsWriteText,
   loadPyodideRuntime,
   type Pyodide,
@@ -50,6 +53,8 @@ import {
   uploadConflicts,
   uploadHostFiles,
 } from "./file-transfer.ts";
+import { startWasiProgram } from "./wasi/browser-runner.ts";
+import { installWasiPythonModule } from "./wasi/python-module.ts";
 
 /* ------------------------------------------------------------------ */
 /* system prompt                                                       */
@@ -59,9 +64,9 @@ const SYSTEM_PROMPT = `You are pi, a coding assistant running entirely inside th
 
 Tools:
 - python: run focused Python 3 code; stdout/stderr is shown live and returned to you. Install a pure-Python package only when needed with: import micropip; await micropip.install("pkg").
-- compile_c: compile one small C source file from /home/web to a wasm32-wasi .o object. It sees the Pyodide workspace, including quoted local headers.
+- compile_c: compile one small C source file from /home/web to a wasm32-wasi .o object. It sees the live Pyodide filesystem, including quoted local headers.
 - link_wasi: link one or more .o files stored in /home/web into a WASI .wasm executable with wasm-ld and WASI libc. The compiler/linker assets are lazily downloaded.
-- run_wasi: run a WASI .wasm file from /home/web with arguments, stdin, and environment variables. The program sees /home/web and its file changes are synchronized back to Pyodide after exit. Use absolute /home/web paths for file access inside C.
+- run_wasi: run a WASI .wasm file from /home/web with arguments, stdin, and environment variables. The program shares the live Pyodide filesystem (no copying): files it creates, edits, or deletes are immediately visible everywhere. Inside C, absolute /home/web paths work, and the process cwd starts at / — chdir or use absolute paths. From Python you can also import wasi and await wasi.run_wasi(path, args=[...], stdin="...").
 - read: read a text file with line numbers; offset (1-based) and limit paginate large files.
 - write: create or overwrite a file; parent directories are created automatically.
 - edit: apply exact, unique string replacements (each oldText must match exactly once).
@@ -119,6 +124,7 @@ const COMMANDS: readonly CommandSuggestion[] = [
   { name: "/thinking", description: "select model thinking level" },
   { name: "/download", description: "save a Pyodide file to the host" },
   { name: "/upload", description: "import host files into /home/web" },
+  { name: "/run", description: "run a WASI program from /home/web" },
   { name: "/image", description: "display an image file from /home/web" },
   { name: "/html", description: "open an HTML file from /home/web" },
   { name: "/nvim", description: "open Neovim (Ctrl+Shift+E)" },
@@ -166,6 +172,12 @@ let viewToggleRunning = false;
 
 let provider: ProviderDef | null = null;
 const apiKeys = new Map<string, string>();
+
+/**
+ * Terminal input routing. The prompt owns keystrokes by default; an
+ * interactive WASI program (/run) temporarily takes them over.
+ */
+let inputHandler: (data: string) => void = (data) => prompt.feed(data);
 let gitHubCredentials: GitHubCredentials | null = null;
 let modelOverride: string | null = null;
 const sessions = new BrowserSessions();
@@ -534,6 +546,92 @@ function activateModel(modelId: string) {
 }
 
 /* ------------------------------------------------------------------ */
+/* interactive WASI programs (/run)                                    */
+/* ------------------------------------------------------------------ */
+
+function splitArgs(input: string): string[] {
+  const args: string[] = [];
+  const pattern = /"([^"]*)"|'([^']*)'|(\S+)/g;
+  let match: RegExpExecArray | null;
+  while ((match = pattern.exec(input)) !== null) {
+    args.push(match[1] ?? match[2] ?? match[3]);
+  }
+  return args;
+}
+
+function writeProgramOutput(text: string) {
+  writer.write(text.replaceAll("\r\n", "\n").replaceAll("\n", "\r\n"));
+}
+
+async function runInteractive(argline: string) {
+  if (!py) return;
+  const parts = splitArgs(argline);
+  if (parts.length === 0) return;
+  const path = fsResolve(py, parts[0]);
+  if (!fsExists(py, path)) {
+    say(red(`  not found: ${path}`));
+    return;
+  }
+  if (fsIsDir(py, path)) {
+    say(red(`  is a directory: ${path}`));
+    return;
+  }
+
+  const handle = startWasiProgram(py, {
+    executablePath: path,
+    args: parts.slice(1),
+    interactiveStdin: true,
+    timeoutMs: 0,
+    onStdout: writeProgramOutput,
+    onStderr: writeProgramOutput,
+  });
+  prompt.setBusy(true);
+  writer.write(dim("  stdin: line-buffered with echo · Ctrl+C kills · Ctrl+D sends EOF\r\n"));
+
+  const encoder = new TextEncoder();
+  let line = "";
+  const previousHandler = inputHandler;
+  inputHandler = (data: string) => {
+    for (const ch of data) {
+      if (ch === "\r" || ch === "\n") {
+        writer.writeln("");
+        handle.stdin?.push(encoder.encode(`${line}\n`));
+        line = "";
+      } else if (ch === "\x7f" || ch === "\b") {
+        if (line.length > 0) {
+          line = line.slice(0, -1);
+          writer.write("\b \b");
+        }
+      } else if (ch === "\x03") {
+        handle.kill();
+        return;
+      } else if (ch === "\x04") {
+        if (line.length === 0) handle.stdin?.close();
+        else {
+          handle.stdin?.push(encoder.encode(line));
+          line = "";
+        }
+      } else if (ch >= " ") {
+        line += ch;
+        writer.write(ch);
+      }
+    }
+  };
+
+  try {
+    const result = await handle.result;
+    writer.ensureNewline();
+    say(dim(`  ↳ exit ${result.exitCode}`));
+  } catch (error) {
+    writer.ensureNewline();
+    say(red(`  program stopped: ${error instanceof Error ? error.message : String(error)}`));
+  } finally {
+    inputHandler = previousHandler;
+    prompt.setBusy(false);
+  }
+}
+
+/* ------------------------------------------------------------------ */
 /* slash commands                                                      */
 /* ------------------------------------------------------------------ */
 
@@ -680,6 +778,7 @@ async function runSlash(input: string) {
       say(dim("  /name  /session  /copy  /export          session utilities"));
       say(dim("  /thinking [level]                         model effort (Shift+Tab cycles)"));
       say(dim("  /download <path>  /upload [directory]      host file transfer"));
+      say(dim("  /run <prog.wasm> [args]                    run a WASI program (live filesystem)"));
       say(dim("  /image <path>  /html <path>                browser previews"));
       say(dim("  /nvim                                      open Neovim editor"));
       say(dim("  /status  /clear  /hotkeys                  terminal utilities"));
@@ -891,6 +990,17 @@ async function runSlash(input: string) {
     case "upload":
       await uploadFromHost(arg);
       break;
+
+    case "run": {
+      if (!pyReady || !py) {
+        say(yellow("  python filesystem is still loading"));
+      } else if (!arg) {
+        say(yellow("  usage: /run <program.wasm> [args...]"));
+      } else {
+        await runInteractive(arg);
+      }
+      break;
+    }
 
     case "thinking": {
       if (!agent) break;
@@ -1140,7 +1250,7 @@ async function renderEvent(event: AgentEvent) {
             footer = `  ↳ linked ${d.objects ?? 0} object${d.objects === 1 ? "" : "s"} · ${d.bytes ?? 0} bytes${d.output ? ` · ${d.output}` : ""} · ${((d.durationMs ?? 0) / 1000).toFixed(1)}s`;
             break;
           case "run_wasi":
-            footer = `  ↳ WASI exit ${d.exitCode ?? "?"} · ${d.outputBytes ?? 0} output bytes · ${d.written ?? 0} written · ${d.deleted ?? 0} deleted`;
+            footer = `  ↳ WASI exit ${d.exitCode ?? "?"} · ${d.outputBytes ?? 0} output bytes`;
             break;
           case "read": footer = `  ↳ read ${d.lines ?? 0} lines${d.path ? ` · ${d.path}` : ""}`; break;
           case "write": footer = `  ↳ wrote ${d.bytes ?? 0} bytes${d.path ? ` · ${d.path}` : ""}`; break;
@@ -1249,7 +1359,7 @@ async function main() {
     commands: COMMANDS,
     commandMenu: commandMenuEl,
   });
-  term.onData((data: string) => prompt.feed(data));
+  term.onData((data: string) => inputHandler(data));
 
   renderFooter();
   window.setInterval(renderFooter, 1000);
@@ -1263,6 +1373,7 @@ async function main() {
     .then(async (p) => {
       py = p;
       seedWelcome(p);
+      installWasiPythonModule(p);
       agent = new Agent({
         initialState: {
           systemPrompt: SYSTEM_PROMPT,

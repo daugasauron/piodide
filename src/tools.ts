@@ -10,11 +10,13 @@
  *   image   -> display an image file from the MEMFS
  *   html    -> display an HTML file in a sandboxed browser popout
  *   compile_c -> compile one C source file to a wasm32-wasi object
- *   link_wasi -> link Pyodide object files into a WASI executable
- *   run_wasi -> run a WASI executable against the Pyodide workspace
+ *   link_wasi -> link object files into a WASI executable
+ *   run_wasi -> run a WASI executable against the live Pyodide MEMFS
  *
  * `read`/`write`/`edit` deliberately use the *same* MEMFS that `python` sees,
  * so a file written by `write` is immediately importable / readable by Python.
+ * WASI programs share that same filesystem live (no copying): files they
+ * create or modify are visible to Python and the editor while they run.
  */
 import { Type } from "typebox";
 import type { AgentTool } from "@earendil-works/pi-agent-core";
@@ -33,13 +35,8 @@ import {
   type GitHubCredentials,
 } from "./git-tool.ts";
 import { downloadPyodideFile } from "./file-transfer.ts";
-import { runToolchain } from "./c-compiler.ts";
-import { runWasi } from "./wasi-runtime.ts";
-import {
-  isWasmWorkspacePath,
-  snapshotWasmWorkspace,
-  syncWasmWorkspace,
-} from "./wasm-workspace.ts";
+import { runToolchainInBrowser } from "./c-compiler.ts";
+import { runWasiProgram } from "./wasi/browser-runner.ts";
 
 const MAX_READ_LINES = 2000;
 const MAX_READ_BYTES = 50_000;
@@ -47,8 +44,8 @@ const MAX_FETCH_BYTES = 50_000;
 const MAX_IMAGE_BYTES = 12 * 1024 * 1024;
 const MAX_HTML_BYTES = 2 * 1024 * 1024;
 const MAX_C_SOURCE_BYTES = 256 * 1024;
-const MAX_TOOLCHAIN_OUTPUT_BYTES = 16 * 1024 * 1024;
 const MAX_WASI_STDIN_BYTES = 64 * 1024;
+const MAX_WASI_OUTPUT_CHARS = 100_000;
 
 function text(t: string) {
   return { type: "text" as const, text: t };
@@ -199,8 +196,6 @@ export interface RunWasiDetails {
   path: string;
   exitCode: number;
   outputBytes: number;
-  written: number;
-  deleted: number;
   truncated: boolean;
 }
 
@@ -274,19 +269,18 @@ export function createCompileCTool(
       if (output === path) throw new Error("C compiler output cannot overwrite the source file.");
 
       const startedAt = performance.now();
-      const workspace = snapshotWasmWorkspace(py, new Set([output]));
-      const result = await runToolchain(
-        { operation: "compile", sourcePath: path, outputPath: output, workspace: workspace.files },
+      const result = await runToolchainInBrowser(
+        py,
+        { operation: "compile", sourcePath: path, outputPath: output },
         signal,
       );
-      writeToolchainOutput(py, result.output);
+      if (!fsExists(py, output)) throw new Error("Clang produced no output file.");
+      const outputBytes = py.FS.stat(output).size;
       const durationMs = Math.round(performance.now() - startedAt);
-      const summary =
-        `Compiled ${path} -> ${output} (${result.output.content.byteLength} bytes) ` +
-        `with ${workspace.files.length} workspace files (${workspace.bytes} bytes).`;
+      const summary = `Compiled ${path} -> ${output} (${outputBytes} bytes).`;
       return {
         content: [text(result.diagnostics ? `${summary}\n${result.diagnostics}` : `${summary}\n`)],
-        details: { path, output, bytes: result.output.content.byteLength, durationMs },
+        details: { path, output, bytes: outputBytes, durationMs },
       };
     },
   };
@@ -323,22 +317,23 @@ export function createLinkWasiTool(
       }
 
       const startedAt = performance.now();
-      const workspace = snapshotWasmWorkspace(py, new Set([output]));
-      const result = await runToolchain(
-        { operation: "link", objectPaths: objects, outputPath: output, workspace: workspace.files },
+      const result = await runToolchainInBrowser(
+        py,
+        { operation: "link", objectPaths: objects, outputPath: output },
         signal,
       );
-      writeToolchainOutput(py, result.output);
+      if (!fsExists(py, output)) throw new Error("wasm-ld produced no output file.");
+      const outputBytes = py.FS.stat(output).size;
       const durationMs = Math.round(performance.now() - startedAt);
       const summary =
         `Linked ${objects.length} object file${objects.length === 1 ? "" : "s"} -> ${output} ` +
-        `(${result.output.content.byteLength} bytes).`;
+        `(${outputBytes} bytes).`;
       return {
         content: [text(result.diagnostics ? `${summary}\n${result.diagnostics}` : `${summary}\n`)],
         details: {
           output,
           objects: objects.length,
-          bytes: result.output.content.byteLength,
+          bytes: outputBytes,
           durationMs,
         },
       };
@@ -355,9 +350,9 @@ export function createRunWasiTool(
     name: "run_wasi",
     label: "Run WASI",
     description:
-      "Run a WASI .wasm executable from /home/web. The program sees the Pyodide " +
-      "workspace at /home/web; files it creates, edits, or deletes are synchronized " +
-      "back after it exits. stdout and stderr are returned.",
+      "Run a WASI .wasm executable from /home/web. The program shares the live " +
+      "Pyodide filesystem: files it creates, edits, or deletes are immediately " +
+      "visible to Python and the other tools. stdout and stderr are returned.",
     parameters: RunWasiParams,
     executionMode: "sequential",
     async execute(_id, params, signal, onUpdate) {
@@ -371,36 +366,39 @@ export function createRunWasiTool(
         throw new Error(`WASI stdin exceeds the ${MAX_WASI_STDIN_BYTES / 1024} KiB limit.`);
       }
 
-      const workspace = snapshotWasmWorkspace(py);
-      const originalPaths = workspace.files.map((file) => file.path);
-      const result = await runWasi(
+      let output = "";
+      let outputTruncated = false;
+      const appendOutput = (chunk: string) => {
+        if (output.length >= MAX_WASI_OUTPUT_CHARS) {
+          outputTruncated = true;
+          return;
+        }
+        const remaining = MAX_WASI_OUTPUT_CHARS - output.length;
+        output += chunk.slice(0, remaining);
+        if (chunk.length > remaining) outputTruncated = true;
+      };
+
+      const result = await runWasiProgram(
+        py,
         {
           executablePath: path,
           args: params.args ?? [],
           stdin,
           env: params.env ?? {},
-          workspace: workspace.files,
+          onStdout: appendOutput,
+          onStderr: appendOutput,
         },
         signal,
       );
-      const synced = syncWasmWorkspace(
-        py,
-        originalPaths,
-        result.files,
-        result.directories,
-      );
-      const renderedOutput =
-        result.output + (result.outputTruncated ? "\n…<WASI output truncated>\n" : "");
+      const renderedOutput = output + (outputTruncated ? "\n…<WASI output truncated>\n" : "");
       if (renderedOutput) {
         onUpdate?.({
           content: [text(renderedOutput)],
           details: {
             path,
             exitCode: result.exitCode,
-            outputBytes: byteLength(result.output),
-            written: synced.written,
-            deleted: synced.deleted,
-            truncated: result.outputTruncated,
+            outputBytes: byteLength(output),
+            truncated: outputTruncated,
           },
         });
       }
@@ -409,10 +407,8 @@ export function createRunWasiTool(
         details: {
           path,
           exitCode: result.exitCode,
-          outputBytes: byteLength(result.output),
-          written: synced.written,
-          deleted: synced.deleted,
-          truncated: result.outputTruncated,
+          outputBytes: byteLength(output),
+          truncated: outputTruncated,
         },
       };
     },
@@ -728,24 +724,14 @@ function bytesToBase64(bytes: Uint8Array): string {
   return btoa(parts.join(""));
 }
 
+function isWasmWorkspacePath(path: string): boolean {
+  return path.startsWith("/home/web/");
+}
+
 function requireWorkspaceFile(py: Pyodide, path: string, label: string): void {
   if (!isWasmWorkspacePath(path)) throw new Error(`${label} must be inside /home/web: ${path}`);
   if (!fsExists(py, path)) throw new Error(`${label} not found: ${path}`);
   if (fsIsDir(py, path)) throw new Error(`${label} is a directory: ${path}`);
-}
-
-function writeToolchainOutput(
-  py: Pyodide,
-  output: { path: string; content: Uint8Array },
-): void {
-  if (output.content.byteLength > MAX_TOOLCHAIN_OUTPUT_BYTES) {
-    throw new Error(
-      `Toolchain output exceeds the ${MAX_TOOLCHAIN_OUTPUT_BYTES / 1024 / 1024} MiB limit.`,
-    );
-  }
-  const slash = output.path.lastIndexOf("/");
-  if (slash > 0) py.FS.mkdirTree(output.path.slice(0, slash));
-  py.FS.writeFile(output.path, output.content);
 }
 
 function countOccurrences(haystack: string, needle: string): number {

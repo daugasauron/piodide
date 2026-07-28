@@ -18,7 +18,36 @@ Surprisingly powerful.
 
 ## WASI
 
-"Investigate your environment and try to figure out how to run WASI compiled binaries that share the pyodide FS."
+A from-scratch WASI runtime (`src/wasi/`) runs wasm32-wasi programs against
+the **live** Pyodide filesystem — no copying, no snapshotting. A file written
+by a WASI program is immediately visible to Python, Neovim, and the agent
+tools, and vice versa.
+
+- `host.ts` implements ~45 `wasi_snapshot_preview1` syscalls (full fd I/O
+  including `pread`/`pwrite`/`readdir`, the whole `path_*` family,
+  `poll_oneoff`, …) plus the legacy `wasi_unstable` (snapshot0) ABI used by
+  older binaries like the runno clang. Filesystem calls go through a small
+  pluggable interface.
+- Two execution strategies share the host: a **worker** whose syscalls are
+  bridged synchronously to the main-thread MEMFS over a SharedArrayBuffer
+  (`Atomics.wait`/`waitAsync`) when the page is cross-origin isolated (dev
+  server, `vite preview`) — killable and with interactive stdin — and a
+  **main-thread** fallback for GitHub Pages (no headers, no
+  SharedArrayBuffer), where programs still share the MEMFS directly.
+- The in-browser C toolchain (clang + wasm-ld, fetched lazily from
+  runno.dev) runs on the same host with a `/sys` sysroot overlay, so
+  `compile_c` output lands directly in `/home/web`.
+
+Ways to run programs:
+
+- `/run prog.wasm [args…]` in the terminal (interactive line-buffered stdin,
+  Ctrl+C kills, Ctrl+D sends EOF).
+- From Python: `import wasi; result = await wasi.run_wasi("/home/web/prog.wasm", args=[...])`.
+- From the agent: the `run_wasi` tool.
+
+`node --experimental-strip-types --test "test/*.test.ts"` covers the host,
+the Emscripten bridge, the SAB RPC stack, and a full
+clang-compile → wasm-ld-link → run cycle (see `test/README.md`).
 
 ![WASI](screens/wasi-summary.png)
 
@@ -38,7 +67,8 @@ Typing `/` shows the available commands. Press `Ctrl+Shift+E` to toggle Neovim;
 - `python` — runs Python in the shared Pyodide runtime with live output;
   pure-Python packages can be installed with `micropip`.
 - `compile_c` / `link_wasi` / `run_wasi` — compile C into `.o` files, link
-  Pyodide objects into WASI executables, and run them against `/home/web`.
+  objects into WASI executables, and run them against the live `/home/web`
+  filesystem (see the WASI section above).
 - `read` — reads text files from `/home/web` with line numbers and pagination.
 - `write` — creates or replaces files in the in-browser filesystem.
 - `edit` — applies exact, unique text replacements to existing files.

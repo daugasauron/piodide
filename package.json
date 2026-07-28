@@ -8,7 +8,9 @@
     "dev": "vite",
     "prebuild": "node scripts/copy-wasm.mjs",
     "build": "tsc && vite build",
-    "preview": "vite preview"
+    "preview": "vite preview",
+    "test": "node --experimental-strip-types --test \"test/*.test.ts\"",
+    "test:fetch-toolchain": "node scripts/fetch-toolchain-assets.mjs"
   },
   "devDependencies": {
     "typescript": "~6.0.2",
@@ -18,7 +20,6 @@
     "@earendil-works/pi-agent-core": "^0.81.1",
     "@earendil-works/pi-ai": "^0.81.1",
     "@monaco-neovim-wasm/wasm-async": "0.1.28",
-    "@runno/wasi": "^0.10.0",
     "ghostty-web": "https://github.com/NimbleMarkets/ghostty-web/archive/20b270562b6829dc05d3478b7c83feb2a3054713.tar.gz",
     "markdansi": "^0.3.2",
     "monaco-editor": "0.55.1",

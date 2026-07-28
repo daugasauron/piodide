@@ -9,13 +9,24 @@ export const PYODIDE_INDEX = `https://cdn.jsdelivr.net/pyodide/${PYODIDE_VERSION
 
 // Minimal surface we use from pyodide. We keep it loose to avoid depending on
 // the (heavy) @types for the whole runtime.
+export interface PyodideFSStat {
+  dev: number;
+  ino: number;
+  mode: number;
+  nlink: number;
+  size: number;
+  atime: number | Date;
+  mtime: number | Date;
+  ctime: number | Date;
+}
+
 export interface PyodideFS {
   writeFile(path: string, data: string | Uint8Array, opts?: { encoding?: string }): void;
   readFile(path: string, opts?: { encoding?: string }): string | Uint8Array;
   mkdirTree(path: string): void;
   readdir(path: string): string[];
-  stat(path: string): { mode: number; size: number };
-  lstat(path: string): { mode: number; size: number };
+  stat(path: string, dontFollow?: boolean): PyodideFSStat;
+  lstat(path: string): PyodideFSStat;
   unlink(path: string): void;
   rmdir(path: string): void;
   chmod(path: string, mode: number): void;
@@ -25,12 +36,23 @@ export interface PyodideFS {
   isDir(mode: number): boolean;
   isLink?(mode: number): boolean;
   chdir(path: string): void;
+  // Extended Emscripten surface used by the WASI filesystem bridge.
+  open(path: string, flags: string, mode?: number): unknown;
+  close(stream: unknown): void;
+  read(stream: unknown, buffer: Uint8Array, offset: number, length: number, position?: number): number;
+  write(stream: unknown, buffer: Uint8Array, offset: number, length: number, position?: number): number;
+  mkdir(path: string, mode?: number): void;
+  rename(oldPath: string, newPath: string): void;
+  link?(oldPath: string, newPath: string): void;
+  truncate(path: string, length: number): void;
+  utime(path: string, atime: number, mtime: number): void;
 }
 
 export interface Pyodide {
   runPythonAsync(code: string): Promise<unknown>;
   runPython(code: string): unknown;
   loadPackage(names: string | string[]): Promise<unknown>;
+  registerJsModule(name: string, module: Record<string, unknown>): void;
   FS: PyodideFS;
   setStdout(opts: { batched?: (s: string) => void }): void;
   setStderr(opts: { batched?: (s: string) => void }): void;
