@@ -10,12 +10,17 @@
 #include <string.h>
 #include <dirent.h>
 #include <sys/stat.h>
+#include <unistd.h>
 
 static int cmpstr(const void *a, const void *b) {
   return strcmp(*(char *const *)a, *(char *const *)b);
 }
 
 int main(int argc, char **argv) {
+  /* slop passes its cwd as PWD: adopt it so relative paths work. */
+  const char *pwd = getenv("PWD");
+  if (pwd) chdir(pwd);
+
   int long_fmt = 0, all = 0;
   const char *paths[64];
   int npaths = 0;

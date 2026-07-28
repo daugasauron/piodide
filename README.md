@@ -58,18 +58,25 @@ bash-ish shell written in C (`shell/src/slop.c`) running as a WASI program
 on the same live filesystem. It keeps its own cwd, and `$PATH` is exactly
 `/bin`:
 
-- `/bin/ls.wasm`, `/bin/cat.wasm`, `/bin/fd-find.wasm` — tiny C utilities
-  (sources in `shell/src/`, also fetched to `/home/web/slop/`).
+- `/bin/ls`, `/bin/cat`, `/bin/grep` (simple substring grep), `/bin/echo`,
+  `/bin/env`, `/bin/fd-find` — tiny C utilities (sources in `shell/src/`,
+  also fetched to `/home/web/slop/`). Command lookup matches the **exact
+  name**, first hit on `$PATH` — no implicit extensions.
 - `cd`, `pwd`, `exit`, `help` are shell builtins (`cd` must be: a child
   can't change its parent's cwd).
 - Programs spawn through a `piodide.spawn` host import: the shell asks the
   runtime to run a sibling process, the terminal foreground switches to it,
   and the exit code comes back. Children can spawn children.
-- `compile hello.c` / `link hello.o -o /bin/hello.wasm` are pseudo-commands
+- Every built-in command does `chdir(getenv("PWD"))` at startup, adopting
+  the shell's cwd — that's how relative paths work (WASI has no process
+  cwd). Your own programs should do the same; snippets live in
+  `/home/web/slop/`.
+- `compile hello.c` / `link hello.o -o /bin/hello` are pseudo-commands
   routed to the in-browser clang toolchain — so you can write C, build it
   into `/bin`, and immediately run it, entirely inside the sandbox.
 - Ctrl+C kills the foreground program (or cancels the line), Ctrl+D sends
-  EOF (or exits the shell).
+  EOF (or exits the shell). Typed-ahead input behaves like a tty: one shared
+  buffer, consumed by whatever reads next.
 
 Interactive mode needs cross-origin isolation. Dev/`vite preview` send the
 headers; on GitHub Pages a tiny service worker (`public/coi-serviceworker.js`)

@@ -17,9 +17,33 @@ import {
 import { runToolchainInBrowser } from "./c-compiler.ts";
 import { normalizePath } from "./wasi/abi.ts";
 
-const SHELL_BINARIES = ["slop.wasm", "ls.wasm", "cat.wasm", "fd-find.wasm"];
-const SHELL_SOURCES = ["slop.c", "ls.c", "cat.c", "fd-find.c"];
+const SHELL_BINARIES = ["slop", "ls", "cat", "fd-find", "echo", "env", "grep"];
+const SHELL_SOURCES = ["slop.c", "ls.c", "cat.c", "fd-find.c", "echo.c", "env.c", "grep.c"];
+const SHELL_PREOPENS = ["/home/web", "/", "/bin"];
 const MAX_CHILDREN = 32;
+
+/**
+ * One shared input buffer for the session, like a tty: input typed while a
+ * child runs is consumed by whatever reads next (the child, or the shell
+ * after the child exits). A null marker is a one-shot EOF for the next
+ * reader only (unlike StdinQueue's permanent EOF state).
+ */
+class SharedInput {
+  private queue: (Uint8Array | null)[] = [];
+  private waiting: ((item: Uint8Array | null) => void)[] = [];
+
+  push(item: Uint8Array | null): void {
+    if (item !== null && item.byteLength === 0) return;
+    if (this.waiting.length > 0) this.waiting.shift()!(item);
+    else this.queue.push(item);
+  }
+
+  next(): Promise<Uint8Array | null> | Uint8Array | null {
+    const queued = this.queue.shift();
+    if (queued !== undefined) return queued;
+    return new Promise((resolve) => this.waiting.push(resolve));
+  }
+}
 
 export interface SlopSessionDeps {
   py: Pyodide;
@@ -35,6 +59,8 @@ export class SlopSession {
   private line = "";
   private installed = false;
   private activeChildren = 0;
+  /** The session's shared tty-style input buffer. */
+  private input = new SharedInput();
 
   constructor(deps: SlopSessionDeps) {
     this.deps = deps;
@@ -48,10 +74,11 @@ export class SlopSession {
     if (this.slop) return;
     if (!this.installed) await this.install();
     const handle = startWasiProgram(this.deps.py, {
-      executablePath: "/bin/slop.wasm",
+      executablePath: "/bin/slop",
       env: { PATH: "/bin", PWD: "/home/web", TERM: "ghostty" },
-      preopens: ["/home/web", "/", "/bin", { name: ".", path: "/home/web" }],
+      preopens: SHELL_PREOPENS,
       interactiveStdin: true,
+      stdinProvider: () => this.input.next(),
       timeoutMs: 0,
       spawnHandler: (request) => this.onSpawn(request),
       onStdout: this.deps.writeOut,
@@ -97,18 +124,17 @@ export class SlopSession {
         if (this.foreground) this.foreground.kill();
         else {
           this.line = "";
-          this.slop?.stdin?.push(encoder.encode("\n"));
+          this.input.push(encoder.encode("\n"));
         }
         return;
       } else if (ch === "\x04") {
-        // Ctrl+D: EOF for the foreground process; exit the shell at the prompt.
+        // Ctrl+D: an EOF marker for whoever reads next (child, or the shell
+        // at its prompt, which exits on EOF).
         if (this.line.length > 0) {
-          this.push(encoder.encode(this.line));
+          this.input.push(encoder.encode(this.line));
           this.line = "";
-        } else if (this.foreground) {
-          this.foreground.stdin?.close();
         } else {
-          this.slop?.stdin?.close();
+          this.input.push(null);
         }
       } else if (ch >= " ") {
         this.line += ch;
@@ -118,8 +144,7 @@ export class SlopSession {
   }
 
   private push(chunk: Uint8Array): void {
-    const target = this.foreground ?? this.slop;
-    target?.stdin?.push(chunk);
+    this.input.push(chunk);
   }
 
   /* ------------------------------ spawning ------------------------------ */
@@ -138,8 +163,9 @@ export class SlopSession {
       executablePath: path,
       args: args.slice(1),
       env: { PATH: "/bin", PWD: cwd, TERM: "ghostty" },
-      preopens: ["/home/web", "/", "/bin", { name: ".", path: cwd }],
+      preopens: SHELL_PREOPENS,
       interactiveStdin: true,
+      stdinProvider: () => this.input.next(),
       timeoutMs: 0,
       spawnHandler: (nested) => this.onSpawn(nested),
       onStdout: this.deps.writeOut,
@@ -230,7 +256,7 @@ export class SlopSession {
   /** Fetch the committed shell binaries + sources into the MEMFS once. */
   private async install(): Promise<void> {
     const py = this.deps.py;
-    if (fsExists(py, "/bin/slop.wasm")) {
+    if (fsExists(py, "/bin/slop")) {
       this.installed = true;
       return;
     }

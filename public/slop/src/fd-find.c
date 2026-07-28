@@ -6,10 +6,12 @@
  *   Skips .git; directories are marked with a trailing /.
  */
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <ctype.h>
 #include <dirent.h>
 #include <sys/stat.h>
+#include <unistd.h>
 
 static const char *pattern = "";
 
@@ -51,6 +53,10 @@ static void walk(const char *path, const char *display) {
 }
 
 int main(int argc, char **argv) {
+  /* slop passes its cwd as PWD: adopt it so relative paths work. */
+  const char *pwd = getenv("PWD");
+  if (pwd) chdir(pwd);
+
   const char *root = ".";
   if (argc > 1) pattern = argv[1];
   if (argc > 2) root = argv[2];

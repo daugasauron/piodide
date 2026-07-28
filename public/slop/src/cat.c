@@ -2,6 +2,7 @@
  * cat — concatenate files (or stdin with no args / "-") to stdout.
  */
 #include <stdio.h>
+#include <stdlib.h>
 #include <unistd.h>
 #include <fcntl.h>
 #include <errno.h>
@@ -22,6 +23,10 @@ static int pump(int fd) {
 }
 
 int main(int argc, char **argv) {
+  /* slop passes its cwd as PWD: adopt it so relative paths work. */
+  const char *pwd = getenv("PWD");
+  if (pwd) chdir(pwd);
+
   if (argc == 1) return pump(STDIN_FILENO) < 0 ? 1 : 0;
   int rc = 0;
   for (int i = 1; i < argc; i++) {

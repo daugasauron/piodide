@@ -42,6 +42,11 @@ export interface WasiProgramRequest {
    * program after any pre-fed `stdin` is consumed. `push(null)` sends EOF.
    */
   interactiveStdin?: boolean;
+  /**
+   * External stdin provider (e.g. a shell session's shared input buffer).
+   * Overrides the internal queue; pull-based, null means EOF.
+   */
+  stdinProvider?: () => Promise<Uint8Array | null> | Uint8Array | null;
   /** Preopen override (defaults to /home/web + /). */
   preopens?: (string | WasiPreopen)[];
   /**
@@ -111,7 +116,7 @@ export function supportsWorkerWasi(): boolean {
   );
 }
 
-class StdinQueue implements WasiStdinController {
+export class StdinQueue implements WasiStdinController {
   private queue: (Uint8Array | null)[] = [];
   private waiting: ((chunk: Uint8Array | null) => void)[] = [];
   private eof = false;
@@ -184,6 +189,7 @@ function startInWorker(
     stdin.push(new TextEncoder().encode(request.stdin));
   }
   if (!request.interactiveStdin) stdin.close();
+  const stdinNext = request.stdinProvider ?? (() => stdin.next());
 
   const rpcBuffer = new SharedArrayBuffer(RPC_BUFFER_BYTES);
   const fs = new EmscriptenFs(py.FS);
@@ -196,12 +202,7 @@ function startInWorker(
         executablePath: path,
         args: args.slice(1),
         env: { PATH: "/bin", PWD: cwd, ...(request.env ?? {}) },
-        preopens: [
-          "/home/web",
-          "/",
-          "/bin",
-          { name: ".", path: cwd || "/" },
-        ],
+        preopens: ["/home/web", "/", "/bin"],
         timeoutMs: request.timeoutMs ?? DEFAULT_TIMEOUT_MS,
         spawnDepth: spawnDepth + 1,
         onStdout: request.onStdout,
@@ -217,7 +218,7 @@ function startInWorker(
   const server = serveWasiFsRpc({
     fs,
     buffer: rpcBuffer,
-    stdin: () => stdin.next(),
+    stdin: stdinNext,
     spawn,
   });
 
@@ -285,7 +286,7 @@ function startInWorker(
 
   return {
     result,
-    stdin: request.interactiveStdin ? stdin : null,
+    stdin: request.interactiveStdin && !request.stdinProvider ? stdin : null,
     kill,
   };
 }

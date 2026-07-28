@@ -29,11 +29,13 @@ static char cwd[SLOP_PATH] = "/home/web";
 static void print_help(void) {
   printf("slop — the piodide shell\n");
   printf("  builtins:  cd [dir]   pwd   exit   help\n");
-  printf("  commands:  any .wasm on $PATH (currently just /bin)\n");
+  printf("  commands:  ls cat grep echo env fd-find (any program on $PATH, which\n");
+  printf("             is exactly /bin; lookup matches the exact name, first hit)\n");
   printf("  toolchain: compile <file.c> [-o out.o]   link <a.o b.o...> -o <out.wasm>\n");
   printf("  keys:      Ctrl+C kill child / cancel line · Ctrl+D exit shell / EOF\n");
   printf("files are the live Pyodide filesystem: Python, the agent and Neovim\n");
-  printf("see everything you create, immediately.\n");
+  printf("see everything you create, immediately. Programs that chdir(getenv(\"PWD\"))\n");
+  printf("at startup inherit the shell's cwd for relative paths.\n");
 }
 
 /* Collapse "//", "/./", "/../" in place. */
@@ -100,6 +102,10 @@ static int parse(char *line, char **argv) {
   return argc;
 }
 
+/*
+ * Command lookup: search each $PATH directory in order for a file named
+ * exactly `cmd` (no implicit extensions) and run the first hit.
+ */
 static int find_command(const char *cmd, char *out) {
   if (strchr(cmd, '/') != NULL) {
     resolve(cmd, out);
@@ -112,10 +118,6 @@ static int find_command(const char *cmd, char *out) {
   for (char *dir = strtok(copy, ":"); dir && !found; dir = strtok(NULL, ":")) {
     snprintf(out, SLOP_PATH, "%s/%s", dir, cmd);
     if (is_reg(out)) found = 1;
-    else {
-      snprintf(out, SLOP_PATH, "%s/%s.wasm", dir, cmd);
-      if (is_reg(out)) found = 1;
-    }
   }
   free(copy);
   return found;
