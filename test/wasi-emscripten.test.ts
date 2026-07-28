@@ -8,41 +8,14 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import { MemoryFs } from "../src/wasi/memory-fs.ts";
 import { EmscriptenFs, type EmscriptenLikeFs, type EmscriptenStat } from "../src/wasi/emscripten-fs.ts";
-import { ERRNO, FILETYPE, WasiError, type WasiStat } from "../src/wasi/abi.ts";
+import { FILETYPE, WasiError, type WasiStat } from "../src/wasi/abi.ts";
 import { executeWasi } from "../src/wasi/runner.ts";
 import { fixtureBinary } from "./helpers.ts";
 
-/** WASI errno → Emscripten (Linux-ish) errno, inverse of the bridge map. */
-const WASI_TO_EMSCRIPTEN: Record<number, number> = {
-  [ERRNO.PERM]: 1,
-  [ERRNO.NOENT]: 2,
-  [ERRNO.INTR]: 4,
-  [ERRNO.IO]: 5,
-  [ERRNO.NXIO]: 6,
-  [ERRNO.BADF]: 9,
-  [ERRNO.AGAIN]: 11,
-  [ERRNO.ACCES]: 13,
-  [ERRNO.BUSY]: 16,
-  [ERRNO.EXIST]: 17,
-  [ERRNO.XDEV]: 18,
-  [ERRNO.NODEV]: 19,
-  [ERRNO.NOTDIR]: 20,
-  [ERRNO.ISDIR]: 21,
-  [ERRNO.INVAL]: 22,
-  [ERRNO.NFILE]: 23,
-  [ERRNO.MFILE]: 24,
-  [ERRNO.NOTTY]: 25,
-  [ERRNO.FBIG]: 27,
-  [ERRNO.NOSPC]: 28,
-  [ERRNO.SPIPE]: 29,
-  [ERRNO.ROFS]: 30,
-  [ERRNO.MLINK]: 31,
-  [ERRNO.PIPE]: 32,
-  [ERRNO.NAMETOOLONG]: 36,
-  [ERRNO.NOTEMPTY]: 39,
-  [ERRNO.LOOP]: 40,
-  [ERRNO.NOTSUP]: 95,
-};
+/** Modern Emscripten throws WASI errno codes directly. */
+function toEmscriptenErrno(wasiErrno: number): number {
+  return wasiErrno;
+}
 
 
 class EmscriptenStyleError extends Error {
@@ -55,7 +28,7 @@ class EmscriptenStyleError extends Error {
 
 function toEmscriptenError(error: unknown): never {
   if (error instanceof WasiError) {
-    throw new EmscriptenStyleError(WASI_TO_EMSCRIPTEN[error.errno] ?? 5, error.message);
+    throw new EmscriptenStyleError(toEmscriptenErrno(error.errno), error.message);
   }
   throw error;
 }
@@ -100,7 +73,7 @@ class MockEmscriptenFs implements EmscriptenLikeFs {
   open(path: string, flags: string, _mode?: number): number {
     const exists = this.mem.exists(path);
     if ((flags === "r" || flags === "r+") && !exists) {
-      throw new EmscriptenStyleError(2, `No such file or directory`);
+      throw new EmscriptenStyleError(44, `No such file or directory`);
     }
     if (flags === "w" || flags === "w+" || flags === "a" || flags === "a+") {
       if (!exists) this.mem.writeFile(path, new Uint8Array());
@@ -119,7 +92,7 @@ class MockEmscriptenFs implements EmscriptenLikeFs {
 
   private stream(id: unknown): MockStream {
     const stream = this.streams.get(id as number);
-    if (!stream || stream.closed) throw new EmscriptenStyleError(9, "Bad file descriptor");
+    if (!stream || stream.closed) throw new EmscriptenStyleError(8, "Bad file descriptor");
     return stream;
   }
 
@@ -129,7 +102,7 @@ class MockEmscriptenFs implements EmscriptenLikeFs {
 
   read(stream: unknown, buffer: Uint8Array, offset: number, length: number, position?: number): number {
     const s = this.stream(stream);
-    if (!s.canRead) throw new EmscriptenStyleError(9, "Bad file descriptor");
+    if (!s.canRead) throw new EmscriptenStyleError(8, "Bad file descriptor");
     const handle = this.mem.open(s.path, { read: true, write: false, create: false, createExcl: false, truncate: false, append: false, directory: false, followSymlinks: true }, 0);
     const data = this.mem.read(handle, BigInt(position ?? s.position), length);
     this.mem.close(handle);
@@ -140,7 +113,7 @@ class MockEmscriptenFs implements EmscriptenLikeFs {
 
   write(stream: unknown, buffer: Uint8Array, offset: number, length: number, position?: number): number {
     const s = this.stream(stream);
-    if (!s.canWrite) throw new EmscriptenStyleError(9, "Bad file descriptor");
+    if (!s.canWrite) throw new EmscriptenStyleError(8, "Bad file descriptor");
     const handle = this.mem.open(s.path, { read: true, write: true, create: false, createExcl: false, truncate: false, append: false, directory: false, followSymlinks: true }, 0);
     const data = buffer.slice(offset, offset + length);
     const written = this.mem.write(handle, position === undefined ? BigInt(s.position) : BigInt(position), data);

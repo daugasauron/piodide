@@ -20,9 +20,11 @@ import { EmscriptenFs } from "./emscripten-fs.ts";
 import { serveWasiFsRpc } from "./rpc.ts";
 import { executeWasi } from "./runner.ts";
 import type { WasiWorkerInit, WasiWorkerMessage } from "./worker-runner.ts";
+import type { WasiRunJs } from "./python-module.ts";
 
 const RPC_BUFFER_BYTES = 2 * 1024 * 1024;
 const DEFAULT_TIMEOUT_MS = 30_000;
+const MAX_CAPTURE_CHARS = 100_000;
 
 export const WASI_PREOPENS = ["/home/web", "/"];
 
@@ -58,6 +60,34 @@ export interface WasiProgramHandle {
   stdin: WasiStdinController | null;
   /** Force-stop the program (worker mode: terminate; no-op otherwise). */
   kill(): void;
+}
+
+/**
+ * JS runner injected into the `wasi` Python module: runs a program with
+ * pre-fed stdin and captured (bounded) stdout/stderr.
+ */
+export function makeJsRunner(py: Pyodide): WasiRunJs {
+  return async (path, options) => {
+    let stdout = "";
+    let stderr = "";
+    const cap = (current: string, chunk: string) =>
+      current.length >= MAX_CAPTURE_CHARS
+        ? current
+        : (current + chunk).slice(0, MAX_CAPTURE_CHARS);
+    const result = await runWasiProgram(py, {
+      executablePath: path,
+      args: options?.args ?? [],
+      env: options?.env ?? {},
+      stdin: options?.stdin ?? "",
+      onStdout: (chunk) => {
+        stdout = cap(stdout, chunk);
+      },
+      onStderr: (chunk) => {
+        stderr = cap(stderr, chunk);
+      },
+    });
+    return { exitCode: result.exitCode, stdout, stderr };
+  };
 }
 
 export function supportsWorkerWasi(): boolean {
@@ -218,6 +248,8 @@ function startInWorker(
     kill,
   };
 }
+
+export type { WasiRunJs } from "./python-module.ts";
 
 /* ---------------------------- main-thread mode --------------------------- */
 

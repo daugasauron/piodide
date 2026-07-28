@@ -53,7 +53,7 @@ import {
   uploadConflicts,
   uploadHostFiles,
 } from "./file-transfer.ts";
-import { startWasiProgram } from "./wasi/browser-runner.ts";
+import { makeJsRunner, startWasiProgram } from "./wasi/browser-runner.ts";
 import { installWasiPythonModule } from "./wasi/python-module.ts";
 
 /* ------------------------------------------------------------------ */
@@ -1373,7 +1373,7 @@ async function main() {
     .then(async (p) => {
       py = p;
       seedWelcome(p);
-      installWasiPythonModule(p);
+      installWasiPythonModule(p, makeJsRunner(p));
       agent = new Agent({
         initialState: {
           systemPrompt: SYSTEM_PROMPT,

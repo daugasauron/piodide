@@ -45,7 +45,8 @@ export interface PyodideFS {
   rename(oldPath: string, newPath: string): void;
   link?(oldPath: string, newPath: string): void;
   truncate(path: string, length: number): void;
-  utime(path: string, atime: number, mtime: number): void;
+  /** Not present in all Emscripten builds. */
+  utime?(path: string, atime: number, mtime: number): void;
 }
 
 export interface Pyodide {

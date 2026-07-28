@@ -13,6 +13,7 @@
     "test:fetch-toolchain": "node scripts/fetch-toolchain-assets.mjs"
   },
   "devDependencies": {
+    "pyodide": "^314.0.3",
     "typescript": "~6.0.2",
     "vite": "^8.1.1"
   },

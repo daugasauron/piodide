@@ -5,20 +5,24 @@
  *   result = await wasi.run_wasi("/home/web/ls.wasm", args=["/home/web"])
  *   # {"exitCode": 0, "stdout": "…", "stderr": ""}
  *
- * The JS side (`wasi_native`, registered via registerJsModule) runs the
- * program through the standard orchestrator, so Python-launched programs
- * share the live MEMFS exactly like tool- and terminal-launched ones.
+ * The JS runner is injected (see browser-runner.ts `makeJsRunner`) so this
+ * module stays free of browser-only imports and can be tested under Node.
  */
 import type { Pyodide } from "../pyodide-host.ts";
-import { runWasiProgram } from "./browser-runner.ts";
 
-const MAX_CAPTURE_CHARS = 100_000;
-
-interface RunOptions {
+export interface WasiRunJsOptions {
   args?: string[];
   env?: Record<string, string>;
   stdin?: string;
 }
+
+export interface WasiRunJsResult {
+  exitCode: number;
+  stdout: string;
+  stderr: string;
+}
+
+export type WasiRunJs = (path: string, options?: WasiRunJsOptions) => Promise<WasiRunJsResult>;
 
 const WASI_PY_SOURCE = `"""Run WASI programs against the shared Pyodide filesystem.
 
@@ -58,30 +62,8 @@ async def run_wasi(path, args=None, env=None, stdin=""):
     }
 `;
 
-export function installWasiPythonModule(py: Pyodide): void {
-  py.registerJsModule("wasi_native", {
-    run: async (path: string, options?: RunOptions) => {
-      let stdout = "";
-      let stderr = "";
-      const cap = (current: string, chunk: string) =>
-        current.length >= MAX_CAPTURE_CHARS
-          ? current
-          : (current + chunk).slice(0, MAX_CAPTURE_CHARS);
-      const result = await runWasiProgram(py, {
-        executablePath: path,
-        args: options?.args ?? [],
-        env: options?.env ?? {},
-        stdin: options?.stdin ?? "",
-        onStdout: (chunk) => {
-          stdout = cap(stdout, chunk);
-        },
-        onStderr: (chunk) => {
-          stderr = cap(stderr, chunk);
-        },
-      });
-      return { exitCode: result.exitCode, stdout, stderr };
-    },
-  });
+export function installWasiPythonModule(py: Pyodide, run: WasiRunJs): void {
+  py.registerJsModule("wasi_native", { run });
   const purelib = py.runPython("import sysconfig; sysconfig.get_paths()['purelib']") as string;
   py.FS.writeFile(`${purelib}/wasi.py`, WASI_PY_SOURCE);
 }

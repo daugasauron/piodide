@@ -45,7 +45,8 @@ export interface EmscriptenLikeFs {
   symlink(target: string, path: string): void;
   readlink(path: string): string;
   truncate(path: string, length: number): void;
-  utime(path: string, atime: number, mtime: number): void;
+  /** Not present in all Emscripten builds (utimes becomes a no-op). */
+  utime?(path: string, atime: number, mtime: number): void;
   analyzePath(path: string): { exists: boolean };
   isDir(mode: number): boolean;
   isFile?(mode: number): boolean;
@@ -74,51 +75,20 @@ const S_IFDIR = 0o040000;
 const S_IFCHR = 0o020000;
 const S_IFIFO = 0o010000;
 
-/** Emscripten (Linux-ish) errno → WASI errno. */
-const EMSCRIPTEN_ERRNO_MAP: Record<number, Errno> = {
-  1: ERRNO.PERM,
-  2: ERRNO.NOENT,
-  4: ERRNO.INTR,
-  5: ERRNO.IO,
-  6: ERRNO.NXIO,
-  9: ERRNO.BADF,
-  10: ERRNO.CHILD,
-  11: ERRNO.AGAIN,
-  12: ERRNO.NOMEM,
-  13: ERRNO.ACCES,
-  16: ERRNO.BUSY,
-  17: ERRNO.EXIST,
-  18: ERRNO.XDEV,
-  19: ERRNO.NODEV,
-  20: ERRNO.NOTDIR,
-  21: ERRNO.ISDIR,
-  22: ERRNO.INVAL,
-  23: ERRNO.NFILE,
-  24: ERRNO.MFILE,
-  25: ERRNO.NOTTY,
-  26: ERRNO.TXTBSY,
-  27: ERRNO.FBIG,
-  28: ERRNO.NOSPC,
-  29: ERRNO.SPIPE,
-  30: ERRNO.ROFS,
-  31: ERRNO.MLINK,
-  32: ERRNO.PIPE,
-  33: ERRNO.DOM,
-  34: ERRNO.RANGE,
-  36: ERRNO.NAMETOOLONG,
-  39: ERRNO.NOTEMPTY,
-  40: ERRNO.LOOP,
-  42: ERRNO.NOMSG,
-  95: ERRNO.NOTSUP,
-};
-
-/** Convert a thrown Emscripten FS.ErrnoError into a WasiError. */
+/**
+ * Convert a thrown Emscripten FS.ErrnoError into a WasiError. Modern
+ * Emscripten (Pyodide ≥ 0.26) numbers its FS errors with WASI errno codes
+ * directly, so the value is passed through when it is a valid WASI errno.
+ */
 export function rethrowAsWasiError(error: unknown, context: string): never {
   const errno = (error as { errno?: number }).errno;
-  if (typeof errno === "number") {
-    const mapped = EMSCRIPTEN_ERRNO_MAP[errno] ?? ERRNO.IO;
+  if (typeof errno === "number" && errno >= 1 && errno <= ERRNO.NOTCAPABLE) {
     const message = error instanceof Error ? error.message : String(error);
-    throw new WasiError(mapped, `${context}: ${message}`);
+    throw new WasiError(errno as Errno, `${context}: ${message}`);
+  }
+  if (typeof errno === "number") {
+    const message = error instanceof Error ? error.message : String(error);
+    throw new WasiError(ERRNO.IO, `${context}: ${message}`);
   }
   throw error;
 }
@@ -385,6 +355,7 @@ export class EmscriptenFs implements WasiFs {
   }
 
   utimes(path: string, atim: bigint | null, mtim: bigint | null): void {
+    if (!this.fs.utime) return; // cosmetic on MEMFS; some builds lack FS.utime
     try {
       const current = this.fs.stat(path);
       const atime = atim === null ? current.atime : toMs(atim);
