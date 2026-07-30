@@ -65,20 +65,27 @@ on the same live filesystem. It keeps its own cwd, and `$PATH` is exactly
 - `cd`, `pwd`, `exit`, `help` are shell builtins (`cd` must be: a child
   can't change its parent's cwd).
 - `cat f.txt | grep x | grep -v y` pipes, `cmd > f` / `cmd >> f` redirects
-  (redirect beats pipe, like bash), and `$VAR` / `${VAR}` / `$?` / `\$`
-  expansion (single quotes inhibit). Pipes are captured child-to-child
+  (redirect beats pipe, like bash), `&&` / `||` short-circuit lists, `;`
+  sequences, and `$VAR` / `${VAR}` / `$?` / `\$` expansion (single quotes
+  inhibit). Pipes are captured child-to-child
   (bounded at 1 MiB); redirects stream straight into the MEMFS file.
 - Programs spawn through a `piodide.spawn` host import: the shell asks the
   runtime to run a sibling process with explicit stdin/stdout routing
   (pipe in/out, file, or terminal), the terminal foreground switches to
   it, and the exit code comes back. Children can spawn children.
-- Every built-in command does `chdir(getenv("PWD"))` at startup, adopting
-  the shell's cwd — that's how relative paths work (WASI has no process
-  cwd). Your own programs should do the same; snippets live in
-  `/home/web/slop/`.
-- `compile hello.c` / `link hello.o -o /bin/hello` are pseudo-commands
-  routed to the in-browser clang toolchain — so you can write C, build it
-  into `/bin`, and immediately run it, entirely inside the sandbox.
+- Spawned programs receive the shell cwd as their `.` WASI preopen, so
+  relative paths work without `chdir` or `getcwd` (neither function is
+  available in the legacy libc). The shell also keeps `$PWD` synchronized.
+- `cc -c hello.c -o hello.o` / `ld hello.o -o /bin/hello` are host-routed
+  pseudo-commands, with `compile` and `link` retained as aliases. Supported
+  compiler controls are C11/C17, `-O0` through `-O3`/`-Os`, `-g`,
+  `-Wall`/`-Wextra`/`-Werror`, `-D`, and `-I`; the linker accepts `-s` and
+  `--export`. Run `cc --help` or `ld --help` for the bounded syntax.
+- The first compile or link lazily loads about 52 MB of legacy Clang 8,
+  wasm-ld, and WASI sysroot assets. There is no `make`, `ar`, package
+  manager, native executable output, or incremental build graph: compile
+  each translation unit separately, link the objects, then run the WASI
+  result from Slop, Python, or the agent.
 - Ctrl+C kills the foreground program (or cancels the line), Ctrl+D sends
   EOF (or exits the shell). Typed-ahead input behaves like a tty: one shared
   buffer, consumed by whatever reads next.
@@ -98,7 +105,9 @@ npm run dev
 Open http://localhost:5173, then use `/provider`, `/login`, and `/model`.
 Typing `/` shows the available commands. Press `Ctrl+Shift+E` to toggle Neovim
 (`:Ex` browses the same `/home/web` files used by the agent and Python) and
-`Ctrl+Shift+S` to toggle the slop shell.
+`Ctrl+Shift+S` to toggle the slop shell. In the terminal views,
+`Ctrl+Shift+C` copies the active selection and `Ctrl+Shift+V` pastes plain
+clipboard text.
 
 ## Agent tools
 

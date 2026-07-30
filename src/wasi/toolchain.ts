@@ -15,10 +15,60 @@ import type { WasiFs } from "./fs.ts";
 const ASSET_BASE_URL = "https://runno.dev/langs";
 const TAR_BLOCK_SIZE = 512;
 const SYSROOT_PREFIX = "/sys";
+const CLANG_VERSION = "8.0.1";
+const ERRNO_COMPAT_HEADER = `#ifndef __wasm_basics___errno_h
+#define __wasm_basics___errno_h
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+/*
+ * This legacy sysroot's libc archive defines errno as a plain global. Its
+ * bundled header incorrectly declares it as TLS, which Clang 8's wasm backend
+ * cannot lower. Keep the declaration consistent with the linked definition.
+ */
+extern int errno;
+#define errno errno
+
+#ifdef __cplusplus
+}
+#endif
+
+#endif
+`;
+
+export type CStandard = "c11" | "c17";
+export type COptimization = "0" | "1" | "2" | "3" | "s";
+
+export interface CompileOptions {
+  standard?: CStandard;
+  optimization?: COptimization;
+  debug?: boolean;
+  warnings?: boolean;
+  warningsAsErrors?: boolean;
+  defines?: string[];
+  includePaths?: string[];
+}
+
+export interface LinkOptions {
+  exports?: string[];
+  strip?: boolean;
+}
 
 export type ToolchainOperation =
-  | { operation: "compile"; sourcePath: string; outputPath: string }
-  | { operation: "link"; objectPaths: string[]; outputPath: string };
+  | {
+      operation: "compile";
+      sourcePath: string;
+      outputPath: string;
+      options?: CompileOptions;
+    }
+  | {
+      operation: "link";
+      objectPaths: string[];
+      outputPath: string;
+      options?: LinkOptions;
+    };
 
 export interface ToolchainRunResult {
   exitCode: number;
@@ -65,7 +115,9 @@ export function getSysrootTarBytes(): Promise<ArrayBuffer> {
 export async function extractSysroot(tarGz: ArrayBuffer | Uint8Array): Promise<MemoryFs> {
   const stream = new Blob([tarGz as BlobPart]).stream().pipeThrough(new DecompressionStream("gzip"));
   const tar = new Uint8Array(await new Response(stream).arrayBuffer());
-  return extractTar(tar);
+  const fs = extractTar(tar);
+  fs.writeFile("/include/__errno.h", ERRNO_COMPAT_HEADER);
+  return fs;
 }
 
 function extractTar(tar: Uint8Array): MemoryFs {
@@ -106,7 +158,11 @@ function tarText(decoder: TextDecoder, header: Uint8Array, offset: number, lengt
 
 /* ------------------------------- commands -------------------------------- */
 
-function compileCommand(sourcePath: string, outputPath: string): string[] {
+function compileCommand(
+  sourcePath: string,
+  outputPath: string,
+  options: CompileOptions = {},
+): string[] {
   return [
     "clang",
     "-cc1",
@@ -117,10 +173,16 @@ function compileCommand(sourcePath: string, outputPath: string): string[] {
     "-internal-isystem",
     `${SYSROOT_PREFIX}/include`,
     "-internal-isystem",
-    `${SYSROOT_PREFIX}/lib/clang/8.0.1/include`,
+    `${SYSROOT_PREFIX}/lib/clang/${CLANG_VERSION}/include`,
     "-ferror-limit",
     "8",
-    "-O2",
+    `-O${options.optimization ?? "2"}`,
+    ...(options.standard ? [`-std=${options.standard}`] : []),
+    ...(options.debug ? ["-debug-info-kind=standalone", "-dwarf-version=4"] : []),
+    ...(options.warnings ? ["-Wall", "-Wextra"] : []),
+    ...(options.warningsAsErrors ? ["-Werror"] : []),
+    ...(options.defines ?? []).map((define) => `-D${define}`),
+    ...(options.includePaths ?? []).flatMap((path) => ["-I", path]),
     "-emit-obj",
     "-o",
     outputPath,
@@ -128,7 +190,11 @@ function compileCommand(sourcePath: string, outputPath: string): string[] {
   ];
 }
 
-function linkCommand(objectPaths: string[], outputPath: string): string[] {
+function linkCommand(
+  objectPaths: string[],
+  outputPath: string,
+  options: LinkOptions = {},
+): string[] {
   return [
     "wasm-ld",
     "--no-threads",
@@ -139,6 +205,9 @@ function linkCommand(objectPaths: string[], outputPath: string): string[] {
     `${SYSROOT_PREFIX}/lib/wasm32-wasi/crt1.o`,
     ...objectPaths,
     "-lc",
+    `${SYSROOT_PREFIX}/lib/clang/${CLANG_VERSION}/lib/wasi/libclang_rt.builtins-wasm32.a`,
+    ...(options.exports ?? []).map((symbol) => `--export=${symbol}`),
+    ...(options.strip ? ["--strip-all"] : []),
     "-o",
     outputPath,
   ];
@@ -166,8 +235,8 @@ export async function runToolchain(
   const fs = new RoutedFs(rootFs, [{ prefix: SYSROOT_PREFIX, fs: sysroot }]);
   const args =
     operation.operation === "compile"
-      ? compileCommand(operation.sourcePath, operation.outputPath)
-      : linkCommand(operation.objectPaths, operation.outputPath);
+      ? compileCommand(operation.sourcePath, operation.outputPath, operation.options)
+      : linkCommand(operation.objectPaths, operation.outputPath, operation.options);
 
   let diagnostics = "";
   const decoder = new TextDecoder();

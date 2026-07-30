@@ -12,6 +12,7 @@
  *   compile_c -> compile one C source file to a wasm32-wasi object
  *   link_wasi -> link object files into a WASI executable
  *   run_wasi -> run a WASI executable against the live Pyodide MEMFS
+ *   slop    -> run one shell command line (pipes, redirects, expansion)
  *
  * `read`/`write`/`edit` deliberately use the *same* MEMFS that `python` sees,
  * so a file written by `write` is immediately importable / readable by Python.
@@ -37,6 +38,7 @@ import {
 import { downloadPyodideFile } from "./file-transfer.ts";
 import { runToolchainInBrowser } from "./c-compiler.ts";
 import { runWasiProgram } from "./wasi/browser-runner.ts";
+import { runSlopCommand } from "./slop.ts";
 
 const MAX_READ_LINES = 2000;
 const MAX_READ_BYTES = 50_000;
@@ -123,6 +125,42 @@ const CompileCParams = Type.Object({
       description: "Destination .o file. Defaults to the source path with an .o suffix.",
     }),
   ),
+  standard: Type.Optional(
+    Type.Union([Type.Literal("c11"), Type.Literal("c17")], {
+      description: "C language standard. The legacy toolchain defaults to C11.",
+    }),
+  ),
+  optimization: Type.Optional(
+    Type.Union(
+      [
+        Type.Literal("0"),
+        Type.Literal("1"),
+        Type.Literal("2"),
+        Type.Literal("3"),
+        Type.Literal("s"),
+      ],
+      { description: "Optimization level matching -O0 through -O3 or -Os. Defaults to -O2." },
+    ),
+  ),
+  debug: Type.Optional(Type.Boolean({ description: "Emit DWARF 4 debug information." })),
+  warnings: Type.Optional(
+    Type.Boolean({ description: "Enable the supported -Wall and -Wextra warning groups." }),
+  ),
+  warningsAsErrors: Type.Optional(
+    Type.Boolean({ description: "Treat compiler warnings as errors with -Werror." }),
+  ),
+  defines: Type.Optional(
+    Type.Array(Type.String({ maxLength: 256 }), {
+      maxItems: 32,
+      description: "Preprocessor definitions such as FEATURE=1 (without the -D prefix).",
+    }),
+  ),
+  includeDirs: Type.Optional(
+    Type.Array(Type.String({ maxLength: 1024 }), {
+      maxItems: 16,
+      description: "Additional include directories in /home/web (without the -I prefix).",
+    }),
+  ),
 });
 
 const LinkWasiParams = Type.Object({
@@ -131,6 +169,13 @@ const LinkWasiParams = Type.Object({
     { minItems: 1, maxItems: 32, description: "Object files to link, in link order." },
   ),
   output: Type.String({ description: "Destination .wasm executable in /home/web." }),
+  exports: Type.Optional(
+    Type.Array(Type.String({ maxLength: 128 }), {
+      maxItems: 32,
+      description: "Additional C symbols to export from the WebAssembly module.",
+    }),
+  ),
+  strip: Type.Optional(Type.Boolean({ description: "Strip symbols and debug information." })),
 });
 
 const RunWasiParams = Type.Object({
@@ -144,6 +189,17 @@ const RunWasiParams = Type.Object({
       maxProperties: 32,
       description: "Environment variables.",
     }),
+  ),
+});
+
+const SlopParams = Type.Object({
+  command: Type.String({
+    description:
+      "One shell command line: pipes (|), redirects (> and >>), &&/|| short-circuit " +
+      "lists, ; sequences, $VAR/${VAR}/$? expansion, and quotes. Runs via /bin/slop.",
+  }),
+  cwd: Type.Optional(
+    Type.String({ description: "Working directory for the fresh shell (default /home/web)." }),
   ),
 });
 
@@ -198,6 +254,13 @@ export interface RunWasiDetails {
   outputBytes: number;
   truncated: boolean;
 }
+export interface SlopDetails {
+  command: string;
+  cwd: string;
+  exitCode: number;
+  outputBytes: number;
+  truncated: boolean;
+}
 
 /* ------------------------------- python -------------------------------- */
 
@@ -239,8 +302,9 @@ export function createCompileCTool(
     label: "Compile C",
     description:
       "Compile one C source file from /home/web to a wasm32-wasi .o object file. " +
-      "Quoted local headers are read from the same Pyodide workspace. Use link_wasi " +
-      "afterward to create an executable.",
+      "Supports bounded C standard, optimization, warning, debug, define, and include " +
+      "controls. Quoted local headers are read from the same Pyodide workspace. Use " +
+      "link_wasi afterward to create an executable.",
     parameters: CompileCParams,
     executionMode: "sequential",
     async execute(_id, params, signal) {
@@ -260,18 +324,48 @@ export function createCompileCTool(
         ? `${path.slice(0, -2)}.o`
         : `${path}.o`;
       const output = fsResolve(py, params.output ?? defaultOutput);
-      if (!isWasmWorkspacePath(output)) {
-        throw new Error("C compiler output must be inside the shared /home/web workspace.");
+      if (!isToolchainPath(output)) {
+        throw new Error("C compiler output must be inside /home/web or /bin.");
       }
       if (!output.toLowerCase().endsWith(".o")) {
         throw new Error("C compiler output must end in .o.");
       }
       if (output === path) throw new Error("C compiler output cannot overwrite the source file.");
 
+      const defines = params.defines ?? [];
+      for (const define of defines) {
+        if (!/^[A-Za-z_][A-Za-z0-9_]*(?:=.*)?$/.test(define)) {
+          throw new Error(`Invalid preprocessor definition: ${define}`);
+        }
+      }
+      const includePaths = (params.includeDirs ?? []).map((value) => {
+        const includePath = fsResolve(py, value);
+        if (!isWasmWorkspacePath(includePath)) {
+          throw new Error(`Include directory must be inside /home/web: ${includePath}`);
+        }
+        if (!fsExists(py, includePath) || !fsIsDir(py, includePath)) {
+          throw new Error(`Include directory not found: ${includePath}`);
+        }
+        return includePath;
+      });
+
       const startedAt = performance.now();
       const result = await runToolchainInBrowser(
         py,
-        { operation: "compile", sourcePath: path, outputPath: output },
+        {
+          operation: "compile",
+          sourcePath: path,
+          outputPath: output,
+          options: {
+            standard: params.standard,
+            optimization: params.optimization,
+            debug: params.debug,
+            warnings: params.warnings,
+            warningsAsErrors: params.warningsAsErrors,
+            defines,
+            includePaths,
+          },
+        },
         signal,
       );
       if (!fsExists(py, output)) throw new Error("Clang produced no output file.");
@@ -296,30 +390,44 @@ export function createLinkWasiTool(
     label: "Link WASI",
     description:
       "Link one or more wasm32-wasi .o files from the shared /home/web Pyodide " +
-      "filesystem into a WASI .wasm executable using wasm-ld and the bundled WASI libc.",
+      "filesystem into a WASI .wasm executable using wasm-ld and the bundled WASI libc. " +
+      "Can export selected symbols or strip the result.",
     parameters: LinkWasiParams,
     executionMode: "sequential",
     async execute(_id, params, signal) {
       const objects = params.objects.map((value) => {
         const path = fsResolve(py, value);
-        requireWorkspaceFile(py, path, "Object file");
+        if (!isToolchainPath(path)) throw new Error(`Object file must be inside /home/web or /bin: ${path}`);
+        if (!fsExists(py, path)) throw new Error(`Object file not found: ${path}`);
+        if (fsIsDir(py, path)) throw new Error(`Object file is a directory: ${path}`);
         if (!path.toLowerCase().endsWith(".o")) {
           throw new Error(`Object file must end in .o: ${path}`);
         }
         return path;
       });
       const output = fsResolve(py, params.output);
-      if (!isWasmWorkspacePath(output)) {
-        throw new Error("WASI linker output must be inside /home/web.");
+      if (!isToolchainPath(output)) {
+        throw new Error("WASI linker output must be inside /home/web or /bin.");
       }
-      if (!output.toLowerCase().endsWith(".wasm")) {
-        throw new Error("WASI linker output must end in .wasm.");
+      if (!output.toLowerCase().endsWith(".wasm") && !output.startsWith("/bin/")) {
+        throw new Error("WASI linker output must end in .wasm (or live in /bin).");
+      }
+      const exports = params.exports ?? [];
+      for (const symbol of exports) {
+        if (!/^[A-Za-z_.$][A-Za-z0-9_.$]*$/.test(symbol)) {
+          throw new Error(`Invalid exported symbol: ${symbol}`);
+        }
       }
 
       const startedAt = performance.now();
       const result = await runToolchainInBrowser(
         py,
-        { operation: "link", objectPaths: objects, outputPath: output },
+        {
+          operation: "link",
+          objectPaths: objects,
+          outputPath: output,
+          options: { exports, strip: params.strip },
+        },
         signal,
       );
       if (!fsExists(py, output)) throw new Error("wasm-ld produced no output file.");
@@ -409,6 +517,85 @@ export function createRunWasiTool(
           exitCode: result.exitCode,
           outputBytes: byteLength(output),
           truncated: outputTruncated,
+        },
+      };
+    },
+  };
+}
+
+/* ------------------------------- slop shell ----------------------------- */
+
+export function createSlopTool(
+  py: Pyodide,
+): AgentTool<typeof SlopParams, SlopDetails> {
+  return {
+    name: "slop",
+    label: "Slop shell",
+    description:
+      "Run one command line in the slop shell against the live Pyodide filesystem. " +
+      "Supports pipes (|), redirects (> and >>), &&/|| short-circuit lists, ; sequences, " +
+      "$VAR/${VAR}/$? expansion, and quotes. " +
+      "$PATH is exactly /bin: ls, cat, grep, echo, env, fd-find. Host-routed cc/ld " +
+      "commands compile C and link WASI objects without placing the large toolchain in /bin. " +
+      "Each call is a fresh " +
+      "shell: cwd does not persist between calls (pass cwd instead), but every file " +
+      "change does. stdout, stderr, and the exit code are returned.",
+    parameters: SlopParams,
+    executionMode: "sequential",
+    async execute(_id, params, signal, onUpdate) {
+      const cwd = params.cwd ? fsResolve(py, params.cwd) : "/home/web";
+      if (!fsExists(py, cwd) || !fsIsDir(py, cwd)) {
+        throw new Error(`Not a directory: ${cwd}`);
+      }
+      if (byteLength(params.command) > MAX_WASI_STDIN_BYTES) {
+        throw new Error("Command line too long.");
+      }
+
+      let output = "";
+      let truncated = false;
+      const append = (chunk: string) => {
+        if (output.length >= MAX_WASI_OUTPUT_CHARS) {
+          truncated = true;
+          return;
+        }
+        const remaining = MAX_WASI_OUTPUT_CHARS - output.length;
+        output += chunk.slice(0, remaining);
+        if (chunk.length > remaining) truncated = true;
+      };
+
+      const result = await runSlopCommand(
+        py,
+        params.command,
+        {
+          cwd,
+          onStdout: (chunk) => {
+            append(chunk);
+            onUpdate?.({
+              content: [text(chunk)],
+              details: {
+                command: params.command,
+                cwd,
+                exitCode: -1,
+                outputBytes: byteLength(output),
+                truncated,
+              },
+            });
+          },
+          signal,
+        },
+      );
+      const rendered =
+        (output || "") +
+        (truncated ? "\n…<slop output truncated>\n" : "") +
+        `[exit ${result.exitCode}]\n`;
+      return {
+        content: [text(rendered || `(no output)\n[exit ${result.exitCode}]\n`)],
+        details: {
+          command: params.command,
+          cwd,
+          exitCode: result.exitCode,
+          outputBytes: byteLength(output),
+          truncated,
         },
       };
     },
@@ -728,6 +915,11 @@ function isWasmWorkspacePath(path: string): boolean {
   return path.startsWith("/home/web/");
 }
 
+/** Toolchain inputs/outputs may also live in /bin (shell commands). */
+function isToolchainPath(path: string): boolean {
+  return isWasmWorkspacePath(path) || path.startsWith("/bin/");
+}
+
 function requireWorkspaceFile(py: Pyodide, path: string, label: string): void {
   if (!isWasmWorkspacePath(path)) throw new Error(`${label} must be inside /home/web: ${path}`);
   if (!fsExists(py, path)) throw new Error(`${label} not found: ${path}`);
@@ -759,6 +951,7 @@ export function createAllTools(
     createCompileCTool(py),
     createLinkWasiTool(py),
     createRunWasiTool(py),
+    createSlopTool(py),
     createReadTool(py),
     createWriteTool(py),
     createEditTool(py),

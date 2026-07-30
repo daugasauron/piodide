@@ -20,9 +20,20 @@ const shellBin = (name: string) =>
 interface SlopRun {
   stdout: string;
   exitCode: number;
+  toolchainCommands: string[][];
 }
 
-async function runSlop(fs: MemoryFs, script: string[]): Promise<SlopRun> {
+function installShell(fs: MemoryFs): void {
+  for (const name of ["slop", "ls", "cat", "fd-find", "echo", "env", "grep"]) {
+    fs.writeFile(`/bin/${name}`, shellBin(`${name}.wasm`));
+  }
+}
+
+async function runSlop(
+  fs: MemoryFs,
+  script: string[],
+  options: { quiet?: boolean } = {},
+): Promise<SlopRun> {
   // Pre-compile child modules (instantiation itself is synchronous).
   const modules = new Map<string, WebAssembly.Module>();
   for (const name of ["slop", "cat", "ls", "fd-find", "echo", "env", "grep"] as const) {
@@ -33,6 +44,7 @@ async function runSlop(fs: MemoryFs, script: string[]): Promise<SlopRun> {
   const decoder = new TextDecoder();
   const lines = [...script];
   const encoder = new TextEncoder();
+  const toolchainCommands: string[][] = [];
 
   interface SpawnIo {
     stdinText?: Uint8Array;
@@ -57,7 +69,7 @@ async function runSlop(fs: MemoryFs, script: string[]): Promise<SlopRun> {
       args,
       env: { PATH: "/bin", PWD: cwd, TERM: "ghostty" },
       fs,
-      preopens: ["/home/web", "/", "/bin"],
+      preopens: [{ name: ".", path: cwd }, "/home/web", "/", "/bin"],
       stdin: () => {
         if (stdinSent) return null;
         stdinSent = true;
@@ -126,6 +138,10 @@ async function runSlop(fs: MemoryFs, script: string[]): Promise<SlopRun> {
     const childArgs = callerHost.readCStringArray(argvPtr);
     const childCwd = callerHost.readCString(cwdPtr);
     const childName = path.split("/").pop() ?? path;
+    if (["cc", "ld", "compile", "link"].includes(childName)) {
+      toolchainCommands.push(childArgs);
+      return 0;
+    }
 
     const io: SpawnIo = {};
     if (ioPtr !== 0) {
@@ -153,9 +169,14 @@ async function runSlop(fs: MemoryFs, script: string[]): Promise<SlopRun> {
 
   const slopHost = new WasiHost({
     args: ["/bin/slop.wasm"],
-    env: { PATH: "/bin", PWD: "/home/web", TERM: "ghostty" },
+    env: {
+      PATH: "/bin",
+      PWD: "/home/web",
+      TERM: "ghostty",
+      ...(options.quiet ? { SLOP_QUIET: "1" } : {}),
+    },
     fs,
-    preopens: ["/home/web", "/", "/bin"],
+    preopens: [{ name: ".", path: "/home/web" }, "/home/web", "/", "/bin"],
     stdin,
     stdout: (chunk) => {
       stdout += decoder.decode(chunk, { stream: true });
@@ -173,29 +194,45 @@ async function runSlop(fs: MemoryFs, script: string[]): Promise<SlopRun> {
   });
   const slopModule = modules.get("slop")!;
   const exitCode = slopHost.start(new WebAssembly.Instance(slopModule, slopHost.getImportObject()));
-  return { stdout, exitCode };
+  return { stdout, exitCode, toolchainCommands };
 }
+
+test("slop: quiet one-shot mode emits only command output", async () => {
+  const fs = new MemoryFs();
+  fs.mkdirTree("/home/web");
+  installShell(fs);
+
+  const run = await runSlop(fs, ["echo exact output"], { quiet: true });
+
+  assert.equal(run.exitCode, 0);
+  assert.equal(run.stdout, "exact output\n");
+});
 
 test("slop: builtins, PATH lookup, spawning, and cwd", async () => {
   const fs = new MemoryFs();
   fs.mkdirTree("/home/web");
   // Install the shell commands like the browser session does on first run.
-  for (const name of ["slop", "ls", "cat", "fd-find", "echo", "env", "grep"]) {
-    fs.writeFile(`/bin/${name}`, shellBin(`${name}.wasm`));
-  }
+  installShell(fs);
   fs.writeFile("/home/web/hello.txt", "hello from memfs\n");
+  fs.writeFile("/home/web/demo.c", "int main(void) { return 0; }\n");
   fs.mkdirTree("/home/web/subdir");
   fs.writeFile("/home/web/subdir/nested.txt", "nested file\n");
   fs.writeFile("/home/web/subdir/other.c", "int main;\n");
+  fs.mkdirTree("/outside");
+  fs.writeFile("/outside/escaped-needle.txt", "must not be traversed\n");
+  fs.symlink("/outside", "/home/web/subdir/loop");
 
   const run = await runSlop(fs, [
     "pwd",
     "ls",
     "cat hello.txt",
     "fd-find nested",
+    "fd-find escaped-needle",
     "cd subdir",
     "pwd",
+    "echo $PWD",
     "ls -l",
+    "ls -l nested.txt",
     "cat nested.txt",
     "cd ..",
     "pwd",
@@ -211,6 +248,7 @@ test("slop: builtins, PATH lookup, spawning, and cwd", async () => {
     "grep -v nested hello.txt",
     "nosuchcmd",
     "cat /missing.txt",
+    "cat /missing-again.txt > cat-errors.txt",
     "ls /",
     // expansion
     "echo $PWD",
@@ -231,6 +269,10 @@ test("slop: builtins, PATH lookup, spawning, and cwd", async () => {
     "cat found.txt",
     "pwd > cwd.txt",
     "cat cwd.txt",
+    "cc -c -std=c17 -O3 -Wall -DVALUE=7 -I . demo.c -o demo.o",
+    "ld -s --export=main demo.o -o demo.wasm",
+    "compile demo.c -o alias.o",
+    "link alias.o -o alias.wasm",
     "exit",
   ]);
 
@@ -246,11 +288,14 @@ test("slop: builtins, PATH lookup, spawning, and cwd", async () => {
   assert.match(out, /hello from memfs\n/);
   // fd-find locates the nested file (printed relative to cwd)
   assert.match(out, /subdir\/nested\.txt\n/);
+  assert.doesNotMatch(out, /escaped-needle/);
   // cd + pwd + relative cat exercise the child's adopted PWD cwd
   assert.match(out, /❯ \/home\/web\/subdir\r?\n/);
+  assert.match(out, /❯ \/home\/web\/subdir\r?\n[\s\S]*❯\s+\d+ nested\.txt\n/);
   assert.match(out, /nested file\n/);
   // ls -l shows sizes
   assert.match(out, /\d+ nested\.txt\n/);
+  assert.doesNotMatch(out, /ls: nested\.txt: Not a directory/);
   // cd .. twice: /home/web/subdir -> /home/web -> /home (was the regression)
   assert.match(out, /❯ \/home\r?\n/);
   // cd web from /home: relative path walking back down
@@ -267,6 +312,7 @@ test("slop: builtins, PATH lookup, spawning, and cwd", async () => {
   // unknown command and missing file surface as errors with exit codes
   assert.match(out, /slop: command not found: nosuchcmd\n/);
   assert.match(out, /cat: \/missing\.txt: .*\n/);
+  assert.match(out, /cat: \/missing-again\.txt: .*\n/);
   assert.match(out, /↳ exit 1/);
   // ls / lists the actual root (not the cwd)
   assert.match(out, /bin\//);
@@ -285,4 +331,117 @@ test("slop: builtins, PATH lookup, spawning, and cwd", async () => {
   assert.equal(new TextDecoder().decode(fs.readFile("/home/web/pipe-out.txt")), "first\nsecond\n");
   assert.equal(new TextDecoder().decode(fs.readFile("/home/web/found.txt")), "hello from memfs\n");
   assert.equal(new TextDecoder().decode(fs.readFile("/home/web/cwd.txt")), "/home/web\n");
+  assert.equal(fs.readFile("/home/web/cat-errors.txt").byteLength, 0);
+  assert.deepEqual(run.toolchainCommands, [
+    ["cc", "-c", "-std=c17", "-O3", "-Wall", "-DVALUE=7", "-I", ".", "demo.c", "-o", "demo.o"],
+    ["ld", "-s", "--export=main", "demo.o", "-o", "demo.wasm"],
+    ["compile", "demo.c", "-o", "alias.o"],
+    ["link", "alias.o", "-o", "alias.wasm"],
+  ]);
+});
+
+test("slop: conditional and sequential command lists", async () => {
+  const fs = new MemoryFs();
+  fs.mkdirTree("/home/web");
+  installShell(fs);
+  fs.writeFile("/home/web/hello.txt", "hello from memfs\n");
+
+  const run = await runSlop(fs, [
+    "echo AND-A && echo AND-B",
+    "grep missing hello.txt && echo AND-SKIP",
+    "grep missing hello.txt || echo OR-RUN",
+    "echo OR-OK || echo OR-SKIP",
+    "echo OR-OK-REDIR || echo BAD > skipped.txt",
+    "echo SEMI-A ; echo SEMI-B",
+    "echo TRAILING-SEMI ;",
+    "grep missing hello.txt || echo RECOVER-$? && echo LEFT-ASSOC",
+    "echo PIPE | grep PIPE && echo PIPE-OK",
+    "echo nope | grep yes || echo PIPE-FAIL",
+    "echo REDIR > list.txt && cat list.txt",
+    "nosuchcmd ; echo STATUS-$?",
+    "echo '$? && ; ||' ; echo \"Q&&Q\" ; echo 'L;L'",
+    "echo GLUED-A&&echo GLUED-B;echo GLUED-C",
+    "grep missing hello.txt && echo BAD-$? ; echo AFTER-$?",
+    "grep missing hello.txt || echo FIRST-$? ; echo SECOND-$?",
+    "grep missing hello.txt && exit ; echo SURVIVED",
+    "echo BEFORE-EXIT && exit ; echo AFTER-EXIT",
+    "echo UNREACHABLE",
+  ]);
+
+  assert.equal(run.exitCode, 0);
+  assert.match(run.stdout, /AND-A\n[\s\S]*AND-B\n/);
+  assert.doesNotMatch(run.stdout, /AND-SKIP/);
+  assert.match(run.stdout, /OR-RUN\n/);
+  assert.match(run.stdout, /OR-OK\n/);
+  assert.doesNotMatch(run.stdout, /OR-SKIP/);
+  assert.equal(fs.exists("/home/web/skipped.txt"), false);
+  assert.match(run.stdout, /SEMI-A\n[\s\S]*SEMI-B\n/);
+  assert.match(run.stdout, /TRAILING-SEMI\n/);
+  assert.match(run.stdout, /RECOVER-1\n[\s\S]*LEFT-ASSOC\n/);
+  assert.match(run.stdout, /PIPE\n[\s\S]*PIPE-OK\n/);
+  assert.match(run.stdout, /PIPE-FAIL\n/);
+  assert.match(run.stdout, /REDIR\n/);
+  assert.equal(new TextDecoder().decode(fs.readFile("/home/web/list.txt")), "REDIR\n");
+  assert.match(run.stdout, /slop: command not found: nosuchcmd\n/);
+  assert.match(run.stdout, /STATUS-127\n/);
+  assert.match(run.stdout, /\$\? && ; \|\|\n/);
+  assert.match(run.stdout, /Q&&Q\n/);
+  assert.match(run.stdout, /L;L\n/);
+  assert.match(run.stdout, /GLUED-A\n[\s\S]*GLUED-B\n[\s\S]*GLUED-C\n/);
+  assert.doesNotMatch(run.stdout, /BAD-/);
+  assert.match(run.stdout, /AFTER-1\n/);
+  assert.match(run.stdout, /FIRST-1\n[\s\S]*SECOND-0\n/);
+  assert.match(run.stdout, /SURVIVED\n/);
+  assert.match(run.stdout, /BEFORE-EXIT\n/);
+  assert.doesNotMatch(run.stdout, /AFTER-EXIT|UNREACHABLE/);
+});
+
+test("slop: process status follows the final command list", async () => {
+  const fs = new MemoryFs();
+  fs.mkdirTree("/home/web");
+  installShell(fs);
+  fs.writeFile("/home/web/hello.txt", "hello from memfs\n");
+
+  assert.equal((await runSlop(fs, ["nosuchcmd"])).exitCode, 127);
+  assert.equal((await runSlop(fs, ["grep missing hello.txt && echo no"])).exitCode, 1);
+  assert.equal((await runSlop(fs, ["grep missing hello.txt || echo recovered"])).exitCode, 0);
+  assert.equal((await runSlop(fs, ["echo nope ||"])).exitCode, 2);
+});
+
+test("slop: oversized expanded spawn arguments fail before the host call", async () => {
+  const fs = new MemoryFs();
+  fs.mkdirTree("/home/web");
+  installShell(fs);
+
+  const run = await runSlop(fs, [`echo ${"$PWD".repeat(1020)}`]);
+
+  assert.equal(run.exitCode, 2);
+  assert.match(run.stdout, /serialized arguments exceed 8192 bytes/);
+});
+
+test("slop: command-list syntax errors have no side effects", async () => {
+  const fs = new MemoryFs();
+  fs.mkdirTree("/home/web");
+  installShell(fs);
+
+  const run = await runSlop(fs, [
+    "echo TOUCHED > touched.txt ; && echo nope",
+    "&& echo nope",
+    "echo nope ||",
+    "echo nope ; ; echo nope",
+    "echo nope & echo nope",
+    "echo \"unterminated",
+    "echo SYNTAX-STATUS-$?",
+    "exit",
+  ]);
+
+  assert.equal(run.exitCode, 0);
+  assert.equal(fs.exists("/home/web/touched.txt"), false);
+  assert.doesNotMatch(run.stdout, /TOUCHED/);
+  assert.match(run.stdout, /empty command before &&/);
+  assert.match(run.stdout, /empty command after \|\|/);
+  assert.match(run.stdout, /empty command before ;/);
+  assert.match(run.stdout, /unsupported operator &/);
+  assert.match(run.stdout, /unterminated \" quote/);
+  assert.match(run.stdout, /SYNTAX-STATUS-2\n/);
 });

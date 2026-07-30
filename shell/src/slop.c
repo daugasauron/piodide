@@ -8,9 +8,10 @@
  *
  *   builtins:  cd, pwd, exit, help
  *   pipes:     cat file.txt | grep something | grep -v noise
+ *   lists:     cmd && next, cmd || fallback, cmd ; next
  *   redirects: cmd > file (truncate), cmd >> file (append)
  *   expansion: $VAR, ${VAR}, $?, \$ (single quotes inhibit)
- *   pseudo:    compile, link (routed to the in-browser clang toolchain)
+ *   pseudo:    cc/compile, ld/link (routed to the in-browser clang toolchain)
  */
 #include <errno.h>
 #include <stdio.h>
@@ -36,6 +37,7 @@ extern int piodide_spawn(const char *path, const char *argv_blob, const char *cw
 
 #define SLOP_MAX_ARGS 64
 #define SLOP_MAX_CMDS 16
+#define SLOP_MAX_LISTS 32
 #define SLOP_LINE 4096
 #define SLOP_PATH 4096
 #define PIPE_CAP (1024 * 1024)
@@ -50,12 +52,13 @@ static void print_help(FILE *out) {
   fprintf(out, "  builtins:  cd [dir]   pwd   exit   help\n");
   fprintf(out, "  commands:  ls cat grep echo env fd-find (exact name, first hit on $PATH=/bin)\n");
   fprintf(out, "  pipes:     cat f.txt | grep x | grep -v y      redirects: cmd > f  cmd >> f\n");
+  fprintf(out, "  lists:     cmd && next   cmd || fallback   cmd ; next\n");
   fprintf(out, "  expansion: $VAR ${VAR} $? \\$ ('...' inhibits)\n");
-  fprintf(out, "  toolchain: compile <file.c> [-o out.o]   link <a.o b.o...> -o <out.wasm>\n");
+  fprintf(out, "  toolchain: cc -c [flags] file.c -o file.o   ld [flags] file.o -o app.wasm\n");
+  fprintf(out, "             aliases: compile = cc, link = ld; run `cc --help` / `ld --help`\n");
   fprintf(out, "  keys:      Ctrl+C kill child / cancel line · Ctrl+D exit shell / EOF\n");
   fprintf(out, "files are the live Pyodide filesystem: Python, the agent and Neovim\n");
-  fprintf(out, "see everything you create, immediately. Programs that chdir(getenv(\"PWD\"))\n");
-  fprintf(out, "at startup inherit the shell's cwd for relative paths.\n");
+  fprintf(out, "see everything you create immediately. Spawned programs inherit this cwd.\n");
 }
 
 /* ------------------------------ path utils ------------------------------ */
@@ -122,15 +125,19 @@ static void buf_puts(char **buf, size_t *len, size_t *cap, const char *s) {
   while (*s) buf_putc(buf, len, cap, *s++);
 }
 
-static void expand_var(char **buf, size_t *len, size_t *cap, char **pp) {
+static void expand_var(char **buf, size_t *len, size_t *cap, char **pp, int expand) {
   char name[128];
   size_t n = 0;
   char *p = *pp;
   if (*p == '?') {
     p++;
-    char tmp[16];
-    snprintf(tmp, sizeof tmp, "%d", last_exit);
-    buf_puts(buf, len, cap, tmp);
+    if (expand) {
+      char tmp[16];
+      snprintf(tmp, sizeof tmp, "%d", last_exit);
+      buf_puts(buf, len, cap, tmp);
+    } else {
+      buf_putc(buf, len, cap, 'x');
+    }
   } else if (*p == '{') {
     p++;
     while (*p && *p != '}' && n + 1 < sizeof name) name[n++] = *p++;
@@ -152,12 +159,16 @@ static void expand_var(char **buf, size_t *len, size_t *cap, char **pp) {
     }
   }
   name[n] = '\0';
-  const char *value = getenv(name);
-  if (value) buf_puts(buf, len, cap, value);
+  if (expand) {
+    const char *value = getenv(name);
+    if (value) buf_puts(buf, len, cap, value);
+  } else {
+    buf_putc(buf, len, cap, 'x');
+  }
   *pp = p;
 }
 
-static char *next_token(char **pp) {
+static char *next_token(char **pp, int expand) {
   char *p = *pp;
   while (*p == ' ' || *p == '\t' || *p == '\r' || *p == '\n') p++;
   if (!*p) {
@@ -194,7 +205,7 @@ static char *next_token(char **pp) {
             p += 2;
           } else {
             p++;
-            expand_var(&buf, &len, &cap, &p);
+            expand_var(&buf, &len, &cap, &p, expand);
           }
         } else if (*p == '\\' && p[1] == '$') {
           buf_putc(&buf, &len, &cap, '$');
@@ -207,7 +218,7 @@ static char *next_token(char **pp) {
       else snprintf(tok_err, sizeof tok_err, "unterminated \" quote");
     } else if (c == '$') {
       p++;
-      expand_var(&buf, &len, &cap, &p);
+      expand_var(&buf, &len, &cap, &p, expand);
     } else if (c == '\\' && p[1] == '$') {
       buf_putc(&buf, &len, &cap, '$');
       p += 2;
@@ -231,14 +242,14 @@ typedef struct {
   int append;
 } Command;
 
-static int parse_pipeline(char *line, Command *cmds) {
+static int parse_pipeline(char *line, Command *cmds, int expand) {
   char *p = line;
   int ncmd = 0;
   memset(cmds, 0, SLOP_MAX_CMDS * sizeof *cmds);
   Command *cur = &cmds[ncmd];
   char *tok;
   tok_err[0] = '\0';
-  while ((tok = next_token(&p)) != NULL) {
+  while ((tok = next_token(&p, expand)) != NULL) {
     if (strcmp(tok, "|") == 0) {
       free(tok);
       if (cur->argc == 0) {
@@ -256,9 +267,15 @@ static int parse_pipeline(char *line, Command *cmds) {
     if (strcmp(tok, ">") == 0 || strcmp(tok, ">>") == 0) {
       int append = tok[1] == '>';
       free(tok);
-      char *target = next_token(&p);
+      char *target = next_token(&p, expand);
       if (!target) {
         snprintf(tok_err, sizeof tok_err, "redirect needs a file");
+        return -1;
+      }
+      if (strcmp(target, "|") == 0 || strcmp(target, ">") == 0 ||
+          strcmp(target, ">>") == 0) {
+        snprintf(tok_err, sizeof tok_err, "redirect needs a file");
+        free(target);
         return -1;
       }
       if (cur->argc == 0) {
@@ -278,6 +295,7 @@ static int parse_pipeline(char *line, Command *cmds) {
     }
     cur->argv[cur->argc++] = tok;
   }
+  if (tok_err[0] != '\0') return -1;
   if (cur->argc == 0 && ncmd > 0) {
     snprintf(tok_err, sizeof tok_err, "empty command after |");
     return -1;
@@ -290,6 +308,160 @@ static void free_pipeline(Command *cmds, int ncmd) {
     for (int a = 0; a < cmds[i].argc; a++) free(cmds[i].argv[a]);
     free(cmds[i].out_file);
   }
+}
+
+/* ---------------------------- command lists ----------------------------- */
+
+typedef enum {
+  LIST_ALWAYS,
+  LIST_AND,
+  LIST_OR,
+} ListCondition;
+
+typedef struct {
+  char *text;
+  ListCondition condition;
+} ListItem;
+
+static void free_command_list(ListItem *items, int count) {
+  for (int i = 0; i < count; i++) free(items[i].text);
+}
+
+static char *copy_trimmed(const char *start, const char *end) {
+  while (start < end && (*start == ' ' || *start == '\t' || *start == '\r' || *start == '\n')) {
+    start++;
+  }
+  while (end > start && (end[-1] == ' ' || end[-1] == '\t' || end[-1] == '\r' || end[-1] == '\n')) {
+    end--;
+  }
+  size_t length = (size_t)(end - start);
+  char *text = malloc(length + 1);
+  if (!text) return NULL;
+  memcpy(text, start, length);
+  text[length] = '\0';
+  return text;
+}
+
+/*
+ * Split a raw line before expansion so each selected pipeline expands with
+ * the status of the previously executed pipeline. Operators inside quotes
+ * remain ordinary text. The complete list is validated before execution.
+ */
+static int parse_command_list(char *line, ListItem *items) {
+  memset(items, 0, SLOP_MAX_LISTS * sizeof *items);
+  const char *start = line;
+  const char *last_operator = NULL;
+  ListCondition next_condition = LIST_ALWAYS;
+  char quote = '\0';
+  int count = 0;
+
+  for (char *p = line; *p; p++) {
+    if (quote) {
+      if (*p == quote) quote = '\0';
+      continue;
+    }
+    if (*p == '\'' || *p == '"') {
+      quote = *p;
+      continue;
+    }
+
+    const char *op = NULL;
+    int op_length = 0;
+    ListCondition following = LIST_ALWAYS;
+    if (*p == '&') {
+      if (p[1] != '&') {
+        snprintf(tok_err, sizeof tok_err, "unsupported operator &");
+        free_command_list(items, count);
+        return -1;
+      }
+      op = "&&";
+      op_length = 2;
+      following = LIST_AND;
+    } else if (*p == '|' && p[1] == '|') {
+      op = "||";
+      op_length = 2;
+      following = LIST_OR;
+    } else if (*p == ';') {
+      op = ";";
+      op_length = 1;
+      following = LIST_ALWAYS;
+    } else {
+      continue;
+    }
+
+    char *text = copy_trimmed(start, p);
+    if (!text) {
+      snprintf(tok_err, sizeof tok_err, "out of memory");
+      free_command_list(items, count);
+      return -1;
+    }
+    if (!*text) {
+      snprintf(tok_err, sizeof tok_err, "empty command before %s", op);
+      free(text);
+      free_command_list(items, count);
+      return -1;
+    }
+    if (count >= SLOP_MAX_LISTS) {
+      snprintf(tok_err, sizeof tok_err, "too many pipelines in command list");
+      free(text);
+      free_command_list(items, count);
+      return -1;
+    }
+    items[count].text = text;
+    items[count].condition = next_condition;
+    count++;
+    next_condition = following;
+    last_operator = op;
+    p += op_length - 1;
+    start = p + 1;
+  }
+
+  if (quote) {
+    snprintf(tok_err, sizeof tok_err, "unterminated %c quote", quote);
+    free_command_list(items, count);
+    return -1;
+  }
+
+  const char *end = line + strlen(line);
+  char *text = copy_trimmed(start, end);
+  if (!text) {
+    snprintf(tok_err, sizeof tok_err, "out of memory");
+    free_command_list(items, count);
+    return -1;
+  }
+  if (*text) {
+    if (count >= SLOP_MAX_LISTS) {
+      snprintf(tok_err, sizeof tok_err, "too many pipelines in command list");
+      free(text);
+      free_command_list(items, count);
+      return -1;
+    }
+    items[count].text = text;
+    items[count].condition = next_condition;
+    count++;
+  } else {
+    free(text);
+    if (count == 0) return 0;
+    if (!last_operator || strcmp(last_operator, ";") != 0) {
+      snprintf(tok_err, sizeof tok_err, "empty command after %s", last_operator);
+      free_command_list(items, count);
+      return -1;
+    }
+  }
+
+  /* Validate every pipeline before any command can cause side effects. */
+  for (int i = 0; i < count; i++) {
+    Command validation[SLOP_MAX_CMDS];
+    int ncmd = parse_pipeline(items[i].text, validation, 0);
+    if (ncmd <= 0) {
+      if (tok_err[0] == '\0') snprintf(tok_err, sizeof tok_err, "empty pipeline");
+      free_pipeline(validation, SLOP_MAX_CMDS);
+      free_command_list(items, count);
+      return -1;
+    }
+    free_pipeline(validation, ncmd);
+  }
+  return count;
 }
 
 /* ------------------------------ builtins -------------------------------- */
@@ -315,6 +487,20 @@ static int is_builtin(const char *name) {
   return strcmp(name, "cd") == 0 || strcmp(name, "pwd") == 0 || strcmp(name, "help") == 0;
 }
 
+static int is_toolchain_command(const char *name) {
+  return strcmp(name, "cc") == 0 || strcmp(name, "ld") == 0 ||
+         strcmp(name, "compile") == 0 || strcmp(name, "link") == 0;
+}
+
+static int append_spawn_arg(char *blob, size_t cap, size_t *offset, const char *arg) {
+  size_t length = strlen(arg) + 1;
+  /* Reserve one final NUL after the last argument. */
+  if (*offset >= cap || length >= cap - *offset) return 0;
+  memcpy(blob + *offset, arg, length);
+  *offset += length;
+  return 1;
+}
+
 /* Runs a builtin; output goes to `out`. Returns the exit code. */
 static int run_builtin(const char *name, char **args, int argc, FILE *out) {
   if (strcmp(name, "pwd") == 0) {
@@ -337,6 +523,9 @@ static int run_builtin(const char *name, char **args, int argc, FILE *out) {
     return 1;
   }
   snprintf(cwd, sizeof cwd, "%s", resolved);
+  if (setenv("PWD", cwd, 1) != 0) {
+    fprintf(stderr, "slop: could not update PWD: %s\n", strerror(errno));
+  }
   return 0;
 }
 
@@ -356,7 +545,7 @@ static int run_pipeline(Command *cmds, int ncmd) {
   for (int i = 0; i < ncmd; i++) {
     Command *c = &cmds[i];
     int is_last = i == ncmd - 1;
-    int pseudo = strcmp(c->argv[0], "compile") == 0 || strcmp(c->argv[0], "link") == 0;
+    int pseudo = is_toolchain_command(c->argv[0]);
 
     /* Where does this command's stdout go? (redirect beats pipe, like bash.) */
     const char *out_file = NULL;
@@ -403,9 +592,20 @@ static int run_pipeline(Command *cmds, int ncmd) {
       break;
     }
     size_t off = 0;
-    off += snprintf(blob + off, sizeof blob - off, "%s", pseudo ? prog : resolved) + 1;
-    for (int a = 1; a < c->argc; a++) {
-      off += snprintf(blob + off, sizeof blob - off, "%s", c->argv[a]) + 1;
+    int args_ok = 1;
+    if (!append_spawn_arg(blob, sizeof blob, &off, pseudo ? prog : resolved)) {
+      fprintf(stderr, "slop: serialized arguments exceed %zu bytes\n", sizeof blob);
+      args_ok = 0;
+    }
+    for (int a = 1; args_ok && a < c->argc; a++) {
+      if (!append_spawn_arg(blob, sizeof blob, &off, c->argv[a])) {
+        fprintf(stderr, "slop: serialized arguments exceed %zu bytes\n", sizeof blob);
+        args_ok = 0;
+      }
+    }
+    if (!args_ok) {
+      code = 2;
+      break;
     }
     blob[off] = '\0';
 
@@ -452,40 +652,66 @@ static int run_pipeline(Command *cmds, int ncmd) {
 int main(void) {
   setvbuf(stdout, NULL, _IONBF, 0);
   setvbuf(stderr, NULL, _IONBF, 0);
+  const char *quiet_env = getenv("SLOP_QUIET");
+  int quiet = quiet_env && *quiet_env && strcmp(quiet_env, "0") != 0;
 
   const char *pwd = getenv("PWD");
   if (pwd && is_dir(pwd)) chdir(pwd);
   else chdir("/home/web");
   if (getcwd(cwd, sizeof cwd) == NULL) snprintf(cwd, sizeof cwd, "/home/web");
   normalize(cwd);
+  if (setenv("PWD", cwd, 1) != 0) {
+    fprintf(stderr, "slop: could not initialize PWD: %s\n", strerror(errno));
+  }
 
-  printf("\x1b[1mslop\x1b[0m — the piodide shell · type 'help'\n");
+  if (!quiet) printf("\x1b[1mslop\x1b[0m — the piodide shell · type 'help'\n");
 
   static char line[SLOP_LINE];
-  static Command cmds[SLOP_MAX_CMDS];
+  static ListItem items[SLOP_MAX_LISTS];
 
-  for (;;) {
-    printf("\x1b[35mslop\x1b[0m \x1b[36m%s\x1b[0m ❯ ", cwd);
+  int exit_requested = 0;
+  while (!exit_requested) {
+    if (!quiet) printf("\x1b[35mslop\x1b[0m \x1b[36m%s\x1b[0m ❯ ", cwd);
     if (fgets(line, sizeof line, stdin) == NULL) {
-      printf("\n");
+      if (!quiet) printf("\n");
       break;
     }
-    int ncmd = parse_pipeline(line, cmds);
-    if (ncmd < 0) {
+    int nitems = parse_command_list(line, items);
+    if (nitems < 0) {
+      last_exit = 2;
       fprintf(stderr, "slop: %s\n", tok_err);
-      free_pipeline(cmds, ncmd < 0 ? SLOP_MAX_CMDS : ncmd);
       continue;
     }
-    if (ncmd == 0) continue;
+    if (nitems == 0) continue;
 
-    if (ncmd == 1 && cmds[0].out_file == NULL && strcmp(cmds[0].argv[0], "exit") == 0) {
+    for (int i = 0; i < nitems; i++) {
+      int should_run = items[i].condition == LIST_ALWAYS ||
+                       (items[i].condition == LIST_AND && last_exit == 0) ||
+                       (items[i].condition == LIST_OR && last_exit != 0);
+      if (!should_run) continue;
+
+      Command cmds[SLOP_MAX_CMDS];
+      int ncmd = parse_pipeline(items[i].text, cmds, 1);
+      if (ncmd <= 0) {
+        last_exit = 2;
+        fprintf(stderr, "slop: %s\n", tok_err[0] ? tok_err : "invalid pipeline");
+        free_pipeline(cmds, SLOP_MAX_CMDS);
+        break;
+      }
+      if (ncmd == 1 && cmds[0].out_file == NULL && strcmp(cmds[0].argv[0], "exit") == 0) {
+        free_pipeline(cmds, ncmd);
+        exit_requested = 1;
+        break;
+      }
+
+      last_exit = run_pipeline(cmds, ncmd);
       free_pipeline(cmds, ncmd);
-      break;
     }
 
-    last_exit = run_pipeline(cmds, ncmd);
-    if (last_exit != 0) printf("\x1b[2m↳ exit %d\x1b[0m\n", last_exit);
-    free_pipeline(cmds, ncmd);
+    free_command_list(items, nitems);
+    if (!quiet && !exit_requested && last_exit != 0) {
+      printf("\x1b[2m↳ exit %d\x1b[0m\n", last_exit);
+    }
   }
-  return 0;
+  return last_exit;
 }

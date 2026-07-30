@@ -1,182 +1,115 @@
 /**
- * slop — the piodide shell session.
+ * slop — the piodide shell.
  *
- * Owns one long-running /bin/slop.wasm process plus every child it spawns,
- * and routes ghostty keystrokes to whichever is in the foreground (canonical
- * line mode with echo, like /run). Children are regular WASI programs found
- * on $PATH (/bin); the "compile"/"link" pseudo-commands are intercepted
- * here and routed to the in-browser clang toolchain, so users can build new
- * commands straight into /bin and run them.
+ * Three consumers share one engine:
+ * - SlopSession: the interactive Ctrl+Shift+S shell (long-running /bin/slop
+ *   with tty-style input routing).
+ * - runSlopCommand: the agent's `slop` tool — one command line per call in
+ *   a fresh shell instance (stateless; cwd via parameter).
+ * - SlopSpawner: the spawn engine both use (children on $PATH, the
+ *   compile/link pseudo-commands routed to the in-browser clang toolchain).
  */
 import type { Pyodide } from "./pyodide-host.ts";
-import { fsExists } from "./pyodide-host.ts";
+import { fsExists, fsIsDir } from "./pyodide-host.ts";
 import {
   startWasiProgram,
   type WasiProgramHandle,
 } from "./wasi/browser-runner.ts";
 import { runToolchainInBrowser } from "./c-compiler.ts";
 import { normalizePath } from "./wasi/abi.ts";
+import type { CompileOptions, LinkOptions } from "./wasi/toolchain.ts";
 
 const SHELL_BINARIES = ["slop", "ls", "cat", "fd-find", "echo", "env", "grep"];
 const SHELL_SOURCES = ["slop.c", "ls.c", "cat.c", "fd-find.c", "echo.c", "env.c", "grep.c"];
-const SHELL_PREOPENS = ["/home/web", "/", "/bin"];
 const MAX_CHILDREN = 32;
+const MAX_C_SOURCE_BYTES = 512 * 1024;
+const MAX_TOOLCHAIN_INPUTS = 32;
 /** Pipe captures are bounded so a runaway producer can't eat the page. */
 const MAX_CAPTURE_BYTES = 1024 * 1024;
 
-function concatChunks(chunks: Uint8Array[], total: number): Uint8Array {
-  const out = new Uint8Array(Math.min(total, MAX_CAPTURE_BYTES));
-  let offset = 0;
-  for (const chunk of chunks) {
-    if (offset + chunk.byteLength > out.byteLength) break;
-    out.set(chunk, offset);
-    offset += chunk.byteLength;
-  }
-  return out;
+function shellPreopens(cwd: string) {
+  return [{ name: ".", path: cwd }, "/home/web", "/", "/bin"];
 }
 
-/**
- * One shared input buffer for the session, like a tty: input typed while a
- * child runs is consumed by whatever reads next (the child, or the shell
- * after the child exits). A null marker is a one-shot EOF for the next
- * reader only (unlike StdinQueue's permanent EOF state).
- */
-class SharedInput {
-  private queue: (Uint8Array | null)[] = [];
-  private waiting: ((item: Uint8Array | null) => void)[] = [];
+/* ------------------------------ install -------------------------------- */
 
-  push(item: Uint8Array | null): void {
-    if (item !== null && item.byteLength === 0) return;
-    if (this.waiting.length > 0) this.waiting.shift()!(item);
-    else this.queue.push(item);
-  }
+let installPromise: Promise<void> | null = null;
 
-  next(): Promise<Uint8Array | null> | Uint8Array | null {
-    const queued = this.queue.shift();
-    if (queued !== undefined) return queued;
-    return new Promise((resolve) => this.waiting.push(resolve));
+/** Fetch the committed shell binaries + sources into the MEMFS once. */
+export function ensureSlopInstalled(py: Pyodide, note?: (text: string) => void): Promise<void> {
+  if (!installPromise) {
+    installPromise = (async () => {
+      if (fsExists(py, "/bin/slop")) return;
+      note?.("  installing slop into /bin …");
+      const base = import.meta.env.BASE_URL;
+      py.FS.mkdirTree("/bin");
+      py.FS.mkdirTree("/home/web/slop");
+      for (const name of SHELL_BINARIES) {
+        const response = await fetch(`${base}slop/bin/${name}`);
+        if (!response.ok) throw new Error(`could not fetch ${name} (HTTP ${response.status})`);
+        py.FS.writeFile(`/bin/${name}`, new Uint8Array(await response.arrayBuffer()));
+      }
+      try {
+        for (const name of SHELL_SOURCES) {
+          const response = await fetch(`${base}slop/src/${name}`);
+          if (response.ok) py.FS.writeFile(`/home/web/slop/${name}`, await response.text());
+        }
+      } catch {
+        // Sources are a convenience, not a requirement.
+      }
+    })();
+    // A failed install should be retried on the next attempt.
+    installPromise.catch(() => {
+      installPromise = null;
+    });
   }
+  return installPromise;
 }
 
-export interface SlopSessionDeps {
+/* ------------------------------- spawner -------------------------------- */
+
+interface SpawnRequest {
+  path: string;
+  args: string[];
+  cwd: string;
+  stdinText?: Uint8Array;
+  capture?: boolean;
+  outFile?: string;
+  append?: boolean;
+}
+
+interface SpawnResult {
+  exitCode: number;
+  stdout?: Uint8Array;
+}
+
+interface SlopSpawnerDeps {
   py: Pyodide;
   writeOut: (text: string) => void;
   note: (text: string) => void;
-  onExit: () => void;
+  /** Interactive stdin for children (the session's tty buffer; EOF otherwise). */
+  childStdin: () => Promise<Uint8Array | null> | Uint8Array | null;
+  signal?: AbortSignal;
 }
 
-export class SlopSession {
-  private deps: SlopSessionDeps;
-  private slop: WasiProgramHandle | null = null;
-  private foreground: WasiProgramHandle | null = null;
-  private line = "";
-  private installed = false;
+/** Runs the programs slop spawns (PATH commands, pseudo-commands, nesting). */
+export class SlopSpawner {
+  /** The currently running direct child (for Ctrl+C kill). */
+  foreground: WasiProgramHandle | null = null;
   private activeChildren = 0;
-  /** The session's shared tty-style input buffer. */
-  private input = new SharedInput();
+  private deps: SlopSpawnerDeps;
 
-  constructor(deps: SlopSessionDeps) {
+  constructor(deps: SlopSpawnerDeps) {
     this.deps = deps;
   }
 
-  get alive(): boolean {
-    return this.slop !== null;
-  }
-
-  async start(): Promise<void> {
-    if (this.slop) return;
-    if (!this.installed) await this.install();
-    const handle = startWasiProgram(this.deps.py, {
-      executablePath: "/bin/slop",
-      env: { PATH: "/bin", PWD: "/home/web", TERM: "ghostty" },
-      preopens: SHELL_PREOPENS,
-      interactiveStdin: true,
-      stdinProvider: () => this.input.next(),
-      timeoutMs: 0,
-      spawnHandler: (request) => this.onSpawn(request),
-      onStdout: this.deps.writeOut,
-      onStderr: this.deps.writeOut,
-    });
-    this.slop = handle;
-    this.line = "";
-    handle.result
-      .catch(() => ({ exitCode: -1 }))
-      .then(({ exitCode }) => {
-        if (this.slop === handle) {
-          this.slop = null;
-          this.deps.note(`  slop exited (${exitCode}) — Ctrl+Shift+S to restart`);
-          this.deps.onExit();
-        }
-      });
-  }
-
-  /** Stop the shell and any foreground child. */
-  stop(): void {
-    this.foreground?.kill();
-    this.slop?.kill();
-    this.slop = null;
-    this.foreground = null;
-  }
-
-  /** Terminal input while the shell view is active (canonical line mode). */
-  feed(data: string): void {
-    const encoder = new TextEncoder();
-    for (const ch of data) {
-      if (ch === "\r" || ch === "\n") {
-        this.deps.writeOut("\r\n");
-        this.push(encoder.encode(`${this.line}\n`));
-        this.line = "";
-      } else if (ch === "\x7f" || ch === "\b") {
-        if (this.line.length > 0) {
-          this.line = this.line.slice(0, -1);
-          this.deps.writeOut("\b \b");
-        }
-      } else if (ch === "\x03") {
-        // Ctrl+C: kill the foreground child, or cancel the line at the prompt.
-        this.deps.writeOut("^C\r\n");
-        if (this.foreground) this.foreground.kill();
-        else {
-          this.line = "";
-          this.input.push(encoder.encode("\n"));
-        }
-        return;
-      } else if (ch === "\x04") {
-        // Ctrl+D: an EOF marker for whoever reads next (child, or the shell
-        // at its prompt, which exits on EOF).
-        if (this.line.length > 0) {
-          this.input.push(encoder.encode(this.line));
-          this.line = "";
-        } else {
-          this.input.push(null);
-        }
-      } else if (ch >= " ") {
-        this.line += ch;
-        this.deps.writeOut(ch);
-      }
-    }
-  }
-
-  private push(chunk: Uint8Array): void {
-    this.input.push(chunk);
-  }
-
-/* ------------------------------ spawning ------------------------------ */
-
-  private async onSpawn(request: {
-    path: string;
-    args: string[];
-    cwd: string;
-    stdinText?: Uint8Array;
-    capture?: boolean;
-    outFile?: string;
-    append?: boolean;
-  }): Promise<{ exitCode: number; stdout?: Uint8Array }> {
+  async onSpawn(request: SpawnRequest): Promise<SpawnResult> {
     const { path, args, cwd, stdinText, capture, outFile, append } = request;
-    if (path === "compile") {
-      return { exitCode: await this.toolchainCompile(args.slice(1), cwd) };
+    if (path === "compile" || path === "cc") {
+      return { exitCode: await this.toolchainCompile(args.slice(1), cwd, path) };
     }
-    if (path === "link") {
-      return { exitCode: await this.toolchainLink(args.slice(1), cwd) };
+    if (path === "link" || path === "ld") {
+      return { exitCode: await this.toolchainLink(args.slice(1), cwd, path) };
     }
 
     if (this.activeChildren >= MAX_CHILDREN) {
@@ -214,12 +147,8 @@ export class SlopSession {
         capturedBytes += chunk.byteLength;
         return;
       }
-      if (fileStream !== null) {
-        const py = this.deps.py;
-        py.FS.write(fileStream, chunk, 0, chunk.byteLength);
-        return;
-      }
-      this.deps.writeOut(new TextDecoder().decode(chunk, { stream: true }));
+      const py = this.deps.py;
+      py.FS.write(fileStream, chunk, 0, chunk.byteLength);
     };
 
     // Piped stdin replaces the session input for this child.
@@ -232,21 +161,25 @@ export class SlopSession {
             return stdinText;
           };
         })()
-      : () => this.input.next();
+      : this.deps.childStdin;
 
-    const handle = startWasiProgram(this.deps.py, {
-      executablePath: path,
-      args: args.slice(1),
-      env: { PATH: "/bin", PWD: cwd, TERM: "ghostty" },
-      preopens: SHELL_PREOPENS,
-      interactiveStdin: true,
-      stdinProvider,
-      timeoutMs: 0,
-      spawnHandler: (nested) => this.onSpawn(nested),
-      onStdoutBytes: capture || outFile ? writeChunk : undefined,
-      onStdout: capture || outFile ? undefined : this.deps.writeOut,
-      onStderr: this.deps.writeOut,
-    });
+    const handle = startWasiProgram(
+      this.deps.py,
+      {
+        executablePath: path,
+        args: args.slice(1),
+        env: { PATH: "/bin", PWD: cwd, TERM: "ghostty" },
+        preopens: shellPreopens(cwd),
+        interactiveStdin: true,
+        stdinProvider,
+        timeoutMs: 0,
+        spawnHandler: (nested) => this.onSpawn(nested),
+        onStdoutBytes: capture || outFile ? writeChunk : undefined,
+        onStdout: capture || outFile ? undefined : this.deps.writeOut,
+        onStderr: this.deps.writeOut,
+      },
+      this.deps.signal,
+    );
     this.foreground = handle;
     try {
       const result = await handle.result;
@@ -271,93 +204,412 @@ export class SlopSession {
     return normalizePath(`${cwd}/${path}`);
   }
 
-  private async toolchainCompile(args: string[], cwd: string): Promise<number> {
+  private compileUsage(command: string): string {
+    return (
+      `usage: ${command} -c [-O0|-O1|-O2|-O3|-Os] [-std=c11|c17] [-g] ` +
+      "[-Wall] [-Wextra] [-Werror] [-Dname[=value]] [-I dir] <file.c> [-o out.o]\r\n"
+    );
+  }
+
+  private linkUsage(command: string): string {
+    return `usage: ${command} [-s] [--export=symbol] <a.o b.o ...> -o <out.wasm>\r\n`;
+  }
+
+  private async toolchainCompile(
+    args: string[],
+    cwd: string,
+    command: string,
+  ): Promise<number> {
     const positional: string[] = [];
     let output: string | null = null;
+    const options: CompileOptions = {};
+    const defines: string[] = [];
+    const includePaths: string[] = [];
+
     for (let i = 0; i < args.length; i++) {
-      if (args[i] === "-o" && i + 1 < args.length) output = args[++i];
-      else positional.push(args[i]);
+      const arg = args[i];
+      if (arg === "--help") {
+        this.deps.writeOut(this.compileUsage(command));
+        return 0;
+      }
+      if (arg === "-c") continue;
+      if (arg === "-o") {
+        if (i + 1 >= args.length) {
+          this.deps.writeOut(`${command}: -o requires a path\r\n`);
+          return 2;
+        }
+        output = args[++i];
+        continue;
+      }
+      if (/^-O[0123s]$/.test(arg)) {
+        options.optimization = arg.slice(2) as CompileOptions["optimization"];
+        continue;
+      }
+      if (arg === "-std=c11" || arg === "-std=c17") {
+        options.standard = arg.slice(5) as CompileOptions["standard"];
+        continue;
+      }
+      if (arg === "-g") {
+        options.debug = true;
+        continue;
+      }
+      if (arg === "-Wall" || arg === "-Wextra") {
+        options.warnings = true;
+        continue;
+      }
+      if (arg === "-Werror") {
+        options.warningsAsErrors = true;
+        continue;
+      }
+      if (arg === "-D" || arg.startsWith("-D")) {
+        const define = arg === "-D" ? args[++i] : arg.slice(2);
+        if (!define || !/^[A-Za-z_][A-Za-z0-9_]*(?:=.*)?$/.test(define)) {
+          this.deps.writeOut(`${command}: invalid -D definition\r\n`);
+          return 2;
+        }
+        defines.push(define);
+        continue;
+      }
+      if (arg === "-I" || arg.startsWith("-I")) {
+        const include = arg === "-I" ? args[++i] : arg.slice(2);
+        if (!include) {
+          this.deps.writeOut(`${command}: -I requires a directory\r\n`);
+          return 2;
+        }
+        const resolved = this.resolveInCwd(include, cwd);
+        if (!fsExists(this.deps.py, resolved) || !fsIsDir(this.deps.py, resolved)) {
+          this.deps.writeOut(`${command}: include directory not found: ${resolved}\r\n`);
+          return 2;
+        }
+        includePaths.push(resolved);
+        continue;
+      }
+      if (arg.startsWith("-")) {
+        this.deps.writeOut(`${command}: unsupported option: ${arg}\r\n`);
+        return 2;
+      }
+      positional.push(arg);
     }
     if (positional.length !== 1) {
-      this.deps.writeOut("usage: compile <file.c> [-o out.o]\r\n");
+      this.deps.writeOut(this.compileUsage(command));
+      return 2;
+    }
+    if (defines.length > MAX_TOOLCHAIN_INPUTS || includePaths.length > MAX_TOOLCHAIN_INPUTS) {
+      this.deps.writeOut(`${command}: too many -D or -I options\r\n`);
       return 2;
     }
     const sourcePath = this.resolveInCwd(positional[0], cwd);
+    if (!sourcePath.toLowerCase().endsWith(".c")) {
+      this.deps.writeOut(`${command}: source file must end in .c\r\n`);
+      return 2;
+    }
+    if (!fsExists(this.deps.py, sourcePath) || fsIsDir(this.deps.py, sourcePath)) {
+      this.deps.writeOut(`${command}: source file not found: ${sourcePath}\r\n`);
+      return 2;
+    }
+    if (this.deps.py.FS.stat(sourcePath).size > MAX_C_SOURCE_BYTES) {
+      this.deps.writeOut(`${command}: source exceeds the 512 KiB limit\r\n`);
+      return 2;
+    }
     const defaultOut = sourcePath.toLowerCase().endsWith(".c")
       ? `${sourcePath.slice(0, -2)}.o`
       : `${sourcePath}.o`;
     const outputPath = output ? this.resolveInCwd(output, cwd) : defaultOut;
+    if (!outputPath.toLowerCase().endsWith(".o")) {
+      this.deps.writeOut(`${command}: compiler output must end in .o\r\n`);
+      return 2;
+    }
+    if (outputPath === sourcePath) {
+      this.deps.writeOut(`${command}: output cannot overwrite the source file\r\n`);
+      return 2;
+    }
+    options.defines = defines;
+    options.includePaths = includePaths;
     this.deps.note(`  compiling ${sourcePath} …`);
     try {
       const result = await runToolchainInBrowser(
         this.deps.py,
-        { operation: "compile", sourcePath, outputPath },
+        { operation: "compile", sourcePath, outputPath, options },
+        this.deps.signal,
       );
       if (result.diagnostics) this.deps.writeOut(result.diagnostics.replaceAll("\n", "\r\n"));
       return 0;
     } catch (error) {
       this.deps.writeOut(
-        `compile: ${error instanceof Error ? error.message : String(error)}\r\n`.replaceAll("\n", "\r\n"),
+        `${command}: ${error instanceof Error ? error.message : String(error)}\r\n`.replaceAll("\n", "\r\n"),
       );
       return 1;
     }
   }
 
-  private async toolchainLink(args: string[], cwd: string): Promise<number> {
+  private async toolchainLink(
+    args: string[],
+    cwd: string,
+    command: string,
+  ): Promise<number> {
     const objects: string[] = [];
     let output: string | null = null;
+    const options: LinkOptions = {};
+    const exports: string[] = [];
+
     for (let i = 0; i < args.length; i++) {
-      if (args[i] === "-o" && i + 1 < args.length) output = args[++i];
-      else objects.push(args[i]);
+      const arg = args[i];
+      if (arg === "--help") {
+        this.deps.writeOut(this.linkUsage(command));
+        return 0;
+      }
+      if (arg === "-o") {
+        if (i + 1 >= args.length) {
+          this.deps.writeOut(`${command}: -o requires a path\r\n`);
+          return 2;
+        }
+        output = args[++i];
+        continue;
+      }
+      if (arg === "-s" || arg === "--strip-all") {
+        options.strip = true;
+        continue;
+      }
+      if (arg === "--export" || arg.startsWith("--export=")) {
+        const symbol = arg === "--export" ? args[++i] : arg.slice("--export=".length);
+        if (!symbol || !/^[A-Za-z_.$][A-Za-z0-9_.$]*$/.test(symbol)) {
+          this.deps.writeOut(`${command}: invalid exported symbol\r\n`);
+          return 2;
+        }
+        exports.push(symbol);
+        continue;
+      }
+      if (arg.startsWith("-")) {
+        this.deps.writeOut(`${command}: unsupported option: ${arg}\r\n`);
+        return 2;
+      }
+      objects.push(arg);
     }
     if (objects.length === 0 || !output) {
-      this.deps.writeOut("usage: link <a.o b.o ...> -o <out.wasm>\r\n");
+      this.deps.writeOut(this.linkUsage(command));
+      return 2;
+    }
+    if (objects.length > MAX_TOOLCHAIN_INPUTS || exports.length > MAX_TOOLCHAIN_INPUTS) {
+      this.deps.writeOut(`${command}: too many object files or exports\r\n`);
       return 2;
     }
     const objectPaths = objects.map((object) => this.resolveInCwd(object, cwd));
     const outputPath = this.resolveInCwd(output, cwd);
+    for (const objectPath of objectPaths) {
+      if (
+        !objectPath.toLowerCase().endsWith(".o") ||
+        !fsExists(this.deps.py, objectPath) ||
+        fsIsDir(this.deps.py, objectPath)
+      ) {
+        this.deps.writeOut(`${command}: object file not found: ${objectPath}\r\n`);
+        return 2;
+      }
+    }
+    if (!outputPath.toLowerCase().endsWith(".wasm") && !outputPath.startsWith("/bin/")) {
+      this.deps.writeOut(`${command}: output must end in .wasm or be inside /bin\r\n`);
+      return 2;
+    }
+    options.exports = exports;
     this.deps.note(`  linking ${outputPath} …`);
     try {
       const result = await runToolchainInBrowser(
         this.deps.py,
-        { operation: "link", objectPaths, outputPath },
+        { operation: "link", objectPaths, outputPath, options },
+        this.deps.signal,
       );
       if (result.diagnostics) this.deps.writeOut(result.diagnostics.replaceAll("\n", "\r\n"));
       return 0;
     } catch (error) {
       this.deps.writeOut(
-        `link: ${error instanceof Error ? error.message : String(error)}\r\n`.replaceAll("\n", "\r\n"),
+        `${command}: ${error instanceof Error ? error.message : String(error)}\r\n`.replaceAll("\n", "\r\n"),
       );
       return 1;
     }
   }
+}
 
-  /* ------------------------------ install ------------------------------- */
+function concatChunks(chunks: Uint8Array[], total: number): Uint8Array {
+  const out = new Uint8Array(Math.min(total, MAX_CAPTURE_BYTES));
+  let offset = 0;
+  for (const chunk of chunks) {
+    if (offset + chunk.byteLength > out.byteLength) break;
+    out.set(chunk, offset);
+    offset += chunk.byteLength;
+  }
+  return out;
+}
 
-  /** Fetch the committed shell binaries + sources into the MEMFS once. */
-  private async install(): Promise<void> {
-    const py = this.deps.py;
-    if (fsExists(py, "/bin/slop")) {
-      this.installed = true;
-      return;
-    }
-    this.deps.note("  installing slop into /bin …");
-    const base = import.meta.env.BASE_URL;
-    py.FS.mkdirTree("/bin");
-    py.FS.mkdirTree("/home/web/slop");
-    for (const name of SHELL_BINARIES) {
-      const response = await fetch(`${base}slop/bin/${name}`);
-      if (!response.ok) throw new Error(`could not fetch ${name} (HTTP ${response.status})`);
-      py.FS.writeFile(`/bin/${name}`, new Uint8Array(await response.arrayBuffer()));
-    }
-    try {
-      for (const name of SHELL_SOURCES) {
-        const response = await fetch(`${base}slop/src/${name}`);
-        if (response.ok) py.FS.writeFile(`/home/web/slop/${name}`, await response.text());
+/* --------------------------- one-shot commands --------------------------- */
+
+export interface SlopCommandOptions {
+  /** Working directory for the fresh shell (default /home/web). */
+  cwd?: string;
+  onStdout?: (text: string) => void;
+  note?: (text: string) => void;
+  /** Worker mode only; 0 disables (default 30s). */
+  timeoutMs?: number;
+  signal?: AbortSignal;
+}
+
+/**
+ * Run one slop command line (pipes, redirects, expansion) in a fresh shell
+ * instance. Stateless: the filesystem persists, cwd does not (pass cwd).
+ */
+export async function runSlopCommand(
+  py: Pyodide,
+  command: string,
+  options: SlopCommandOptions = {},
+): Promise<{ exitCode: number }> {
+  await ensureSlopInstalled(py, options.note);
+  const cwd = options.cwd ?? "/home/web";
+  const spawner = new SlopSpawner({
+    py,
+    writeOut: options.onStdout ?? (() => {}),
+    note: options.note ?? (() => {}),
+    childStdin: () => null, // deterministic EOF for interactive reads
+    signal: options.signal,
+  });
+  // Pre-fed stdin works in worker and main-thread fallback modes. It closes
+  // after the command, so both the shell and stdin-reading children terminate.
+  const handle = startWasiProgram(
+    py,
+    {
+      executablePath: "/bin/slop",
+      env: { PATH: "/bin", PWD: cwd, TERM: "ghostty", SLOP_QUIET: "1" },
+      preopens: shellPreopens(cwd),
+      stdin: command.endsWith("\n") ? command : `${command}\n`,
+      timeoutMs: options.timeoutMs ?? 30_000,
+      spawnHandler: (request) => spawner.onSpawn(request),
+      onStdout: options.onStdout,
+      onStderr: options.onStdout,
+    },
+    options.signal,
+  );
+  return handle.result;
+}
+
+/* --------------------------- interactive session ------------------------- */
+
+/**
+ * One shared input buffer for the session, like a tty: input typed while a
+ * child runs is consumed by whatever reads next (the child, or the shell
+ * after the child exits). A null marker is a one-shot EOF for the next
+ * reader only (unlike StdinQueue's permanent EOF state).
+ */
+class SharedInput {
+  private queue: (Uint8Array | null)[] = [];
+  private waiting: ((item: Uint8Array | null) => void)[] = [];
+
+  push(item: Uint8Array | null): void {
+    if (item !== null && item.byteLength === 0) return;
+    if (this.waiting.length > 0) this.waiting.shift()!(item);
+    else this.queue.push(item);
+  }
+
+  next(): Promise<Uint8Array | null> | Uint8Array | null {
+    const queued = this.queue.shift();
+    if (queued !== undefined) return queued;
+    return new Promise((resolve) => this.waiting.push(resolve));
+  }
+}
+
+export interface SlopSessionDeps {
+  py: Pyodide;
+  writeOut: (text: string) => void;
+  note: (text: string) => void;
+  onExit: () => void;
+}
+
+export class SlopSession {
+  private deps: SlopSessionDeps;
+  private slop: WasiProgramHandle | null = null;
+  private line = "";
+  private input = new SharedInput();
+  private spawner: SlopSpawner;
+
+  constructor(deps: SlopSessionDeps) {
+    this.deps = deps;
+    this.spawner = new SlopSpawner({
+      py: deps.py,
+      writeOut: deps.writeOut,
+      note: deps.note,
+      childStdin: () => this.input.next(),
+    });
+  }
+
+  get alive(): boolean {
+    return this.slop !== null;
+  }
+
+  async start(): Promise<void> {
+    if (this.slop) return;
+    await ensureSlopInstalled(this.deps.py, this.deps.note);
+    const handle = startWasiProgram(this.deps.py, {
+      executablePath: "/bin/slop",
+      env: { PATH: "/bin", PWD: "/home/web", TERM: "ghostty" },
+      preopens: shellPreopens("/home/web"),
+      interactiveStdin: true,
+      stdinProvider: () => this.input.next(),
+      timeoutMs: 0,
+      spawnHandler: (request) => this.spawner.onSpawn(request),
+      onStdout: this.deps.writeOut,
+      onStderr: this.deps.writeOut,
+    });
+    this.slop = handle;
+    this.line = "";
+    handle.result
+      .catch(() => ({ exitCode: -1 }))
+      .then(({ exitCode }) => {
+        if (this.slop === handle) {
+          this.slop = null;
+          this.deps.note(`  slop exited (${exitCode}) — Ctrl+Shift+S to restart`);
+          this.deps.onExit();
+        }
+      });
+  }
+
+  /** Stop the shell and any foreground child. */
+  stop(): void {
+    this.spawner.foreground?.kill();
+    this.slop?.kill();
+    this.slop = null;
+  }
+
+  /** Terminal input while the shell view is active (canonical line mode). */
+  feed(data: string): void {
+    const encoder = new TextEncoder();
+    for (const ch of data) {
+      if (ch === "\r" || ch === "\n") {
+        this.deps.writeOut("\r\n");
+        this.input.push(encoder.encode(`${this.line}\n`));
+        this.line = "";
+      } else if (ch === "\x7f" || ch === "\b") {
+        if (this.line.length > 0) {
+          this.line = this.line.slice(0, -1);
+          this.deps.writeOut("\b \b");
+        }
+      } else if (ch === "\x03") {
+        // Ctrl+C: kill the foreground child, or cancel the line at the prompt.
+        this.deps.writeOut("^C\r\n");
+        if (this.spawner.foreground) this.spawner.foreground.kill();
+        else {
+          this.line = "";
+          this.input.push(encoder.encode("\n"));
+        }
+        return;
+      } else if (ch === "\x04") {
+        // Ctrl+D: an EOF marker for whoever reads next (child, or the shell
+        // at its prompt, which exits on EOF).
+        if (this.line.length > 0) {
+          this.input.push(encoder.encode(this.line));
+          this.line = "";
+        } else {
+          this.input.push(null);
+        }
+      } else if (ch >= " ") {
+        this.line += ch;
+        this.deps.writeOut(ch);
       }
-    } catch {
-      // Sources are a convenience, not a requirement.
     }
-    this.installed = true;
   }
 }

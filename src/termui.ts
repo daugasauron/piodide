@@ -160,6 +160,24 @@ export async function createTerminal(mount: HTMLElement): Promise<TerminalHandle
   term.open(mount);
   cacheViewportPerRender(term);
   makeKittyImagesFollowScrollback(term);
+  term.attachCustomKeyEventHandler((event) => {
+    const terminalClipboardShortcut =
+      event.ctrlKey && event.shiftKey && !event.altKey && !event.metaKey;
+    if (!terminalClipboardShortcut) return false;
+
+    if (event.code === "KeyC") {
+      // Always consume the terminal copy chord. With no selection it is a
+      // harmless no-op rather than Ctrl+C or the browser's inspector shortcut.
+      term.copySelection();
+      return true;
+    }
+    if (event.code === "KeyV") {
+      // Let the browser emit its trusted paste event. Ghostty handles that
+      // event as plain text and routes it through onData to the active view.
+      return false;
+    }
+    return false;
+  });
 
   const fit = new FitAddon();
   term.loadAddon(fit);

@@ -36,12 +36,12 @@ int main(int argc, char **argv) {
     }
     int fd = open(argv[i], O_RDONLY);
     if (fd < 0) {
-      printf("cat: %s: %s\n", argv[i], strerror(errno));
+      fprintf(stderr, "cat: %s: %s\n", argv[i], strerror(errno));
       rc = 1;
       continue;
     }
     if (pump(fd) < 0) {
-      printf("cat: %s: %s\n", argv[i], strerror(errno));
+      fprintf(stderr, "cat: %s: %s\n", argv[i], strerror(errno));
       rc = 1;
     }
     close(fd);

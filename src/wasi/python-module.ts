@@ -31,8 +31,7 @@ const WASI_PY_SOURCE = `"""Run WASI programs against the shared Pyodide filesyst
     print(result["exitCode"], result["stdout"])
 
 The program reads and writes the same files Python sees (no copying).
-The process cwd starts at "/", so prefer absolute /home/web paths or
-chdir early in your program.
+The process working directory is /home/web. Absolute paths are also supported.
 """
 
 from pyodide.ffi import to_js

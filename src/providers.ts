@@ -8,6 +8,7 @@ import type { Model } from "@earendil-works/pi-ai";
 export type ApiKind =
   | "openai-completions"
   | "openai-responses"
+  | "openai-codex-responses"
   | "anthropic-messages";
 
 export interface ProviderDef {
@@ -23,6 +24,8 @@ export interface ProviderDef {
   note?: string;
   /** Extra fields merged into the chat-completions request body. */
   extraBody?: Record<string, unknown>;
+  /** TEMPORARY: authenticates through the opt-in loopback Codex proxy. */
+  temporaryLocalCodexProxy?: boolean;
 }
 
 export const PROVIDERS: Record<string, ProviderDef> = {
@@ -145,6 +148,22 @@ export const PROVIDERS: Record<string, ProviderDef> = {
       import("@earendil-works/pi-ai/providers/zai.models").then((module) => module.ZAI_MODELS),
     ),
     note: "GLM Coding Plan 订阅专用端点",
+  },
+  // TEMPORARY: delete this entry with scripts/local-codex-proxy.mjs when the
+  // browser can use subscription auth through a supported mechanism.
+  "codex-local": {
+    name: "codex-local",
+    label: "OpenAI Codex subscription (temporary local proxy)",
+    api: "openai-codex-responses",
+    baseUrl: "http://127.0.0.1:1456",
+    defaultModel: "gpt-5.6-sol",
+    loadModels: modelCatalogue("codex-local", "gpt-5.6-sol", () =>
+      import("@earendil-works/pi-ai/providers/openai-codex.models").then(
+        (module) => module.OPENAI_CODEX_MODELS,
+      ),
+    ),
+    note: "temporary loopback proxy; start it with npm run codex-proxy",
+    temporaryLocalCodexProxy: true,
   },
   local: {
     name: "local",

@@ -9,6 +9,7 @@
     "prebuild": "node scripts/copy-wasm.mjs",
     "build": "tsc && vite build",
     "preview": "vite preview",
+    "codex-proxy": "node scripts/local-codex-proxy.mjs",
     "test": "node --experimental-strip-types --test \"test/*.test.ts\"",
     "test:fetch-toolchain": "node scripts/fetch-toolchain-assets.mjs"
   },

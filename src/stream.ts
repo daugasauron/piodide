@@ -3,12 +3,16 @@ import type {
   AssistantMessage,
   AssistantMessageEventStream,
 } from "@earendil-works/pi-ai";
+import { openAICodexResponsesApi } from "@earendil-works/pi-ai/api/openai-codex-responses.lazy";
 import { openAIResponsesApi } from "@earendil-works/pi-ai/api/openai-responses.lazy";
 import type { StreamFn } from "@earendil-works/pi-agent-core";
 
 import { streamAnthropic } from "./anthropic-stream.ts";
 import { streamOpenAI } from "./openai-stream.ts";
 
+// TEMPORARY: this API targets the opt-in loopback Codex proxy. Force SSE so
+// the proxy can remain a tiny HTTP relay instead of implementing WebSockets.
+const openAICodexResponses = openAICodexResponsesApi();
 const openAIResponses = openAIResponsesApi();
 const MISSING_RESPONSES_TERMINAL =
   "OpenAI Responses stream ended before a terminal response event";
@@ -66,6 +70,12 @@ export const streamDispatch: StreamFn = (model, context, options) => {
     return recoverMissingResponsesTerminal(
       openAIResponses.streamSimple(model, context, options),
     );
+  }
+  if (model.api === "openai-codex-responses") {
+    return openAICodexResponses.streamSimple(model, context, {
+      ...options,
+      transport: "sse",
+    });
   }
   return streamOpenAI(model, context, options);
 };

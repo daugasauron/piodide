@@ -65,9 +65,10 @@ const SYSTEM_PROMPT = `You are pi, a coding assistant running entirely inside th
 
 Tools:
 - python: run focused Python 3 code; stdout/stderr is shown live and returned to you. Install a pure-Python package only when needed with: import micropip; await micropip.install("pkg").
-- compile_c: compile one small C source file from /home/web to a wasm32-wasi .o object. It sees the live Pyodide filesystem, including quoted local headers.
-- link_wasi: link one or more .o files stored in /home/web into a WASI .wasm executable with wasm-ld and WASI libc. The compiler/linker assets are lazily downloaded.
-- run_wasi: run a WASI .wasm file from /home/web with arguments, stdin, and environment variables. The program shares the live Pyodide filesystem (no copying): files it creates, edits, or deletes are immediately visible everywhere. Inside C, absolute /home/web paths work, and the process cwd starts at / — chdir or use absolute paths. From Python you can also import wasi and await wasi.run_wasi(path, args=[...], stdin="...").
+- compile_c: compile one bounded C source file to a wasm32-wasi .o object. It supports C11/C17, -O0/-O1/-O2/-O3/-Os, DWARF debug info, warnings/-Werror, -D definitions, and additional /home/web include directories.
+- link_wasi: link one or more .o files into a WASI .wasm executable with wasm-ld and WASI libc. It can export selected symbols and optionally strip the result. The compiler, linker, and sysroot assets are lazily downloaded.
+- run_wasi: run a WASI .wasm file from /home/web with arguments, stdin, and environment variables. The program shares the live Pyodide filesystem (no copying): files it creates, edits, or deletes are immediately visible everywhere. Relative paths start at /home/web, and absolute /home/web paths also work. From Python you can also import wasi and await wasi.run_wasi(path, args=[...], stdin="...").
+- slop: run one command line in the slop shell: pipes (cat f.txt | grep x), redirects (> file, >> file), &&/|| short-circuit lists, ; sequences, and $VAR/\${VAR}/$? expansion. $PATH is exactly /bin: ls, cat, grep, echo, env, fd-find. Slop also recognizes host-routed cc/ld pseudo-commands. Each call is a fresh shell — filesystem changes persist between calls, cwd does not (pass cwd; default /home/web). Use slop for small shell-style jobs instead of python for file crunching.
 - read: read a text file with line numbers; offset (1-based) and limit paginate large files.
 - write: create or overwrite a file; parent directories are created automatically.
 - edit: apply exact, unique string replacements (each oldText must match exactly once).
@@ -89,6 +90,18 @@ Environment and memory constraints:
 - If a request could exhaust memory, say so and use a bounded alternative instead of attempting it.
 
 Files written by write are immediately visible to python and vice versa. The current working directory is /home/web.
+
+C/WASI toolchain:
+- Prefer compile_c and link_wasi when you want structured validation, separate diagnostics, and explicit inputs/outputs. Prefer slop's cc/ld commands for familiar command lines, cwd-relative paths, or && workflows. Both interfaces use exactly the same backend and cache.
+- Slop examples: cc -c -std=c17 -O2 -Wall -Wextra main.c -o main.o; ld main.o util.o --export=main -o app.wasm; ./app.wasm. The older names compile and link remain aliases for cc and ld. Run cc --help or ld --help for the accepted flags.
+- cc and ld are host-routed Slop pseudo-commands, not WASI files in /bin. cc compiles exactly one .c source to one .o object; invoke it once per translation unit, then pass objects to ld in link order.
+- The first toolchain use downloads and compiles roughly 52 MB of Clang 8, wasm-ld, and sysroot assets. Reuse the cache and avoid speculative compiles. Compilation runs in a disposable worker when cross-origin isolation is available and may take materially longer than Python or the small /bin commands.
+- Defaults are C11 and -O2. This is a legacy WASI libc/toolchain: C11 and C17 are supported, direct errno access is compatibility-patched, and relative file paths start at the supplied cwd. chdir/getcwd, native subprocesses, threads, sockets, dynamic loading, and host OS access are unavailable. Generated modules currently use the legacy wasi_unstable namespace, which this runtime supports alongside wasi_snapshot_preview1.
+- Keep sources and outputs small. There is no make, ar, package manager, native executable output, or incremental build graph; use several cc calls and one ld call. A linked executable runs only through run_wasi, ./path inside slop, Python's wasi.run_wasi, or an exact-name command installed in /bin.
+
+Extending the shell (self-hosting):
+- You can add commands: write a small C program with the write tool, compile it with cc -c file.c -o file.o, then link it with ld file.o -o /bin/name (or use compile_c + link_wasi). It runs immediately by exact name through slop. Relative paths automatically start at the cwd supplied by slop.
+- The shell's own sources are in /home/web/slop/ (slop.c, ls.c, cat.c, grep.c, echo.c, env.c, fd-find.c) — small, readable starting points. You can even rebuild slop itself (careful: the user runs it interactively too).
 To show an image, save it as a file and then call the image tool exactly once. A fetch,
 python, or reasoning result does not display the file. Do not print binary image bytes or
 base64 into the terminal, and do not call image again for the same display request.
@@ -152,7 +165,6 @@ const htmlPreviewTitleEl = document.getElementById("html-preview-title") as HTML
 const htmlPreviewFrameEl = document.getElementById("html-preview-frame") as HTMLIFrameElement;
 const htmlPreviewCloseEl = document.getElementById("html-preview-close") as HTMLButtonElement;
 const footerLocationEl = document.getElementById("footer-location") as HTMLElement;
-const footerHeapEl = document.getElementById("footer-heap") as HTMLElement;
 const footerUsageEl = document.getElementById("footer-usage") as HTMLElement;
 const footerModelEl = document.getElementById("footer-model") as HTMLElement;
 const statusEl = document.getElementById("status") as HTMLElement;
@@ -258,6 +270,30 @@ function currentApiKey() {
   return provider ? (apiKeys.get(provider.name) ?? "") : "";
 }
 
+function consumeTemporaryCodexProxyToken(): string {
+  const url = new URL(location.href);
+  const fragment = new URLSearchParams(url.hash.slice(1));
+  const token = fragment.get("codex_proxy_token")?.trim() ?? "";
+  if (!token) return "";
+  fragment.delete("codex_proxy_token");
+  url.hash = fragment.toString();
+  history.replaceState(history.state, "", `${url.pathname}${url.search}${url.hash}`);
+  return token;
+}
+
+async function verifyTemporaryCodexProxyToken(
+  candidate: ProviderDef,
+  token: string,
+): Promise<void> {
+  const response = await fetch(`${candidate.baseUrl}/auth/status`, {
+    headers: { Authorization: `Bearer ${token}` },
+  });
+  if (!response.ok) {
+    const detail = await response.text().catch(() => "");
+    throw new Error(detail || `local Codex proxy returned HTTP ${response.status}`);
+  }
+}
+
 function currentHeapUsage() {
   return py ? formatWasmHeapUsage(py) : "loading";
 }
@@ -281,12 +317,11 @@ function renderFooter() {
       ? "/home/web (nvim)"
       : activeView === "slop"
         ? "/home/web (slop)"
-        : `/home/web (${model})`;
-  footerHeapEl.textContent = `heap ${currentHeapUsage()}`;
+        : "/home/web";
   footerUsageEl.textContent =
     `↑${formatTokenCount(usage.input)} ↓${formatTokenCount(usage.output)} ` +
     `R${formatTokenCount(usage.reasoning)} CH${cacheHit} ` +
-    `${contextPercent.toFixed(1)}%/${formatTokenCount(contextWindow)} (${thinking})`;
+    `${contextPercent.toFixed(1)}%/${formatTokenCount(contextWindow)}`;
   footerModelEl.textContent =
     `(${provider?.name ?? "no provider"}) ${model} • ${thinking}`;
 }
@@ -724,7 +759,7 @@ function showStatus() {
     }`,
     `  model  : ${currentModelId() || dim("(none)")}`,
     `  thinking: ${agent?.state.thinkingLevel ?? "off"}`,
-    `  key    : ${currentApiKey() ? green("set") : dim("(none — /login)")}`,
+    `  ${provider?.temporaryLocalCodexProxy ? "proxy  " : "key    "}: ${currentApiKey() ? green("set") : dim("(none — /login)")}`,
     `  github : ${
       gitHubCredentials
         ? `${green("connected")} · ${gitHubCredentials.login}@${gitHubCredentials.apiBaseUrl}`
@@ -910,6 +945,20 @@ async function runSlash(input: string) {
         say(yellow("  pick a provider first: /provider <name>"));
         break;
       }
+      if (provider.temporaryLocalCodexProxy) {
+        const token = (
+          await prompt.ask("  temporary token printed by npm run codex-proxy (hidden): ", true)
+        ).trim();
+        if (!token) {
+          say(yellow("  login cancelled"));
+          break;
+        }
+        say(dim("  checking local Codex proxy…"));
+        await verifyTemporaryCodexProxyToken(provider, token);
+        apiKeys.set(provider.name, token);
+        say(green("  ◆ connected to temporary local Codex proxy"));
+        break;
+      }
       const key = await prompt.ask(`  API key for ${provider.label} (hidden): `, true);
       const trimmed = key.trim();
       if (trimmed) {
@@ -924,6 +973,20 @@ async function runSlash(input: string) {
     case "logout":
       if (!provider) {
         say(yellow("  no provider selected"));
+      } else if (provider.temporaryLocalCodexProxy) {
+        const token = currentApiKey();
+        apiKeys.delete(provider.name);
+        if (token) {
+          try {
+            await fetch(`${provider.baseUrl}/shutdown`, {
+              method: "POST",
+              headers: { Authorization: `Bearer ${token}` },
+            });
+          } catch {
+            // It may already have been stopped with Ctrl-C.
+          }
+        }
+        say(green("  ◆ local Codex proxy disconnected; its temporary process was stopped"));
       } else {
         apiKeys.delete(provider.name);
         say(green(`  ◆ key removed for ${provider.label}`));
@@ -1141,6 +1204,8 @@ async function runSlash(input: string) {
     case "hotkeys":
       say(dim("  Ctrl+Shift+E  toggle agent / Neovim"));
       say(dim("  Ctrl+Shift+S  toggle agent / slop shell"));
+      say(dim("  Ctrl+Shift+C  copy terminal selection"));
+      say(dim("  Ctrl+Shift+V  paste clipboard text"));
       say(dim("  Shift+Tab  cycle thinking level"));
       say(dim("  ↑/↓        history or menu selection"));
       say(dim("  Tab        complete selected slash command"));
@@ -1216,6 +1281,69 @@ function truncateLine(value: string, maxLength: number): string {
   return value.slice(0, Math.max(1, maxLength - 1)) + "…";
 }
 
+function exactStringPreview(value: string, maxLength: number): string {
+  const serialized = JSON.stringify(value);
+  if (serialized.length <= maxLength) return serialized;
+
+  const suffix = " … [truncated]";
+  const budget = Math.max(2, maxLength - suffix.length);
+  let low = 0;
+  let high = value.length;
+  while (low < high) {
+    const middle = Math.ceil((low + high) / 2);
+    if (JSON.stringify(value.slice(0, middle)).length <= budget) low = middle;
+    else high = middle - 1;
+  }
+  return `${JSON.stringify(value.slice(0, low))}${suffix}`;
+}
+
+function printSlopCall(args: unknown) {
+  const values =
+    typeof args === "object" && args !== null ? (args as Record<string, unknown>) : {};
+  const command = typeof values.command === "string" ? values.command : "";
+  const cwd = typeof values.cwd === "string" ? values.cwd : "/home/web";
+  const valueWidth = Math.max(32, writer.cols - 15);
+
+  writer.writeln(dim("  ⏺ slop"));
+  writer.writeln(dim(`    cwd    ${exactStringPreview(cwd, valueWidth)}`));
+  writer.writeln(dim(`    input  ${exactStringPreview(command, valueWidth)}`));
+}
+
+function slopOutputText(result: any, exitCode: unknown): string {
+  const text = toolResultText(result);
+  const marker = `[exit ${exitCode ?? "?"}]\n`;
+  return text.endsWith(marker) ? text.slice(0, -marker.length) : text;
+}
+
+function printSlopOutput(result: any, exitCode: unknown) {
+  const output = slopOutputText(result, exitCode);
+  writer.writeln(dim("    output"));
+  if (!output) {
+    writer.writeln(dim("    │ (no output)"));
+    return;
+  }
+
+  const normalized = output.replace(/\r\n/g, "\n").replace(/\r/g, "\\r");
+  const lines = normalized.endsWith("\n")
+    ? normalized.slice(0, -1).split("\n")
+    : normalized.split("\n");
+  const headCount = 12;
+  const tailCount = 4;
+  const maxLineLength = Math.max(24, writer.cols - 8);
+  const printLine = (line: string) => {
+    const safe = line.replaceAll("\x1b", "\\x1b");
+    writer.writeln(dim(`    │ ${truncateLine(safe, maxLineLength)}`));
+  };
+
+  if (lines.length <= headCount + tailCount + 1) {
+    for (const line of lines) printLine(line);
+    return;
+  }
+  for (const line of lines.slice(0, headCount)) printLine(line);
+  writer.writeln(dim(`    │ … ${lines.length - headCount - tailCount} lines omitted`));
+  for (const line of lines.slice(-tailCount)) printLine(line);
+}
+
 function printPythonPreview(code: string) {
   const lines = code.replace(/\r\n?/g, "\n").split("\n");
   const visible = lines.slice(0, 10);
@@ -1288,7 +1416,11 @@ async function renderEvent(event: AgentEvent) {
     case "tool_execution_start": {
       spinner.stop();
       writer.ensureNewline();
-      writer.writeln(dim(`  ⏺ ${toolCallLabel(event.toolName, event.args)}`));
+      if (event.toolName === "slop") {
+        printSlopCall(event.args);
+      } else {
+        writer.writeln(dim(`  ⏺ ${toolCallLabel(event.toolName, event.args)}`));
+      }
       if (event.toolName === "python") {
         const code = pythonSource(event.args);
         if (code) printPythonPreview(code);
@@ -1305,9 +1437,12 @@ async function renderEvent(event: AgentEvent) {
     case "tool_execution_end": {
       writer.ensureNewline();
       if (event.isError) {
+        if (event.toolName === "slop") {
+          printSlopOutput(event.result, event.result?.details?.exitCode);
+        }
         writer.writeln(red(`  ↳ ${event.toolName} failed`));
         const msg = toolResultText(event.result);
-        if (msg) printCapped(msg, 8);
+        if (msg && event.toolName !== "slop") printCapped(msg, 8);
         if (event.toolName === "python") {
           writer.writeln(dim(`  ↳ heap ${currentHeapUsage()}`));
         }
@@ -1329,6 +1464,10 @@ async function renderEvent(event: AgentEvent) {
             break;
           case "run_wasi":
             footer = `  ↳ WASI exit ${d.exitCode ?? "?"} · ${d.outputBytes ?? 0} output bytes`;
+            break;
+          case "slop":
+            printSlopOutput(event.result, d.exitCode);
+            footer = `  ↳ slop exit ${d.exitCode ?? "?"} · ${d.outputBytes ?? 0} output bytes`;
             break;
           case "read": footer = `  ↳ read ${d.lines ?? 0} lines${d.path ? ` · ${d.path}` : ""}`; break;
           case "write": footer = `  ↳ wrote ${d.bytes ?? 0} bytes${d.path ? ` · ${d.path}` : ""}`; break;
@@ -1425,25 +1564,64 @@ the browser.
  * that adds them; one reload later the page is cross-origin isolated and the
  * WASI worker mode (interactive slop, killable runs) works in production.
  */
-async function ensureCrossOriginIsolation() {
-  if (typeof crossOriginIsolated === "undefined" || crossOriginIsolated) return;
-  if (!("serviceWorker" in navigator)) return;
+async function ensureCrossOriginIsolation(): Promise<boolean> {
+  if (typeof crossOriginIsolated === "undefined") return false;
+  if (!("serviceWorker" in navigator)) return false;
+  const scriptUrl = new URL(
+    `${import.meta.env.BASE_URL}coi-serviceworker.js`,
+    location.href,
+  ).href;
   try {
-    await navigator.serviceWorker.register(`${import.meta.env.BASE_URL}coi-serviceworker.js`);
+    const current = await navigator.serviceWorker.getRegistration(import.meta.env.BASE_URL);
+    const loopbackHost =
+      location.hostname === "localhost" ||
+      location.hostname === "127.0.0.1" ||
+      location.hostname === "[::1]";
+    if (
+      crossOriginIsolated &&
+      loopbackHost &&
+      current?.active?.scriptURL === scriptUrl
+    ) {
+      // Dev and preview servers already send COOP/COEP. Detach an older COI
+      // worker so Firefox loads Slop/WASI workers directly from Vite.
+      await current.unregister();
+      if (
+        navigator.serviceWorker.controller &&
+        !sessionStorage.getItem("coi-local-unregistered")
+      ) {
+        sessionStorage.setItem("coi-local-unregistered", "1");
+        location.reload();
+        return true;
+      }
+      return false;
+    }
+    if (!current) sessionStorage.removeItem("coi-local-unregistered");
+    if (current?.active?.scriptURL === scriptUrl) {
+      // Existing controlled pages may already be isolated by an older worker.
+      // Check for the narrowed fetch handler instead of returning early.
+      await current.update();
+    }
+    if (crossOriginIsolated) return false;
+    await navigator.serviceWorker.register(scriptUrl);
     if (
       !navigator.serviceWorker.controller &&
       !sessionStorage.getItem("coi-reloaded")
     ) {
       sessionStorage.setItem("coi-reloaded", "1");
       location.reload();
+      return true;
     }
   } catch {
     // No isolation: everything still works in main-thread fallback mode.
   }
+  return false;
 }
 
 async function main() {
-  void ensureCrossOriginIsolation();
+  // Finish any service-worker transition before consuming a temporary launch
+  // token. A required reload must preserve the fragment for the stable page.
+  if (await ensureCrossOriginIsolation()) return;
+  const temporaryCodexProxyToken = consumeTemporaryCodexProxyToken();
   handle = await createTerminal(mount);
   writer = handle.writer;
   markdown = new AssistantMarkdown(writer);
@@ -1493,6 +1671,30 @@ async function main() {
       renderFooter();
       say(green(`  ◆ python ready · heap ${currentHeapUsage()} · filesystem at /home/web`));
       applyConfigToAgent();
+
+      // TEMPORARY: a proxy launch URL can connect without making the user paste
+      // its non-OpenAI capability. OAuth credentials never enter the browser.
+      if (temporaryCodexProxyToken) {
+        const localCodex = getProvider("codex-local");
+        if (localCodex) {
+          try {
+            await verifyTemporaryCodexProxyToken(localCodex, temporaryCodexProxyToken);
+            apiKeys.set(localCodex.name, temporaryCodexProxyToken);
+            provider = localCodex;
+            modelOverride = null;
+            await localCodex.loadModels();
+            applyConfigToAgent();
+            say(green(`  ◆ connected to ${localCodex.label}`));
+          } catch (error) {
+            say(
+              red(
+                `  local Codex proxy unavailable: ${error instanceof Error ? error.message : String(error)}`,
+              ),
+            );
+          }
+        }
+      }
+
       prompt.setBusy(false);
       prompt.start();
 

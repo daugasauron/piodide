@@ -28,7 +28,11 @@ const DEFAULT_TIMEOUT_MS = 30_000;
 const MAX_CAPTURE_CHARS = 100_000;
 const MAX_SPAWN_DEPTH = 4;
 
-export const WASI_PREOPENS: (string | WasiPreopen)[] = ["/home/web", "/"];
+export const WASI_PREOPENS: (string | WasiPreopen)[] = [
+  { name: ".", path: "/home/web" },
+  "/home/web",
+  "/",
+];
 
 export interface WasiProgramRequest {
   executablePath: string;
@@ -227,7 +231,7 @@ function startInWorker(
         executablePath: path,
         args: args.slice(1),
         env: { PATH: "/bin", PWD: cwd, ...(request.env ?? {}) },
-        preopens: ["/home/web", "/", "/bin"],
+        preopens: [{ name: ".", path: cwd }, "/home/web", "/", "/bin"],
         timeoutMs: request.timeoutMs ?? DEFAULT_TIMEOUT_MS,
         spawnDepth: spawnDepth + 1,
         stdinProvider: stdinText

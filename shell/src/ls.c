@@ -11,9 +11,19 @@
 #include <dirent.h>
 #include <sys/stat.h>
 #include <unistd.h>
+#include <errno.h>
 
 static int cmpstr(const void *a, const void *b) {
   return strcmp(*(char *const *)a, *(char *const *)b);
+}
+
+static void print_entry(const char *name, const struct stat *st, int long_fmt) {
+  int is_dir = S_ISDIR(st->st_mode);
+  if (long_fmt) {
+    printf("%8lld %s%s\n", (long long)st->st_size, name, is_dir ? "/" : "");
+  } else {
+    printf("%s%s\n", name, is_dir ? "/" : "");
+  }
 }
 
 int main(int argc, char **argv) {
@@ -43,34 +53,58 @@ int main(int argc, char **argv) {
   int rc = 0;
   for (int p = 0; p < npaths; p++) {
     const char *path = paths[p];
+    struct stat operand;
+    if (stat(path, &operand) != 0) {
+      fprintf(stderr, "ls: %s: %s\n", path, strerror(errno));
+      rc = 1;
+      continue;
+    }
+    if (!S_ISDIR(operand.st_mode)) {
+      print_entry(path, &operand, long_fmt);
+      continue;
+    }
+
     if (npaths > 1) printf("%s:\n", path);
     DIR *d = opendir(path);
     if (!d) {
-      fprintf(stderr, "ls: %s: ", path);
-      perror(NULL);
+      fprintf(stderr, "ls: %s: %s\n", path, strerror(errno));
       rc = 1;
       continue;
     }
     char *names[4096];
     int n = 0;
     struct dirent *e;
-    while ((e = readdir(d)) != NULL && n < 4096) {
+    while ((e = readdir(d)) != NULL) {
       if (!all && e->d_name[0] == '.') continue;
-      names[n++] = strdup(e->d_name);
+      if (n >= 4096) {
+        fprintf(stderr, "ls: %s: entry limit reached\n", path);
+        rc = 1;
+        break;
+      }
+      names[n] = strdup(e->d_name);
+      if (!names[n]) {
+        fprintf(stderr, "ls: %s: out of memory\n", path);
+        rc = 1;
+        break;
+      }
+      n++;
     }
     closedir(d);
     qsort(names, n, sizeof(char *), cmpstr);
     for (int i = 0; i < n; i++) {
       char full[4096];
-      snprintf(full, sizeof full, "%s/%s", path, names[i]);
+      if (snprintf(full, sizeof full, "%s/%s", path, names[i]) >= (int)sizeof full) {
+        fprintf(stderr, "ls: %s/%s: path too long\n", path, names[i]);
+        free(names[i]);
+        rc = 1;
+        continue;
+      }
       struct stat st;
-      int has_stat = stat(full, &st) == 0;
-      int is_dir = has_stat && S_ISDIR(st.st_mode);
-      if (long_fmt) {
-        if (has_stat) printf("%8lld %s%s\n", (long long)st.st_size, names[i], is_dir ? "/" : "");
-        else printf("%8s %s\n", "?", names[i]);
+      if (stat(full, &st) == 0) {
+        print_entry(names[i], &st, long_fmt);
       } else {
-        printf("%s%s\n", names[i], is_dir ? "/" : "");
+        fprintf(stderr, "ls: %s: %s\n", full, strerror(errno));
+        rc = 1;
       }
       free(names[i]);
     }
