@@ -57,7 +57,10 @@ function text(t: string) {
 
 const PythonParams = Type.Object({
   code: Type.String({
-    description: "The Python code to run. Runs as a top-level script; print() to produce output.",
+    description:
+      "Valid CPython code to run as a top-level script; print() for output. " +
+      "Never use notebook `!` commands, pip, os.system, or subprocess. " +
+      "Install a pure-Python package with `import micropip; await micropip.install('pkg')`.",
   }),
 });
 
@@ -272,7 +275,8 @@ export function createPythonTool(py: Pyodide): AgentTool<typeof PythonParams, Py
       "Execute Python 3 code in the in-browser pyodide sandbox. stdout and stderr are " +
       "captured and returned. The filesystem you see here (open/read/write files, os, " +
       "pathlib) is the SAME in-browser filesystem the read/write/edit/image tools use. " +
-      "Print results; do not rely on return values. Install pure-Python packages with " +
+      "Print results; do not rely on return values. Pass valid CPython—never notebook " +
+      "`!` commands, pip, os.system, or subprocess. Install pure-Python packages with " +
       "`import micropip; await micropip.install('pkg')`.",
     parameters: PythonParams,
     executionMode: "sequential",

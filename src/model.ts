@@ -24,7 +24,7 @@ export function makeModel(cfg: ModelConfig): Model<ApiKind> {
     baseUrl: cfg.baseUrl.replace(/\/+$/, ""),
     reasoning: cfg.info?.reasoning ?? false,
     thinkingLevelMap: cfg.info?.thinkingLevelMap,
-    input: ["text", "image"],
+    input: cfg.info?.input ?? ["text", "image"],
     cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
     contextWindow: cfg.info?.contextWindow ?? 200_000,
     maxTokens: cfg.info?.maxTokens ?? 16_384,

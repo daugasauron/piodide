@@ -39,6 +39,16 @@ import {
   getProvider,
   type ProviderDef,
 } from "./providers.ts";
+import {
+  estimateWebGpuKvCacheBytes,
+  formatContextSize,
+  formatModelBytes,
+  getBrowserModel,
+} from "./browser-models.ts";
+import { getLocalProviderBinding } from "./local-provider.ts";
+import type { LocalModelRuntime, LocalModelStatus } from "./local-model.ts";
+import { browserModelRuntime } from "./browser-model-runtime.ts";
+import { webLLMRuntime } from "./webllm-runtime.ts";
 import { createAllTools, createHtmlTool, createImageTool } from "./tools.ts";
 import type { NeovimController } from "./neovim.ts";
 import {
@@ -61,10 +71,10 @@ import { SlopSession } from "./slop.ts";
 /* system prompt                                                       */
 /* ------------------------------------------------------------------ */
 
-const SYSTEM_PROMPT = `You are pi, a coding assistant running entirely inside the user's web browser. You have no access to the host machine. Your only runtime is one long-lived Pyodide CPython instance backed by an in-memory filesystem at /home/web.
+const REMOTE_SYSTEM_PROMPT = `You are pi, a coding assistant running entirely inside the user's web browser. You have no access to the host machine. Your only runtime is one long-lived Pyodide CPython instance backed by an in-memory filesystem at /home/web.
 
 Tools:
-- python: run focused Python 3 code; stdout/stderr is shown live and returned to you. Install a pure-Python package only when needed with: import micropip; await micropip.install("pkg").
+- python: run focused, valid CPython 3 code; stdout/stderr is shown live and returned to you. Never use notebook ! commands, pip, os.system, or subprocess. Install a pure-Python package only when needed with: import micropip; await micropip.install("pkg").
 - compile_c: compile one bounded C source file to a wasm32-wasi .o object. It supports C11/C17, -O0/-O1/-O2/-O3/-Os, DWARF debug info, warnings/-Werror, -D definitions, and additional /home/web include directories.
 - link_wasi: link one or more .o files into a WASI .wasm executable with wasm-ld and WASI libc. It can export selected symbols and optionally strip the result. The compiler, linker, and sysroot assets are lazily downloaded.
 - run_wasi: run a WASI .wasm file from /home/web with arguments, stdin, and environment variables. The program shares the live Pyodide filesystem (no copying): files it creates, edits, or deletes are immediately visible everywhere. Relative paths start at /home/web, and absolute /home/web paths also work. From Python you can also import wasi and await wasi.run_wasi(path, args=[...], stdin="...").
@@ -110,13 +120,36 @@ once. Keep its CSS and JavaScript inline.
 
 Be concise and pragmatic. Prefer running code over long prose. Use python for math, data, and exploration. Use write/edit to change files, then confirm briefly.`;
 
+const LOCAL_SYSTEM_PROMPT = `You are pi, a tool-using coding assistant running entirely in the user's browser. Work directly on the persistent in-memory filesystem rooted at /home/web. You cannot access host files, native processes, or the host shell.
+
+Working method:
+- Inspect relevant files before editing. Use tools for actions; never claim that you ran or changed something without a successful tool result.
+- Prefer small, focused changes. Verify important work by reading it back or running a bounded check.
+- Call one tool at a time unless independent calls are clearly safe. After a tool error, inspect the error and adjust instead of repeating the same call.
+- Keep answers concise. When the task asks for implementation, finish the implementation rather than only explaining it.
+
+Tools:
+- read, write, and edit operate on text files in /home/web. edit requires an exact unique oldText match.
+- slop runs one small shell-style command with ls, cat, grep, echo, env, and fd-find, plus pipes, redirects, &&, ||, and ;. Each call has a fresh cwd; pass cwd when needed. There is no Bash, subprocess access, or host command execution.
+- python runs focused, valid CPython 3 in the long-lived Pyodide runtime. Never use notebook ! commands, pip, os.system, or subprocess. Pure-Python packages can be installed with micropip when necessary.
+- compile_c compiles one C11/C17 source to a wasm32-wasi object. link_wasi links objects with WASI libc. run_wasi executes the resulting module. The first compile downloads about 52 MB; avoid speculative builds.
+- git manages the browser-local Dulwich repository. GitHub network operations require credentials registered separately by the user.
+- fetch is browser fetch and is CORS-limited. download exports a file only when the user asks. image displays an image exactly once. html opens one self-contained HTML file.
+
+Constraints:
+- Pyodide objects and /home/web files consume a wasm32 heap with a hard ceiling near 4 GB. Avoid unbounded work, large copies, and speculative package installs.
+- The user must run /upload to import host files. Never ask for secrets in chat or write tokens into files, commands, or URLs.
+- Files written by any tool are immediately visible to every other tool.
+
+Choose the narrowest useful tool, inspect before changing, and verify after changing.`;
+
 const BANNER = [
   "\x1b[35m❯\x1b[0m \x1b[1mpiodide\x1b[0m — pi in the browser",
   "\x1b[2mghostty-web · pyodide · pi-agent-core\x1b[0m",
   "",
   "\x1b[2mCommands:\x1b[0m  /provider   /model   /github   /new   /tree   /thinking   /nvim   /help",
   "\x1b[2mEditor:\x1b[0m    Ctrl+Shift+E toggles agent ↔ Neovim · Ctrl+Shift+S toggles slop shell",
-  "\x1b[2mStart with:\x1b[0m /provider  →  choose one  →  /login  →  then just type.",
+  "\x1b[2mStart with:\x1b[0m /provider  →  choose one  →  /login when required  →  type.",
   "",
 ].join("\r\n");
 
@@ -274,6 +307,16 @@ function currentApiKey() {
   return provider ? (apiKeys.get(provider.name) ?? "") : "";
 }
 
+function currentLocalProvider() {
+  return getLocalProviderBinding(provider);
+}
+
+function currentSystemPrompt() {
+  return provider?.transport === "browser"
+    ? LOCAL_SYSTEM_PROMPT
+    : REMOTE_SYSTEM_PROMPT;
+}
+
 function consumeTemporaryCodexProxyToken(): string {
   const url = new URL(location.href);
   const fragment = new URLSearchParams(url.hash.slice(1));
@@ -309,6 +352,8 @@ function currentMessages(): AgentMessage[] {
 function renderFooter() {
   const model = currentModelId() || "no model";
   const thinking = agent?.state.thinkingLevel ?? "off";
+  const localProvider = currentLocalProvider();
+  const browserStatus = localProvider?.runtime.status ?? { phase: "idle" };
   const usage = sessionUsage();
   const contextWindow = agent?.state.model.contextWindow || 200_000;
   const contextTokens = currentContextTokens();
@@ -316,18 +361,30 @@ function renderFooter() {
   const cacheTotal = usage.input + usage.cacheRead;
   const cacheHit = cacheTotal > 0 ? `${((usage.cacheRead / cacheTotal) * 100).toFixed(1)}%` : "—";
 
-  footerLocationEl.textContent =
+  const location =
     activeView === "nvim"
       ? "/home/web (nvim)"
       : activeView === "slop"
         ? "/home/web (slop)"
         : "/home/web";
+  const browserProgress =
+    provider?.transport === "browser" &&
+    (browserStatus.phase === "downloading" || browserStatus.phase === "loading")
+      ? ` · model ${formatBrowserStatus(browserStatus)}`
+      : "";
+  footerLocationEl.textContent = location + browserProgress;
   footerUsageEl.textContent =
     `↑${formatTokenCount(usage.input)} ↓${formatTokenCount(usage.output)} ` +
     `R${formatTokenCount(usage.reasoning)} CH${cacheHit} ` +
     `${contextPercent.toFixed(1)}%/${formatTokenCount(contextWindow)}`;
+  const backend =
+    provider?.transport === "browser" &&
+    browserStatus.modelId === model &&
+    browserStatus.backend
+      ? ` • ${browserStatus.backend}`
+      : "";
   footerModelEl.textContent =
-    `(${provider?.name ?? "no provider"}) ${model} • ${thinking}`;
+    `(${provider?.name ?? "no provider"}) ${model} • ${thinking}${backend}`;
 }
 
 function sessionUsage() {
@@ -357,7 +414,7 @@ function currentContextTokens(): number {
     if (tokens > 0) return tokens;
   }
   const chars =
-    SYSTEM_PROMPT.length +
+    (agent?.state.systemPrompt ?? currentSystemPrompt()).length +
     messages.reduce((sum, message) => sum + safeStringify(message).length, 0);
   return Math.ceil(chars / 4);
 }
@@ -391,17 +448,56 @@ function formatTokenCount(value: number): string {
   return Math.round(value).toString();
 }
 
+function formatBrowserStatus(status: LocalModelStatus): string {
+  if (
+    status.phase === "downloading" &&
+    status.loadedBytes !== undefined &&
+    status.totalBytes
+  ) {
+    return `${Math.min(100, Math.round((status.loadedBytes / status.totalBytes) * 100))}%`;
+  }
+  return status.phase;
+}
+
+function onBrowserModelStatus(runtime: LocalModelRuntime, status: LocalModelStatus) {
+  if (currentLocalProvider()?.runtime !== runtime) {
+    renderFooter();
+    return;
+  }
+  if (
+    agent?.state.isStreaming &&
+    (status.phase === "preparing" ||
+      status.phase === "downloading" ||
+      status.phase === "loading")
+  ) {
+    spinner.start(`local model · ${formatBrowserStatus(status)}`);
+  } else if (agent?.state.isStreaming && status.phase === "generating") {
+    spinner.start("thinking locally");
+  }
+  renderFooter();
+}
+
 function applyConfigToAgent() {
   if (agent && provider) {
+    const modelId = currentModelId();
+    const loadedInfo = getLoadedModelInfo(provider.name, modelId);
+    const info =
+      provider.api === "browser-wllama" && loadedInfo
+        ? {
+            ...loadedInfo,
+            contextWindow: browserModelRuntime.contextSize(modelId),
+          }
+        : loadedInfo;
     const model = makeModel({
       baseUrl: provider.baseUrl,
-      modelId: currentModelId(),
+      modelId,
       api: provider.api,
       provider: provider.name,
       extraBody: provider.extraBody,
-      info: getLoadedModelInfo(provider.name, currentModelId()),
+      info,
     });
     agent.state.model = model;
+    agent.state.systemPrompt = currentSystemPrompt();
     agent.state.thinkingLevel = clampThinkingLevel(
       model,
       agent.state.thinkingLevel,
@@ -685,10 +781,27 @@ async function handleSubmit(text: string) {
     prompt.start();
     return;
   }
-  if (!currentApiKey()) {
+  if (provider.auth !== "none" && !currentApiKey()) {
     say(yellow(`  not logged in. run: /login   (to use ${provider.label})`));
     prompt.start();
     return;
+  }
+
+  if (provider.transport === "browser") {
+    try {
+      if (!(await confirmBrowserModelDownload())) {
+        prompt.start();
+        return;
+      }
+    } catch (error) {
+      say(
+        red(
+          `  local model unavailable: ${error instanceof Error ? error.message : String(error)}`,
+        ),
+      );
+      prompt.start();
+      return;
+    }
   }
 
   prompt.setBusy(true);
@@ -702,22 +815,133 @@ async function handleSubmit(text: string) {
   // agent_end restarts the prompt in the normal case.
 }
 
-function activateProvider(next: ProviderDef) {
+async function confirmBrowserModelDownload(): Promise<boolean> {
+  const localProvider = currentLocalProvider();
+  if (!localProvider) throw new Error("No local browser provider is active.");
+  const model = localProvider.getModel(currentModelId());
+  if (!model) throw new Error(`Unknown browser model: ${currentModelId()}`);
+  if (await localProvider.runtime.isCached(model.id)) return true;
+
+  const headroom = await localProvider.runtime.storageHeadroom();
+  const storage =
+    headroom === undefined
+      ? ""
+      : ` · ${formatModelBytes(headroom)} browser storage available`;
+  const answer = await prompt.ask(
+    `  Download ${model.label} ${model.quantization} (${formatModelBytes(model.bytes)})?${storage} [y/N] `,
+  );
+  if (!/^(y|yes)$/i.test(answer.trim())) {
+    say(yellow("  local model download cancelled"));
+    return false;
+  }
+  const persistent = await localProvider.runtime.requestPersistentStorage().catch(() => undefined);
+  if (persistent === false) {
+    say(dim("  browser storage is not persistent; the cached model may be evicted"));
+  }
+  return true;
+}
+
+async function activateProvider(next: ProviderDef) {
+  const previousProvider = provider;
+  const previousModel = currentModelId();
+  const previousLocal = getLocalProviderBinding(previousProvider);
+  const nextLocal = getLocalProviderBinding(next);
+  if (
+    previousLocal &&
+    (previousLocal.runtime !== nextLocal?.runtime || previousModel !== next.defaultModel)
+  ) {
+    await previousLocal.runtime.unload();
+  }
   provider = next;
   modelOverride = null;
+  await next.loadModels();
   applyConfigToAgent();
   say(cyan(`  ◇ provider: ${next.label}   model: ${currentModelId()}`));
   if (next.note) say(dim(`    ${next.note}`));
-  if (!currentApiKey()) say(yellow("  now run /login to set your API key"));
-  void next.loadModels().then(() => {
-    if (provider === next) applyConfigToAgent();
+  if (next.auth === "none") {
+    say(green("  ◆ no login required · use /model to inspect local downloads"));
+  } else if (!currentApiKey()) {
+    say(yellow("  now run /login to set your API key"));
+  }
+}
+
+async function activateModel(modelId: string, contextSize?: number) {
+  const localProvider = currentLocalProvider();
+  if (localProvider && !localProvider.getModel(modelId)) {
+    throw new Error(`Unknown browser model: ${modelId}`);
+  }
+  if (
+    localProvider &&
+    modelId !== currentModelId()
+  ) {
+    await localProvider.runtime.unload();
+  }
+  if (provider?.api === "browser-wllama" && contextSize !== undefined) {
+    await browserModelRuntime.setContextSize(modelId, contextSize);
+  }
+  modelOverride = modelId === provider?.defaultModel ? null : modelId;
+  applyConfigToAgent();
+  const context =
+    provider?.api === "browser-wllama"
+      ? `   context: ${formatContextSize(browserModelRuntime.contextSize(modelId))}`
+      : "";
+  say(cyan(`  ◇ model: ${modelId}${context}`));
+}
+
+async function selectBrowserContextSize(modelId: string): Promise<number | null> {
+  const model = getBrowserModel(modelId);
+  if (!model) throw new Error(`Unknown Wllama model: ${modelId}`);
+  return prompt.select({
+    title: `Select context / KV cache · ${model.label}`,
+    active: browserModelRuntime.contextSize(modelId),
+    options: model.contextOptions.map((contextSize) => {
+      const estimate = estimateWebGpuKvCacheBytes(model, contextSize);
+      const sizeHint =
+        contextSize === model.load.contextSize
+          ? "recommended · default"
+          : contextSize < model.load.contextSize
+            ? "lower memory"
+            : "larger working context";
+      return {
+        value: contextSize,
+        label: `${formatContextSize(contextSize)} context`,
+        description: [
+          sizeHint,
+          estimate === undefined
+            ? ""
+            : `~${formatModelBytes(estimate)} WebGPU KV cache`,
+        ]
+          .filter(Boolean)
+          .join(" · "),
+      };
+    }),
   });
 }
 
-function activateModel(modelId: string) {
-  modelOverride = modelId === provider?.defaultModel ? null : modelId;
-  applyConfigToAgent();
-  say(cyan(`  ◇ model: ${modelId}`));
+async function showBrowserModels(): Promise<void> {
+  const localProvider = currentLocalProvider();
+  if (!localProvider) throw new Error("No local browser provider is active.");
+  const cached = await localProvider.runtime.cachedModelIds();
+  const status = localProvider.runtime.status;
+  say(
+    `  runtime: ${formatBrowserStatus(status)}` +
+      `${status.backend ? ` · ${status.backend}` : ""}` +
+      `${status.contextSize ? ` · ${formatContextSize(status.contextSize)} context` : ""}`,
+  );
+  for (const model of localProvider.models) {
+    const active = model.id === currentModelId() ? cyan("active") : "";
+    const details = localProvider.describeModel(model, cached.has(model.id));
+    const context =
+      provider?.api === "browser-wllama"
+        ? `${formatContextSize(browserModelRuntime.contextSize(model.id))} selected context`
+        : "";
+    say(`  ${model.label.padEnd(24)} ${model.id}`);
+    say(
+      dim(
+        `    ${[active, details, context, model.license].filter(Boolean).join(" · ")}`,
+      ),
+    );
+  }
 }
 
 /* ------------------------------------------------------------------ */
@@ -823,6 +1047,13 @@ async function runInteractive(argline: string) {
 /* ------------------------------------------------------------------ */
 
 function showStatus() {
+  const browserStatus = currentLocalProvider()?.runtime.status ?? { phase: "idle" };
+  const authStatus =
+    provider?.auth === "none"
+      ? green("not required")
+      : currentApiKey()
+        ? green("set")
+        : dim("(none — /login)");
   const lines = [
     `  python : ${pyReady ? green("ready") : yellow("loading…")}`,
     `  heap   : ${pyReady ? currentHeapUsage() : dim("unavailable")}`,
@@ -834,7 +1065,18 @@ function showStatus() {
     }`,
     `  model  : ${currentModelId() || dim("(none)")}`,
     `  thinking: ${agent?.state.thinkingLevel ?? "off"}`,
-    `  ${provider?.temporaryLocalCodexProxy ? "proxy  " : "key    "}: ${currentApiKey() ? green("set") : dim("(none — /login)")}`,
+    ...(provider?.transport === "browser"
+      ? [
+          `  runtime: ${formatBrowserStatus(browserStatus)}${
+            browserStatus.backend ? ` · ${browserStatus.backend}` : ""
+          }${browserStatus.threads ? ` · ${browserStatus.threads} threads` : ""}${
+            browserStatus.contextSize
+              ? ` · ${formatContextSize(browserStatus.contextSize)} context`
+              : ""
+          }`,
+        ]
+      : []),
+    `  ${provider?.temporaryLocalCodexProxy ? "proxy  " : "auth   "}: ${authStatus}`,
     `  github : ${
       gitHubCredentials
         ? `${green("connected")} · ${gitHubCredentials.login}@${gitHubCredentials.apiBaseUrl}`
@@ -960,6 +1202,7 @@ async function runSlash(input: string) {
   switch (cmd) {
     case "help":
       say(dim("  /provider  /model  /login  /logout       provider configuration"));
+      say(dim("  /model status|unload|remove|clear-cache   local model storage"));
       say(dim("  /github [api-url|status|logout]           session-only GitHub access"));
       say(dim("  /new  /tree  /resume  /fork  /clone     page-local sessions"));
       say(dim("  /name  /session  /copy  /export          session utilities"));
@@ -982,35 +1225,92 @@ async function runSlash(input: string) {
             description: candidate.note,
           })),
         });
-        if (name) activateProvider(PROVIDERS[name]);
+        if (name) await activateProvider(PROVIDERS[name]);
       } else {
         const next = getProvider(arg);
         if (!next) {
           say(red(`  unknown provider: ${arg}`));
         } else {
-          activateProvider(next);
+          await activateProvider(next);
         }
       }
       break;
     }
 
     case "model": {
+      const localProvider = currentLocalProvider();
       if (!provider) {
         say(yellow("  pick a provider first: /provider"));
+      } else if (provider.transport === "browser" && arg.toLowerCase() === "status") {
+        await showBrowserModels();
+      } else if (provider.transport === "browser" && arg.toLowerCase() === "unload") {
+        await localProvider!.runtime.unload();
+        say(green("  ◆ local model unloaded; its browser cache was kept"));
+      } else if (provider.transport === "browser" && arg.toLowerCase() === "clear-cache") {
+        const answer = await prompt.ask(
+          "  Unload local inference and remove every downloaded model? [y/N] ",
+        );
+        if (/^(y|yes)$/i.test(answer.trim())) {
+          await localProvider!.runtime.clearCache();
+          say(green("  ◆ local model cache cleared"));
+        } else {
+          say(yellow("  cache removal cancelled"));
+        }
+      } else if (
+        provider.transport === "browser" &&
+        /^remove(?:\s|$)/i.test(arg)
+      ) {
+        const modelId = arg.replace(/^remove\s*/i, "") || currentModelId();
+        const descriptor = localProvider!.getModel(modelId);
+        if (!descriptor) {
+          say(red(`  unknown browser model: ${modelId}`));
+          break;
+        }
+        const answer = await prompt.ask(
+          `  Remove cached ${descriptor.label} (${formatModelBytes(descriptor.bytes)})? [y/N] `,
+        );
+        if (/^(y|yes)$/i.test(answer.trim())) {
+          await localProvider!.runtime.removeCached(modelId);
+          say(green(`  ◆ removed cached ${descriptor.label}`));
+        } else {
+          say(yellow("  cache removal cancelled"));
+        }
       } else if (!arg) {
         const models = await provider.loadModels();
+        const cached =
+          provider.transport === "browser"
+            ? await localProvider!.runtime.cachedModelIds()
+            : new Set<string>();
         const modelId = await prompt.select({
           title: `Select model · ${provider.label}`,
           active: currentModelId(),
-          options: models.map((id) => ({
-            value: id,
-            label: id,
-            description: id === provider!.defaultModel ? "default" : undefined,
-          })),
+          options: models.map((id) => {
+            const local = localProvider?.getModel(id);
+            return {
+              value: id,
+              label: local?.label ?? id,
+              description: local
+                ? [
+                    id === provider!.defaultModel ? "default" : "",
+                    localProvider!.describeModel(local, cached.has(id)),
+                  ]
+                    .filter(Boolean)
+                    .join(" · ")
+                : id === provider!.defaultModel
+                  ? "default"
+                  : undefined,
+            };
+          }),
         });
-        if (modelId) activateModel(modelId);
+        if (modelId) {
+          const contextSize =
+            provider.api === "browser-wllama"
+              ? await selectBrowserContextSize(modelId)
+              : undefined;
+          if (contextSize !== null) await activateModel(modelId, contextSize);
+        }
       } else {
-        activateModel(arg);
+        await activateModel(arg);
       }
       break;
     }
@@ -1018,6 +1318,10 @@ async function runSlash(input: string) {
     case "login": {
       if (!provider) {
         say(yellow("  pick a provider first: /provider <name>"));
+        break;
+      }
+      if (provider.auth === "none") {
+        say(green(`  ◆ ${provider.label} runs locally and needs no login`));
         break;
       }
       if (provider.temporaryLocalCodexProxy) {
@@ -1048,6 +1352,8 @@ async function runSlash(input: string) {
     case "logout":
       if (!provider) {
         say(yellow("  no provider selected"));
+      } else if (provider.auth === "none") {
+        say(green(`  ◆ ${provider.label} stores no login credentials`));
       } else if (provider.temporaryLocalCodexProxy) {
         const token = currentApiKey();
         apiKeys.delete(provider.name);
@@ -1701,6 +2007,12 @@ async function main() {
   writer = handle.writer;
   markdown = new AssistantMarkdown(writer);
   spinner = new Spinner(writer);
+  browserModelRuntime.subscribe((status) =>
+    onBrowserModelStatus(browserModelRuntime, status),
+  );
+  webLLMRuntime.subscribe((status) =>
+    onBrowserModelStatus(webLLMRuntime, status),
+  );
   const term = handle.term;
 
   mount.addEventListener("click", () => term.focus());
@@ -1730,7 +2042,7 @@ async function main() {
       installWasiPythonModule(p, makeJsRunner(p));
       agent = new Agent({
         initialState: {
-          systemPrompt: SYSTEM_PROMPT,
+          systemPrompt: REMOTE_SYSTEM_PROMPT,
           model: makeModel({ baseUrl: "", modelId: "", api: "openai-completions", provider: "none" }),
           thinkingLevel: "off",
           tools: createAllTools(p, () => gitHubCredentials),
@@ -1795,6 +2107,8 @@ async function main() {
           get slopTerminal() {
             return slopHandle;
           },
+          browserModelRuntime,
+          webLLMRuntime,
           get view() {
             return activeView;
           },

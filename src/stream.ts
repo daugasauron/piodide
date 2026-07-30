@@ -8,7 +8,9 @@ import { openAIResponsesApi } from "@earendil-works/pi-ai/api/openai-responses.l
 import type { StreamFn } from "@earendil-works/pi-agent-core";
 
 import { streamAnthropic } from "./anthropic-stream.ts";
+import { streamBrowserModel } from "./browser-model-stream.ts";
 import { streamOpenAI } from "./openai-stream.ts";
+import { streamWebLLMModel } from "./webllm-model-stream.ts";
 
 // TEMPORARY: this API targets the opt-in loopback Codex proxy. Force SSE so
 // the proxy can remain a tiny HTTP relay instead of implementing WebSockets.
@@ -63,6 +65,12 @@ function recoverMissingResponsesTerminal(
 }
 
 export const streamDispatch: StreamFn = (model, context, options) => {
+  if (model.api === "browser-webllm") {
+    return streamWebLLMModel(model, context, options);
+  }
+  if (model.api === "browser-wllama") {
+    return streamBrowserModel(model, context, options);
+  }
   if (model.api === "anthropic-messages") {
     return streamAnthropic(model, context, options);
   }

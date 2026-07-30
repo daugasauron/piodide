@@ -4,17 +4,27 @@
  * enough to make `/provider <name>` work.
  */
 import type { Model } from "@earendil-works/pi-ai";
+import { BROWSER_MODELS } from "./browser-models.ts";
+import type { LocalModelDef } from "./local-model.ts";
+import { WEBLLM_MODELS } from "./webllm-models.ts";
 
 export type ApiKind =
   | "openai-completions"
   | "openai-responses"
   | "openai-codex-responses"
-  | "anthropic-messages";
+  | "anthropic-messages"
+  | "browser-webllm"
+  | "browser-wllama";
+
+export type ProviderAuth = "api-key" | "none" | "temporary-proxy";
+export type ProviderTransport = "http" | "browser";
 
 export interface ProviderDef {
   name: string;
   label: string;
   api: ApiKind;
+  transport: ProviderTransport;
+  auth: ProviderAuth;
   /** Base URL. OpenAI-style URLs include `/v1`; Anthropic's does not. */
   baseUrl: string;
   defaultModel: string;
@@ -29,10 +39,34 @@ export interface ProviderDef {
 }
 
 export const PROVIDERS: Record<string, ProviderDef> = {
+  webllm: {
+    name: "webllm",
+    label: "Browser WebGPU (WebLLM)",
+    api: "browser-webllm",
+    transport: "browser",
+    auth: "none",
+    baseUrl: "browser://webllm",
+    defaultModel: WEBLLM_MODELS[0].id,
+    loadModels: localModelCatalogue("webllm", "browser-webllm", WEBLLM_MODELS),
+    note: "GPU-only MLC models · private Web Worker inference · 1.69 GiB+ download",
+  },
+  wllama: {
+    name: "wllama",
+    label: "Browser GGUF (Wllama)",
+    api: "browser-wllama",
+    transport: "browser",
+    auth: "none",
+    baseUrl: "browser://wllama",
+    defaultModel: BROWSER_MODELS[0].id,
+    loadModels: localModelCatalogue("wllama", "browser-wllama", BROWSER_MODELS),
+    note: "GGUF via WebGPU or WebAssembly · private in-tab inference · 508 MiB+ download",
+  },
   anthropic: {
     name: "anthropic",
     label: "Anthropic",
     api: "anthropic-messages",
+    transport: "http",
+    auth: "api-key",
     baseUrl: "https://api.anthropic.com",
     defaultModel: "claude-sonnet-4-5",
     loadModels: modelCatalogue("anthropic", "claude-sonnet-4-5", () =>
@@ -46,6 +80,8 @@ export const PROVIDERS: Record<string, ProviderDef> = {
     name: "openai",
     label: "OpenAI",
     api: "openai-completions",
+    transport: "http",
+    auth: "api-key",
     baseUrl: "https://api.openai.com/v1",
     defaultModel: "gpt-4.1-mini",
     loadModels: modelCatalogue("openai", "gpt-4.1-mini", () =>
@@ -56,6 +92,8 @@ export const PROVIDERS: Record<string, ProviderDef> = {
     name: "openrouter",
     label: "OpenRouter",
     api: "openai-completions",
+    transport: "http",
+    auth: "api-key",
     baseUrl: "https://openrouter.ai/api/v1",
     defaultModel: "anthropic/claude-sonnet-4.5",
     loadModels: modelCatalogue("openrouter", "anthropic/claude-sonnet-4.5", () =>
@@ -69,6 +107,8 @@ export const PROVIDERS: Record<string, ProviderDef> = {
     name: "groq",
     label: "Groq",
     api: "openai-completions",
+    transport: "http",
+    auth: "api-key",
     baseUrl: "https://api.groq.com/openai/v1",
     defaultModel: "llama-3.3-70b-versatile",
     loadModels: modelCatalogue("groq", "llama-3.3-70b-versatile", () =>
@@ -79,6 +119,8 @@ export const PROVIDERS: Record<string, ProviderDef> = {
     name: "together",
     label: "Together",
     api: "openai-completions",
+    transport: "http",
+    auth: "api-key",
     baseUrl: "https://api.together.xyz/v1",
     defaultModel: "meta-llama/Llama-3.3-70B-Instruct-Turbo",
     loadModels: modelCatalogue("together", "meta-llama/Llama-3.3-70B-Instruct-Turbo", () =>
@@ -91,6 +133,8 @@ export const PROVIDERS: Record<string, ProviderDef> = {
     name: "deepseek",
     label: "DeepSeek",
     api: "openai-completions",
+    transport: "http",
+    auth: "api-key",
     baseUrl: "https://api.deepseek.com",
     defaultModel: "deepseek-chat",
     loadModels: modelCatalogue("deepseek", "deepseek-chat", () =>
@@ -103,6 +147,8 @@ export const PROVIDERS: Record<string, ProviderDef> = {
     name: "mistral",
     label: "Mistral",
     api: "openai-completions",
+    transport: "http",
+    auth: "api-key",
     baseUrl: "https://api.mistral.ai/v1",
     defaultModel: "mistral-small-latest",
     loadModels: modelCatalogue("mistral", "mistral-small-latest", () =>
@@ -115,6 +161,8 @@ export const PROVIDERS: Record<string, ProviderDef> = {
     name: "moonshot",
     label: "Moonshot (Kimi)",
     api: "openai-completions",
+    transport: "http",
+    auth: "api-key",
     // International endpoint. A key created on platform.moonshot.ai is
     // rejected with HTTP 401 by the China endpoint (api.moonshot.cn), and the
     // .cn model IDs (e.g. kimi-k2-0905-preview) are not permissioned on .ai.
@@ -131,6 +179,8 @@ export const PROVIDERS: Record<string, ProviderDef> = {
     name: "zhipu",
     label: "智谱 GLM (通用)",
     api: "openai-completions",
+    transport: "http",
+    auth: "api-key",
     baseUrl: "https://open.bigmodel.cn/api/paas/v4",
     defaultModel: "glm-5.2",
     loadModels: modelCatalogue("zhipu", "glm-5.2", () =>
@@ -142,6 +192,8 @@ export const PROVIDERS: Record<string, ProviderDef> = {
     name: "zhipu-coding",
     label: "智谱 GLM (Coding 套餐)",
     api: "openai-completions",
+    transport: "http",
+    auth: "api-key",
     baseUrl: "https://open.bigmodel.cn/api/coding/paas/v4",
     defaultModel: "glm-5.2",
     loadModels: modelCatalogue("zhipu-coding", "glm-5.2", () =>
@@ -155,6 +207,8 @@ export const PROVIDERS: Record<string, ProviderDef> = {
     name: "codex-local",
     label: "OpenAI Codex subscription (temporary local proxy)",
     api: "openai-codex-responses",
+    transport: "http",
+    auth: "temporary-proxy",
     baseUrl: "http://127.0.0.1:1456",
     defaultModel: "gpt-5.6-sol",
     loadModels: modelCatalogue("codex-local", "gpt-5.6-sol", () =>
@@ -167,8 +221,10 @@ export const PROVIDERS: Record<string, ProviderDef> = {
   },
   local: {
     name: "local",
-    label: "Local",
+    label: "Local server",
     api: "openai-completions",
+    transport: "http",
+    auth: "api-key",
     baseUrl: "http://localhost:8080/v1",
     defaultModel: "local-model",
     loadModels: async () => ["local-model"],
@@ -189,6 +245,12 @@ const ALIASES: Record<string, ProviderDef> = {
   zhipuai: PROVIDERS.zhipu,
   bigmodel: PROVIDERS.zhipu,
   moonshotai: PROVIDERS.moonshot,
+  browser: PROVIDERS.wllama,
+  wasm: PROVIDERS.wllama,
+  "browser-local": PROVIDERS.wllama,
+  "browser-gguf": PROVIDERS.wllama,
+  mlc: PROVIDERS.webllm,
+  webgpu: PROVIDERS.webllm,
 };
 
 export interface ProviderModelInfo {
@@ -196,6 +258,7 @@ export interface ProviderModelInfo {
   contextWindow: number;
   maxTokens: number;
   reasoning: boolean;
+  input?: Model<ApiKind>["input"];
   thinkingLevelMap?: Model<ApiKind>["thinkingLevelMap"];
   compat?: Model<ApiKind>["compat"];
 }
@@ -221,12 +284,43 @@ function modelIds(providerName: string, defaultModel: string, catalogue: object)
         contextWindow: model.contextWindow,
         maxTokens: model.maxTokens,
         reasoning: model.reasoning === true,
+        input: (model as Partial<Model<ApiKind>>).input,
         thinkingLevelMap: (model as Partial<Model<ApiKind>>).thinkingLevelMap,
         compat: (model as Partial<Model<ApiKind>>).compat,
       });
     }
   }
   return [defaultModel, ...Object.keys(catalogue).filter((id) => id !== defaultModel)];
+}
+
+function localModelCatalogue(
+  providerName: string,
+  api: Extract<ApiKind, "browser-webllm" | "browser-wllama">,
+  models: readonly LocalModelDef[],
+): () => Promise<readonly string[]> {
+  return async () => {
+    for (const model of models) {
+      MODEL_INFO.set(`${providerName}\0${model.id}`, {
+        api,
+        contextWindow: model.contextWindow,
+        maxTokens: model.maxTokens,
+        reasoning: model.thinking === true,
+        thinkingLevelMap:
+          model.thinking === true
+            ? {
+                minimal: null,
+                low: null,
+                medium: null,
+                high: "enabled",
+                xhigh: null,
+                max: null,
+              }
+            : undefined,
+        input: ["text"],
+      });
+    }
+    return models.map((model) => model.id);
+  };
 }
 
 function modelCatalogue(

@@ -27,7 +27,7 @@ type ContentBlock =
   | { kind: "thinking"; text: string }
   | { kind: "tool"; idx: number; id: string; name: string; args: string };
 
-interface OaiChoiceDelta {
+export interface OaiChoiceDelta {
   role?: string;
   content?: string | null;
   reasoning_content?: string | null;
@@ -40,7 +40,7 @@ interface OaiChoiceDelta {
     function?: { name?: string; arguments?: string };
   }> | null;
 }
-interface OaiChunk {
+export interface OaiChunk {
   choices?: Array<{ delta?: OaiChoiceDelta; finish_reason?: string | null }>;
   usage?: {
     prompt_tokens?: number;
@@ -122,6 +122,170 @@ export class EventQueue {
   }
 }
 
+/** Converts OpenAI-shaped streaming chunks into the pi-ai event protocol. */
+export class OpenAIEventAdapter {
+  private readonly model: Model<Api>;
+  private readonly stream: EventQueue;
+  private readonly blocks: ContentBlock[] = [];
+  private readonly toolPosByIndex = new Map<number, number>();
+  private textStarted = false;
+  private textPos = -1;
+  private reasoningStarted = false;
+  private reasoningPos = -1;
+  private usage: Usage = zeroUsage();
+  private stopReason: AssistantMessage["stopReason"] = "stop";
+  private finished = false;
+
+  constructor(model: Model<Api>, stream: EventQueue) {
+    this.model = model;
+    this.stream = stream;
+    stream.push({
+      type: "start",
+      partial: snapshot(model, this.blocks, this.usage, this.stopReason),
+    });
+  }
+
+  accept(chunk: OaiChunk): void {
+    if (this.finished) return;
+    if (chunk.usage) this.usage = mapUsage(chunk.usage);
+
+    const choice = chunk.choices?.[0];
+    if (!choice) return;
+    const delta = choice.delta ?? {};
+    const reasoningDelta = [
+      delta.reasoning_content,
+      delta.reasoning,
+      delta.reasoning_text,
+    ].find((value): value is string => typeof value === "string" && value.length > 0);
+
+    if (reasoningDelta) {
+      if (!this.reasoningStarted) {
+        this.reasoningStarted = true;
+        this.reasoningPos = this.blocks.push({ kind: "thinking", text: "" }) - 1;
+        this.stream.push({
+          type: "thinking_start",
+          contentIndex: this.reasoningPos,
+          partial: this.snapshot(),
+        });
+      }
+      (this.blocks[this.reasoningPos] as { text: string }).text += reasoningDelta;
+      this.stream.push({
+        type: "thinking_delta",
+        contentIndex: this.reasoningPos,
+        delta: reasoningDelta,
+        partial: this.snapshot(),
+      });
+    }
+
+    if (typeof delta.content === "string" && delta.content.length > 0) {
+      if (!this.textStarted) {
+        this.textStarted = true;
+        this.textPos = this.blocks.push({ kind: "text", text: "" }) - 1;
+        this.stream.push({
+          type: "text_start",
+          contentIndex: this.textPos,
+          partial: this.snapshot(),
+        });
+      }
+      (this.blocks[this.textPos] as { text: string }).text += delta.content;
+      this.stream.push({
+        type: "text_delta",
+        contentIndex: this.textPos,
+        delta: delta.content,
+        partial: this.snapshot(),
+      });
+    }
+
+    for (const toolCall of delta.tool_calls ?? []) {
+      let position = this.toolPosByIndex.get(toolCall.index);
+      if (position === undefined) {
+        position =
+          this.blocks.push({
+            kind: "tool",
+            idx: toolCall.index,
+            id: toolCall.id ?? "",
+            name: toolCall.function?.name ?? "",
+            args: "",
+          }) - 1;
+        this.toolPosByIndex.set(toolCall.index, position);
+        this.stream.push({
+          type: "toolcall_start",
+          contentIndex: position,
+          partial: this.snapshot(),
+        });
+      }
+      const block = this.blocks[position] as Extract<ContentBlock, { kind: "tool" }>;
+      if (toolCall.id) block.id = toolCall.id;
+      if (toolCall.function?.name) block.name = toolCall.function.name;
+      const fragment = toolCall.function?.arguments ?? "";
+      if (fragment) {
+        block.args += fragment;
+        this.stream.push({
+          type: "toolcall_delta",
+          contentIndex: position,
+          delta: fragment,
+          partial: this.snapshot(),
+        });
+      }
+    }
+
+    if (choice.finish_reason) {
+      this.stopReason = mapStopReason(choice.finish_reason);
+    }
+  }
+
+  finish(): void {
+    if (this.finished) return;
+    this.finished = true;
+    // Some local OpenAI-compatible runtimes (notably Wllama 3.5.1) emit
+    // structured tool-call deltas but finish with `stop`. The structured call
+    // is authoritative; the agent must execute it instead of treating this as
+    // a final text response.
+    if (this.toolPosByIndex.size > 0) this.stopReason = "toolUse";
+
+    if (this.reasoningStarted) {
+      this.stream.push({
+        type: "thinking_end",
+        contentIndex: this.reasoningPos,
+        content: (this.blocks[this.reasoningPos] as { text: string }).text,
+        partial: this.snapshot(),
+      });
+    }
+    if (this.textStarted) {
+      this.stream.push({
+        type: "text_end",
+        contentIndex: this.textPos,
+        content: (this.blocks[this.textPos] as { text: string }).text,
+        partial: this.snapshot(),
+      });
+    }
+    for (const [, position] of [...this.toolPosByIndex.entries()].sort((a, b) => a[0] - b[0])) {
+      const block = this.blocks[position] as Extract<ContentBlock, { kind: "tool" }>;
+      const toolCall: ToolCall = {
+        type: "toolCall",
+        id: block.id || `call_${position}`,
+        name: block.name,
+        arguments: tryParseJson(block.args),
+      };
+      this.stream.push({
+        type: "toolcall_end",
+        contentIndex: position,
+        toolCall,
+        partial: this.snapshot(),
+      });
+    }
+    this.stream.push({
+      type: "done",
+      reason: mapDoneReason(this.stopReason),
+      message: this.snapshot(),
+    });
+  }
+
+  private snapshot(): AssistantMessage {
+    return snapshot(this.model, this.blocks, this.usage, this.stopReason);
+  }
+}
+
 async function run(
   model: Model<Api>,
   context: Context,
@@ -163,58 +327,10 @@ async function run(
     return;
   }
 
-  // Emit the initial empty assistant message, then drive the event protocol
-  // from the SSE stream.
-  const blocks: ContentBlock[] = [];
-  const toolPosByIndex = new Map<number, number>();
-  let textStarted = false;
-  let textPos = -1;
-  let reasoningStarted = false;
-  let reasoningPos = -1;
-  let usage: Usage = zeroUsage();
-  let stopReason: AssistantMessage["stopReason"] = "stop";
-
-  stream.push({ type: "start", partial: snapshot(model, blocks, usage, stopReason) });
-
+  const events = new OpenAIEventAdapter(model, stream);
   const reader = resp.body.getReader();
   const decoder = new TextDecoder();
   let buffer = "";
-
-  const finish = (reason: AssistantMessage["stopReason"]) => {
-    stopReason = reason;
-    if (reasoningStarted) {
-      stream.push({
-        type: "thinking_end",
-        contentIndex: reasoningPos,
-        content: (blocks[reasoningPos] as { text: string }).text,
-        partial: snapshot(model, blocks, usage, stopReason),
-      });
-    }
-    if (textStarted) {
-      stream.push({
-        type: "text_end",
-        contentIndex: textPos,
-        content: (blocks[textPos] as { text: string }).text,
-        partial: snapshot(model, blocks, usage, stopReason),
-      });
-    }
-    for (const [, pos] of [...toolPosByIndex.entries()].sort((a, b) => a[0] - b[0])) {
-      const b = blocks[pos] as Extract<ContentBlock, { kind: "tool" }>;
-      const toolCall: ToolCall = {
-        type: "toolCall",
-        id: b.id || `call_${pos}`,
-        name: b.name,
-        arguments: tryParseJson(b.args),
-      };
-      stream.push({
-        type: "toolcall_end",
-        contentIndex: pos,
-        toolCall,
-        partial: snapshot(model, blocks, usage, stopReason),
-      });
-    }
-    stream.push({ type: "done", reason: mapDoneReason(reason), message: snapshot(model, blocks, usage, stopReason) });
-  };
 
   for (;;) {
     const { done, value } = await reader.read();
@@ -229,7 +345,7 @@ async function run(
       if (!line.startsWith("data:")) continue;
       const payload = line.slice(5).trim();
       if (payload === "[DONE]") {
-        finish(stopReason);
+        events.finish();
         return;
       }
       let chunk: OaiChunk;
@@ -238,96 +354,11 @@ async function run(
       } catch {
         continue;
       }
-      if (chunk.usage) usage = mapUsage(chunk.usage);
-
-      const choice = chunk.choices?.[0];
-      if (!choice) continue;
-      const delta = choice.delta ?? {};
-
-      // OpenAI-compatible providers use several names for the same reasoning
-      // delta. Pick the first populated field to avoid duplicate traces.
-      const reasoningDelta = [
-        delta.reasoning_content,
-        delta.reasoning,
-        delta.reasoning_text,
-      ].find((value): value is string => typeof value === "string" && value.length > 0);
-      if (reasoningDelta) {
-        if (!reasoningStarted) {
-          reasoningStarted = true;
-          reasoningPos = blocks.push({ kind: "thinking", text: "" }) - 1;
-          stream.push({
-            type: "thinking_start",
-            contentIndex: reasoningPos,
-            partial: snapshot(model, blocks, usage, stopReason),
-          });
-        }
-        (blocks[reasoningPos] as { text: string }).text += reasoningDelta;
-        stream.push({
-          type: "thinking_delta",
-          contentIndex: reasoningPos,
-          delta: reasoningDelta,
-          partial: snapshot(model, blocks, usage, stopReason),
-        });
-      }
-
-      // text
-      if (typeof delta.content === "string" && delta.content.length > 0) {
-        if (!textStarted) {
-          textStarted = true;
-          textPos = blocks.push({ kind: "text", text: "" }) - 1;
-          stream.push({
-            type: "text_start",
-            contentIndex: textPos,
-            partial: snapshot(model, blocks, usage, stopReason),
-          });
-        }
-        (blocks[textPos] as { text: string }).text += delta.content;
-        stream.push({
-          type: "text_delta",
-          contentIndex: textPos,
-          delta: delta.content,
-          partial: snapshot(model, blocks, usage, stopReason),
-        });
-      }
-
-      // tool calls
-      if (delta.tool_calls) {
-        for (const tc of delta.tool_calls) {
-          let pos = toolPosByIndex.get(tc.index);
-          if (pos === undefined) {
-            pos = blocks.push({ kind: "tool", idx: tc.index, id: tc.id ?? "", name: tc.function?.name ?? "", args: "" }) - 1;
-            toolPosByIndex.set(tc.index, pos);
-            stream.push({
-              type: "toolcall_start",
-              contentIndex: pos,
-              partial: snapshot(model, blocks, usage, stopReason),
-            });
-          }
-          const block = blocks[pos] as Extract<ContentBlock, { kind: "tool" }>;
-          if (tc.id) block.id = tc.id;
-          if (tc.function?.name) block.name = tc.function.name;
-          const frag = tc.function?.arguments ?? "";
-          if (frag.length > 0) {
-            block.args += frag;
-            stream.push({
-              type: "toolcall_delta",
-              contentIndex: pos,
-              delta: frag,
-              partial: snapshot(model, blocks, usage, stopReason),
-            });
-          }
-        }
-      }
-
-      if (choice.finish_reason) {
-        // Usage commonly arrives in a final choices:[] chunk after the stop
-        // reason. Keep reading through [DONE] so the persistent footer gets it.
-        stopReason = mapStopReason(choice.finish_reason);
-      }
+      events.accept(chunk);
     }
   }
   // Stream ended without an explicit finish marker.
-  finish(stopReason);
+  events.finish();
 }
 
 /* --------------------------- request building --------------------------- */
