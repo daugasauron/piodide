@@ -323,7 +323,7 @@ async function run(
 
   if (!resp.ok || !resp.body) {
     const text = await resp.text().catch(() => "");
-    emitError(stream, model, `HTTP ${resp.status} ${resp.statusText}\n${text}`.trim());
+    emitError(stream, model, formatHttpError(resp.status, resp.statusText, text));
     return;
   }
 
@@ -560,6 +560,23 @@ function emitError(stream: EventQueue, model: Model<Api>, message: string) {
     timestamp: Date.now(),
   };
   stream.push({ type: "error", reason: "error", error });
+}
+
+export function formatHttpError(
+  status: number,
+  statusText: string,
+  text: string,
+): string {
+  const trimmed = text.trim();
+  if (trimmed) {
+    try {
+      const parsed = JSON.parse(trimmed) as { error?: unknown };
+      return `Error: ${status}: ${JSON.stringify(parsed.error ?? parsed)}`;
+    } catch {
+      return `Error: ${status}${statusText ? ` ${statusText}` : ""}: ${trimmed}`;
+    }
+  }
+  return `Error: ${status}${statusText ? ` ${statusText}` : ""}`;
 }
 
 /* ------------------------------- mappers -------------------------------- */

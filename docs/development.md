@@ -50,6 +50,9 @@ Set `DOCS_SCREENSHOT_URL` or `CHROME_BIN` to override the defaults. The script
 uses an isolated temporary Chrome profile, validates the mobile GLM login flow,
 and writes to `screens/`.
 
+Set `DOCS_GLM_API_KEY` for the optional live GLM check. Set
+`DOCS_SCREENSHOT_WRITE=0` to validate without replacing screenshots.
+
 ## GitHub Pages
 
 `.github/workflows/pages.yml` tests and builds every push to `main`, then

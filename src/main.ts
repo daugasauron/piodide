@@ -67,6 +67,7 @@ import { makeJsRunner, startWasiProgram, supportsWorkerWasi } from "./wasi/brows
 import { installWasiPythonModule } from "./wasi/python-module.ts";
 import { SlopSession } from "./slop.ts";
 import { MobileCommandUi } from "./mobile-command-ui.ts";
+import { normalizeApiKey, verifyApiKey } from "./provider-auth.ts";
 
 const NEOVIM_ENABLED = import.meta.env.VITE_ENABLE_NEOVIM !== "0";
 
@@ -1383,10 +1384,17 @@ async function runSlash(input: string) {
         break;
       }
       const key = await prompt.ask(`  API key for ${provider.label} (hidden): `, true);
-      const trimmed = key.trim();
-      if (trimmed) {
-        apiKeys.set(provider.name, trimmed);
-        say(green(`  ◆ key set for ${provider.label}`));
+      const normalized = normalizeApiKey(key);
+      if (normalized) {
+        const verification = await verifyApiKey(provider, normalized);
+        apiKeys.set(provider.name, normalized);
+        say(
+          green(
+            `  ◆ key ${verification === "verified" ? "verified and " : ""}set for ${
+              provider.label
+            }`,
+          ),
+        );
       } else {
         say(yellow("  login cancelled"));
       }

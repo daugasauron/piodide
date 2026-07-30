@@ -190,16 +190,31 @@ export const PROVIDERS: Record<string, ProviderDef> = {
   },
   "zhipu-coding": {
     name: "zhipu-coding",
-    label: "智谱 GLM (Coding 套餐)",
+    label: "Z.AI GLM Coding",
+    api: "openai-completions",
+    transport: "http",
+    auth: "api-key",
+    baseUrl: "https://api.z.ai/api/coding/paas/v4",
+    defaultModel: "glm-5.2",
+    loadModels: modelCatalogue("zhipu-coding", "glm-5.2", () =>
+      import("@earendil-works/pi-ai/providers/zai.models").then((module) => module.ZAI_MODELS),
+    ),
+    note: "International GLM Coding Plan endpoint",
+  },
+  "zhipu-coding-cn": {
+    name: "zhipu-coding-cn",
+    label: "智谱 GLM Coding (中国)",
     api: "openai-completions",
     transport: "http",
     auth: "api-key",
     baseUrl: "https://open.bigmodel.cn/api/coding/paas/v4",
     defaultModel: "glm-5.2",
-    loadModels: modelCatalogue("zhipu-coding", "glm-5.2", () =>
-      import("@earendil-works/pi-ai/providers/zai.models").then((module) => module.ZAI_MODELS),
+    loadModels: modelCatalogue("zhipu-coding-cn", "glm-5.2", () =>
+      import("@earendil-works/pi-ai/providers/zai-coding-cn.models").then(
+        (module) => module.ZAI_CODING_CN_MODELS,
+      ),
     ),
-    note: "GLM Coding Plan 订阅专用端点",
+    note: "China GLM Coding Plan endpoint",
   },
   // Local-only subscription auth bridge; OAuth credentials never enter the
   // browser.
@@ -242,6 +257,9 @@ const ALIASES: Record<string, ProviderDef> = {
   kimi: PROVIDERS.moonshot,
   glm: PROVIDERS.zhipu,
   "glm-coding": PROVIDERS["zhipu-coding"],
+  "glm-coding-cn": PROVIDERS["zhipu-coding-cn"],
+  zai: PROVIDERS["zhipu-coding"],
+  "zai-coding": PROVIDERS["zhipu-coding"],
   zhipuai: PROVIDERS.zhipu,
   bigmodel: PROVIDERS.zhipu,
   moonshotai: PROVIDERS.moonshot,

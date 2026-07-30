@@ -17,6 +17,8 @@ const root = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const outputDir = join(root, "screens");
 const appUrl = process.env.DOCS_SCREENSHOT_URL || "http://localhost:5173/piodide/";
 const chromeBin = process.env.CHROME_BIN || "google-chrome-stable";
+const glmApiKey = process.env.DOCS_GLM_API_KEY?.trim() || "";
+const writeScreenshots = process.env.DOCS_SCREENSHOT_WRITE !== "0";
 const viewport = { width: 1440, height: 900 };
 
 const sleep = (milliseconds) =>
@@ -157,6 +159,7 @@ async function screenshot(
   height = viewport.height,
   width = viewport.width,
 ) {
+  if (!writeScreenshots) return;
   const { data } = await client.send("Page.captureScreenshot", {
     format: "png",
     fromSurface: true,
@@ -292,7 +295,7 @@ async function main() {
     await client.send("Runtime.evaluate", {
       expression: `(
         [...document.querySelectorAll(".mobile-option-button")]
-          .find((button) => button.textContent.includes("智谱 GLM (Coding 套餐)"))
+          .find((button) => button.textContent.includes("Z.AI GLM Coding"))
           ?.click()
       )`,
     });
@@ -349,14 +352,45 @@ async function main() {
       throw new Error(`Unexpected mobile login form: ${loginResult.value}`);
     }
     await screenshot(client, "mobile-login.png", 844, 390);
-    await client.send("Runtime.evaluate", {
-      expression: `(() => {
-        const input = document.querySelector(".mobile-command-input");
-        input.value = "mobile-flow-test-key";
-        input.dispatchEvent(new Event("input", { bubbles: true }));
-        input.form.requestSubmit();
-      })()`,
-    });
+
+    if (glmApiKey) {
+      await client.send("Runtime.evaluate", {
+        expression: `(() => {
+          window.__piodideGlmResponses = [];
+          const originalFetch = window.fetch.bind(window);
+          window.fetch = async (...args) => {
+            const response = await originalFetch(...args);
+            const input = args[0];
+            const url = typeof input === "string" ? input : input.url;
+            if (url.includes("/api/coding/paas/v4/")) {
+              window.__piodideGlmResponses.push({
+                url,
+                status: response.status,
+                body: await response.clone().text()
+              });
+            }
+            return response;
+          };
+        })()`,
+      });
+      const { result: inputHandle } = await client.send("Runtime.evaluate", {
+        expression: `document.querySelector(".mobile-command-input")`,
+      });
+      if (!inputHandle.objectId) throw new Error("Mobile login input is unavailable");
+      await client.send("Runtime.callFunctionOn", {
+        objectId: inputHandle.objectId,
+        functionDeclaration: `function(value) {
+          this.value = value;
+          this.dispatchEvent(new Event("input", { bubbles: true }));
+          this.form.requestSubmit();
+        }`,
+        arguments: [{ value: glmApiKey }],
+      });
+    } else {
+      await client.send("Runtime.evaluate", {
+        expression: `document.querySelector("#mobile-command-close").click()`,
+      });
+    }
     await sleep(300);
     const { result: connectedResult } = await client.send("Runtime.evaluate", {
       expression: `!document.querySelector("#mobile-command-layer").classList.contains("open")
@@ -364,6 +398,56 @@ async function main() {
       returnByValue: true,
     });
     if (connectedResult.value !== true) throw new Error("Mobile login did not complete");
+
+    if (glmApiKey) {
+      const keyCheckDeadline = Date.now() + 15_000;
+      let keyCheckResult = null;
+      while (Date.now() < keyCheckDeadline) {
+        const { result } = await client.send("Runtime.evaluate", {
+          expression: `window.__piodideGlmResponses
+            .find((response) => response.url.endsWith("/models")) ?? null`,
+          returnByValue: true,
+        });
+        if (result.value) {
+          keyCheckResult = result.value;
+          break;
+        }
+        await sleep(200);
+      }
+      if (keyCheckResult?.status !== 200) {
+        throw new Error(
+          `Unexpected GLM key-check response: ${JSON.stringify(keyCheckResult)}`,
+        );
+      }
+
+      await focusTerminal(client);
+      await submit(client, "Reply with OK.");
+
+      const deadline = Date.now() + 15_000;
+      let responseResult = null;
+      while (Date.now() < deadline) {
+        const { result } = await client.send("Runtime.evaluate", {
+          expression: `window.__piodideGlmResponses
+            .find((response) => response.url.endsWith("/chat/completions")) ?? null`,
+          returnByValue: true,
+        });
+        if (result.value) {
+          responseResult = result.value;
+          break;
+        }
+        await sleep(200);
+      }
+      if (
+        responseResult?.status !== 429 ||
+        !responseResult.body.includes('"code":"1310"') ||
+        !responseResult.body.includes("Weekly/Monthly Limit Exhausted")
+      ) {
+        throw new Error(
+          `Unexpected authenticated GLM response: ${JSON.stringify(responseResult)}`,
+        );
+      }
+      console.log("validated authenticated GLM request → HTTP 429 code 1310");
+    }
     console.log("validated mobile GLM Coding → GLM-5.2 → login flow");
   } finally {
     client?.close();

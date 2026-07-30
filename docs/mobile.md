@@ -13,4 +13,5 @@ Tap the floating `/` button or swipe left from the right edge.
 3. Choose `/login`, paste the API key, and tap **Connect**.
 
 The drawer is limited to these three commands. API keys stay in page memory
-and are cleared on refresh.
+and are cleared on refresh. GLM keys are checked without running a completion
+before they are stored.

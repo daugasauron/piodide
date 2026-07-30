@@ -5,6 +5,7 @@ import type { AssistantMessageEvent } from "@earendil-works/pi-ai";
 import { makeModel } from "../src/model.ts";
 import {
   EventQueue,
+  formatHttpError,
   OpenAIEventAdapter,
 } from "../src/openai-stream.ts";
 
@@ -102,4 +103,19 @@ test("OpenAI event adapter preserves streamed text, tool arguments, and usage", 
       arguments: { path: "/home/web/main.c" },
     },
   ]);
+});
+
+test("OpenAI HTTP errors unwrap provider error envelopes", () => {
+  assert.equal(
+    formatHttpError(
+      429,
+      "Too Many Requests",
+      '{"error":{"code":"1310","message":"Weekly/Monthly Limit Exhausted"}}',
+    ),
+    'Error: 429: {"code":"1310","message":"Weekly/Monthly Limit Exhausted"}',
+  );
+  assert.equal(
+    formatHttpError(401, "Unauthorized", "token expired or incorrect"),
+    "Error: 401 Unauthorized: token expired or incorrect",
+  );
 });

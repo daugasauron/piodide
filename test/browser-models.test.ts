@@ -254,3 +254,17 @@ test("WebLLM is an independent WebGPU catalogue with tool support marked", async
 test("browser-local providers are the first choices", () => {
   assert.deepEqual(Object.keys(PROVIDERS).slice(0, 2), ["webllm", "wllama"]);
 });
+
+test("GLM Coding separates the international and China endpoints", async () => {
+  const international = getProvider("glm-coding");
+  const china = getProvider("glm-coding-cn");
+  assert.ok(international);
+  assert.ok(china);
+
+  assert.equal(international, getProvider("zai"));
+  assert.equal(international, getProvider("zai-coding"));
+  assert.equal(international.baseUrl, "https://api.z.ai/api/coding/paas/v4");
+  assert.equal(china.baseUrl, "https://open.bigmodel.cn/api/coding/paas/v4");
+  assert.ok((await international.loadModels()).includes("glm-5.2"));
+  assert.ok((await china.loadModels()).includes("glm-5.2"));
+});
