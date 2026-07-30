@@ -1,0 +1,41 @@
+# Agent tools
+
+[← README](../README.md)
+
+All tools operate inside the browser and share `/home/web`.
+
+| Tool | Purpose |
+| --- | --- |
+| `python` | Long-lived Pyodide CPython |
+| `read`, `write`, `edit` | Bounded text-file operations |
+| `slop` | One shell command or pipeline |
+| `compile_c`, `link_wasi`, `run_wasi` | Build and run wasm32-wasi programs |
+| `git` | Local Dulwich repository and GitHub snapshots |
+| `fetch` | Browser fetch, subject to CORS |
+| `download` | Export a file after the user asks |
+| `image` | Render PNG, JPEG, GIF, or WebP in the terminal |
+| `html` | Open a sandboxed, closeable HTML preview |
+
+| Image output | HTML preview |
+| --- | --- |
+| ![A Matplotlib image rendered in the terminal](../screens/in-terminal-pictures.png) | ![An interactive HTML preview](../screens/html-tool.png) |
+
+## Python packages
+
+Pyodide has no native `pip` process. Install compatible packages with:
+
+```python
+import micropip
+await micropip.install("package")
+```
+
+Use `/upload` to import host files; it must be initiated by the user.
+
+## Boundaries
+
+- No host shell, subprocesses, sockets, or host filesystem access.
+- Browser `fetch` follows CORS.
+- The wasm32 heap has a hard ceiling near 4 GiB.
+- Prefer bounded reads, output, and allocations.
+
+See [WASI](wasi.md) for compiled programs and [Slop](slop.md) for shell syntax.

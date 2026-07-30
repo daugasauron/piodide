@@ -4,7 +4,7 @@
  *
  * OAuth credentials stay in this process and disappear when it exits. The
  * browser receives only a random, process-local capability token through a
- * URL fragment. See LOCAL_CODEX_PROXY.md.
+ * URL fragment. See docs/codex-proxy.md.
  */
 import { spawn } from "node:child_process";
 import { randomBytes, timingSafeEqual } from "node:crypto";
