@@ -12,7 +12,7 @@ import { streamBrowserModel } from "./browser-model-stream.ts";
 import { streamOpenAI } from "./openai-stream.ts";
 import { streamWebLLMModel } from "./webllm-model-stream.ts";
 
-// TEMPORARY: this API targets the opt-in loopback Codex proxy. Force SSE so
+// This API targets the opt-in loopback Codex proxy. Force SSE so
 // the proxy can remain a tiny HTTP relay instead of implementing WebSockets.
 const openAICodexResponses = openAICodexResponsesApi();
 const openAIResponses = openAIResponsesApi();

@@ -67,6 +67,8 @@ import { makeJsRunner, startWasiProgram, supportsWorkerWasi } from "./wasi/brows
 import { installWasiPythonModule } from "./wasi/python-module.ts";
 import { SlopSession } from "./slop.ts";
 
+const NEOVIM_ENABLED = import.meta.env.VITE_ENABLE_NEOVIM !== "0";
+
 /* ------------------------------------------------------------------ */
 /* system prompt                                                       */
 /* ------------------------------------------------------------------ */
@@ -147,11 +149,17 @@ const BANNER = [
   "\x1b[35m❯\x1b[0m \x1b[1mpiodide\x1b[0m — pi in the browser",
   "\x1b[2mghostty-web · pyodide · pi-agent-core\x1b[0m",
   "",
-  "\x1b[2mCommands:\x1b[0m  /provider   /model   /github   /new   /tree   /thinking   /nvim   /help",
-  "\x1b[2mEditor:\x1b[0m    Ctrl+Shift+E toggles agent ↔ Neovim · Ctrl+Shift+S toggles slop shell",
+  `\x1b[2mCommands:\x1b[0m  /provider   /model   /github   /new   /tree   /thinking${NEOVIM_ENABLED ? "   /nvim" : ""}   /help`,
+  NEOVIM_ENABLED
+    ? "\x1b[2mViews:\x1b[0m     Ctrl+Shift+E toggles agent ↔ Neovim · Ctrl+Shift+S toggles slop shell"
+    : "\x1b[2mView:\x1b[0m      Ctrl+Shift+S toggles the slop shell",
   "\x1b[2mStart with:\x1b[0m /provider  →  choose one  →  /login when required  →  type.",
   "",
 ].join("\r\n");
+
+const NEOVIM_COMMANDS: readonly CommandSuggestion[] = NEOVIM_ENABLED
+  ? [{ name: "/nvim", description: "open Neovim (Ctrl+Shift+E)" }]
+  : [];
 
 const COMMANDS: readonly CommandSuggestion[] = [
   { name: "/provider", description: "choose the API provider" },
@@ -174,7 +182,7 @@ const COMMANDS: readonly CommandSuggestion[] = [
   { name: "/run", description: "run a WASI program from /home/web" },
   { name: "/image", description: "display an image file from /home/web" },
   { name: "/html", description: "open an HTML file from /home/web" },
-  { name: "/nvim", description: "open Neovim (Ctrl+Shift+E)" },
+  ...NEOVIM_COMMANDS,
   { name: "/hotkeys", description: "show keyboard shortcuts" },
   { name: "/settings", description: "show current browser settings" },
   { name: "/status", description: "show detailed session status" },
@@ -317,7 +325,7 @@ function currentSystemPrompt() {
     : REMOTE_SYSTEM_PROMPT;
 }
 
-function consumeTemporaryCodexProxyToken(): string {
+function consumeLocalCodexProxyToken(): string {
   const url = new URL(location.href);
   const fragment = new URLSearchParams(url.hash.slice(1));
   const token = fragment.get("codex_proxy_token")?.trim() ?? "";
@@ -328,13 +336,21 @@ function consumeTemporaryCodexProxyToken(): string {
   return token;
 }
 
-async function verifyTemporaryCodexProxyToken(
+async function verifyLocalCodexProxyToken(
   candidate: ProviderDef,
   token: string,
 ): Promise<void> {
   const response = await fetch(`${candidate.baseUrl}/auth/status`, {
     headers: { Authorization: `Bearer ${token}` },
   });
+  if (!response.ok) {
+    const detail = await response.text().catch(() => "");
+    throw new Error(detail || `local Codex proxy returned HTTP ${response.status}`);
+  }
+}
+
+async function verifyLocalCodexProxyAvailable(candidate: ProviderDef): Promise<void> {
+  const response = await fetch(`${candidate.baseUrl}/health`);
   if (!response.ok) {
     const detail = await response.text().catch(() => "");
     throw new Error(detail || `local Codex proxy returned HTTP ${response.status}`);
@@ -540,6 +556,7 @@ function setNeovimStatus(message: string, warning = false) {
 }
 
 async function getNeovim(): Promise<NeovimController> {
+  if (!NEOVIM_ENABLED) throw new Error("Neovim is not included in this build.");
   if (neovim) return neovim;
   if (!py) throw new Error("Python filesystem is not ready.");
   if (!neovimStarting) {
@@ -565,6 +582,11 @@ async function getNeovim(): Promise<NeovimController> {
 }
 
 async function toggleNeovim() {
+  if (!NEOVIM_ENABLED) {
+    footerLocationEl.textContent = "Neovim is not included in this build";
+    window.setTimeout(renderFooter, 1500);
+    return;
+  }
   if (viewToggleRunning) return;
   if (activeView === "slop") return;
   if (activeView === "agent" && (!pyReady || !py)) {
@@ -1076,7 +1098,7 @@ function showStatus() {
           }`,
         ]
       : []),
-    `  ${provider?.temporaryLocalCodexProxy ? "proxy  " : "auth   "}: ${authStatus}`,
+    `  ${provider?.localCodexProxy ? "proxy  " : "auth   "}: ${authStatus}`,
     `  github : ${
       gitHubCredentials
         ? `${green("connected")} · ${gitHubCredentials.login}@${gitHubCredentials.apiBaseUrl}`
@@ -1210,7 +1232,9 @@ async function runSlash(input: string) {
       say(dim("  /download <path>  /upload [directory]      host file transfer"));
       say(dim("  /run <prog.wasm> [args]                    run a WASI program (live filesystem)"));
       say(dim("  /image <path>  /html <path>                browser previews"));
-      say(dim("  /nvim                                      open Neovim editor"));
+      if (NEOVIM_ENABLED) {
+        say(dim("  /nvim                                      open Neovim editor"));
+      }
       say(dim("  /status  /clear  /hotkeys                  terminal utilities"));
       break;
 
@@ -1324,18 +1348,21 @@ async function runSlash(input: string) {
         say(green(`  ◆ ${provider.label} runs locally and needs no login`));
         break;
       }
-      if (provider.temporaryLocalCodexProxy) {
-        const token = (
-          await prompt.ask("  temporary token printed by npm run codex-proxy (hidden): ", true)
-        ).trim();
-        if (!token) {
-          say(yellow("  login cancelled"));
-          break;
-        }
+      if (provider.localCodexProxy) {
         say(dim("  checking local Codex proxy…"));
-        await verifyTemporaryCodexProxyToken(provider, token);
-        apiKeys.set(provider.name, token);
-        say(green("  ◆ connected to temporary local Codex proxy"));
+        try {
+          await verifyLocalCodexProxyAvailable(provider);
+          say(dim("  reconnecting through the local proxy…"));
+          location.assign(`${provider.baseUrl}/connect`);
+        } catch (error) {
+          say(
+            red(
+              `  local Codex proxy unavailable; run npm run codex-proxy${
+                error instanceof Error ? ` (${error.message})` : ""
+              }`,
+            ),
+          );
+        }
         break;
       }
       const key = await prompt.ask(`  API key for ${provider.label} (hidden): `, true);
@@ -1354,7 +1381,7 @@ async function runSlash(input: string) {
         say(yellow("  no provider selected"));
       } else if (provider.auth === "none") {
         say(green(`  ◆ ${provider.label} stores no login credentials`));
-      } else if (provider.temporaryLocalCodexProxy) {
+      } else if (provider.localCodexProxy) {
         const token = currentApiKey();
         apiKeys.delete(provider.name);
         if (token) {
@@ -1367,7 +1394,7 @@ async function runSlash(input: string) {
             // It may already have been stopped with Ctrl-C.
           }
         }
-        say(green("  ◆ local Codex proxy disconnected; its temporary process was stopped"));
+        say(green("  ◆ local Codex proxy disconnected and stopped"));
       } else {
         apiKeys.delete(provider.name);
         say(green(`  ◆ key removed for ${provider.label}`));
@@ -1583,7 +1610,9 @@ async function runSlash(input: string) {
       return;
 
     case "hotkeys":
-      say(dim("  Ctrl+Shift+E  toggle agent / Neovim"));
+      if (NEOVIM_ENABLED) {
+        say(dim("  Ctrl+Shift+E  toggle agent / Neovim"));
+      }
       say(dim("  Ctrl+Shift+S  toggle agent / slop shell"));
       say(dim("  Ctrl+Shift+C  copy terminal selection"));
       say(dim("  Ctrl+Shift+V  paste clipboard text"));
@@ -2002,7 +2031,7 @@ async function main() {
   // Finish any service-worker transition before consuming a temporary launch
   // token. A required reload must preserve the fragment for the stable page.
   if (await ensureCrossOriginIsolation()) return;
-  const temporaryCodexProxyToken = consumeTemporaryCodexProxyToken();
+  const localCodexProxyToken = consumeLocalCodexProxyToken();
   handle = await createTerminal(mount);
   writer = handle.writer;
   markdown = new AssistantMarkdown(writer);
@@ -2059,14 +2088,14 @@ async function main() {
       say(green(`  ◆ python ready · heap ${currentHeapUsage()} · filesystem at /home/web`));
       applyConfigToAgent();
 
-      // TEMPORARY: a proxy launch URL can connect without making the user paste
-      // its non-OpenAI capability. OAuth credentials never enter the browser.
-      if (temporaryCodexProxyToken) {
+      // A proxy launch URL connects without exposing its non-OpenAI capability
+      // in terminal logs. OAuth credentials never enter the browser.
+      if (localCodexProxyToken) {
         const localCodex = getProvider("codex-local");
         if (localCodex) {
           try {
-            await verifyTemporaryCodexProxyToken(localCodex, temporaryCodexProxyToken);
-            apiKeys.set(localCodex.name, temporaryCodexProxyToken);
+            await verifyLocalCodexProxyToken(localCodex, localCodexProxyToken);
+            apiKeys.set(localCodex.name, localCodexProxyToken);
             provider = localCodex;
             modelOverride = null;
             await localCodex.loadModels();
@@ -2126,7 +2155,9 @@ async function main() {
           provider = { ...baseProvider, baseUrl: qp.get("baseUrl") || baseProvider.baseUrl };
           await baseProvider.loadModels();
         }
-        if (provider) apiKeys.set(provider.name, qp.get("key") || "test");
+        // E2E mode is for loopback mock servers only. Never accept credentials
+        // through the URL: query strings leak into browser history and logs.
+        if (provider) apiKeys.set(provider.name, "test");
         if (qp.get("model")) modelOverride = qp.get("model");
         applyConfigToAgent();
         const q = qp.get("q") || "compute 1+1";

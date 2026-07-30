@@ -11,7 +11,11 @@ import { existsSync, readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
 import { MemoryFs } from "../src/wasi/memory-fs.ts";
-import { runToolchain } from "../src/wasi/toolchain.ts";
+import {
+  runToolchain,
+  verifyToolchainAsset,
+  type ToolchainAssetName,
+} from "../src/wasi/toolchain.ts";
 import { executeWasi } from "../src/wasi/runner.ts";
 
 const here = dirname(fileURLToPath(import.meta.url));
@@ -77,6 +81,24 @@ unsigned long long high_half_product(unsigned long long left, unsigned long long
   return (unsigned long long)(product >> 64);
 }
 `;
+
+test(
+  "toolchain: downloaded assets match pinned SHA-256 digests",
+  { skip: !assetsAvailable },
+  async () => {
+    const assets: Array<[ToolchainAssetName, string]> = [
+      ["clang.wasm", clangPath],
+      ["wasm-ld.wasm", wasmLdPath],
+      ["clang-fs.tar.gz", sysrootPath],
+    ];
+    await Promise.all(
+      assets.map(async ([name, path]) => {
+        const bytes = assetBytes(path);
+        assert.equal(await verifyToolchainAsset(name, bytes), bytes);
+      }),
+    );
+  },
+);
 
 test(
   "toolchain: clang compiles, wasm-ld links, host runs the binary",

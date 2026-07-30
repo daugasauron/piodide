@@ -6,6 +6,8 @@
 
 export const PYODIDE_VERSION = "v0.27.7";
 export const PYODIDE_INDEX = `https://cdn.jsdelivr.net/pyodide/${PYODIDE_VERSION}/full/`;
+const PYODIDE_BOOTSTRAP_INTEGRITY =
+  "sha384-90so5tCKvl0xs9agU29IMKlAVzhfzFX7QO//YxQkRhJG58bBZrFN+2ZTRB026X5X";
 
 // Minimal surface we use from pyodide. We keep it loose to avoid depending on
 // the (heavy) @types for the whole runtime.
@@ -78,6 +80,8 @@ function loadBootstrap(): Promise<void> {
     if (typeof g.loadPyodide === "function") return resolve();
     const s = document.createElement("script");
     s.src = `${PYODIDE_INDEX}pyodide.js`;
+    s.integrity = PYODIDE_BOOTSTRAP_INTEGRITY;
+    s.crossOrigin = "anonymous";
     s.onload = () => resolve();
     s.onerror = () => reject(new Error(`Failed to load ${s.src}`));
     document.head.appendChild(s);

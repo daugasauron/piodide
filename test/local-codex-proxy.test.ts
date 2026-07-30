@@ -8,6 +8,7 @@ import type { Model } from "@earendil-works/pi-ai";
 import {
   createCapabilityToken,
   createLocalCodexProxyServer,
+  createPiodideConnectionLocation,
   extractAccountId,
 } from "../scripts/local-codex-proxy.mjs";
 import { getProvider, type ApiKind } from "../src/providers.ts";
@@ -42,11 +43,11 @@ async function listen(server: Server): Promise<string> {
   return `http://127.0.0.1:${address.port}`;
 }
 
-describe("temporary local Codex proxy", () => {
-  it("registers an explicitly temporary Codex provider", async () => {
+describe("local Codex proxy", () => {
+  it("registers the local Codex provider", async () => {
     const provider = getProvider("codex-local");
     assert.ok(provider);
-    assert.equal(provider.temporaryLocalCodexProxy, true);
+    assert.equal(provider.localCodexProxy, true);
     assert.equal(provider.api, "openai-codex-responses");
     assert.equal(provider.baseUrl, "http://127.0.0.1:1456");
     assert.ok((await provider.loadModels()).includes("gpt-5.6-sol"));
@@ -55,7 +56,50 @@ describe("temporary local Codex proxy", () => {
   it("creates a JWT-shaped capability without an OpenAI credential", () => {
     const capability = createCapabilityToken();
     assert.equal(capability.split(".").length, 3);
-    assert.equal(extractAccountId(capability), "temporary-local-proxy");
+    assert.equal(extractAccountId(capability), "piodide-local-proxy");
+  });
+
+  it("hands the capability to an allowlisted Piodide page through a fragment", async () => {
+    const capability = createCapabilityToken();
+    const server = createLocalCodexProxyServer({
+      capability,
+      allowedOrigins: [ORIGIN],
+      connectTarget: `${ORIGIN}/piodide/#view=terminal`,
+      getAccessToken: async () => jwt("account-real"),
+    });
+    const base = await listen(server);
+    const response = await fetch(`${base}/connect`, { redirect: "manual" });
+
+    assert.equal(response.status, 302);
+    assert.equal(response.headers.get("cache-control"), "no-store");
+    assert.equal(response.headers.get("referrer-policy"), "no-referrer");
+    const location = new URL(response.headers.get("location") ?? "");
+    assert.equal(location.origin, ORIGIN);
+    assert.equal(location.pathname, "/piodide/");
+    assert.equal(location.searchParams.has("codex_proxy_token"), false);
+    const fragment = new URLSearchParams(location.hash.slice(1));
+    assert.equal(fragment.get("view"), "terminal");
+    assert.equal(fragment.get("codex_proxy_token"), capability);
+  });
+
+  it("does not connect to a target outside the exact origin allowlist", () => {
+    assert.throws(
+      () =>
+        createLocalCodexProxyServer({
+          capability: createCapabilityToken(),
+          allowedOrigins: [ORIGIN],
+          connectTarget: "https://evil.test/piodide/",
+          getAccessToken: async () => jwt("account-real"),
+        }),
+      /is not in PIODIDE_ORIGINS/,
+    );
+  });
+
+  it("rejects non-web connection targets", () => {
+    assert.throws(
+      () => createPiodideConnectionLocation("file:///tmp/piodide", createCapabilityToken()),
+      /must use http or https/,
+    );
   });
 
   it("rejects foreign origins and invalid capabilities", async () => {
@@ -72,6 +116,10 @@ describe("temporary local Codex proxy", () => {
     });
     assert.equal(foreign.status, 403);
     assert.equal(foreign.headers.get("access-control-allow-origin"), null);
+
+    const health = await fetch(`${base}/health`, { headers: { Origin: ORIGIN } });
+    assert.equal(health.status, 200);
+    assert.deepEqual(await health.json(), { ready: true });
 
     const invalid = await fetch(`${base}/auth/status`, {
       headers: { Origin: ORIGIN, Authorization: "Bearer wrong" },

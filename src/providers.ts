@@ -16,7 +16,7 @@ export type ApiKind =
   | "browser-webllm"
   | "browser-wllama";
 
-export type ProviderAuth = "api-key" | "none" | "temporary-proxy";
+export type ProviderAuth = "api-key" | "none" | "local-proxy";
 export type ProviderTransport = "http" | "browser";
 
 export interface ProviderDef {
@@ -34,8 +34,8 @@ export interface ProviderDef {
   note?: string;
   /** Extra fields merged into the chat-completions request body. */
   extraBody?: Record<string, unknown>;
-  /** TEMPORARY: authenticates through the opt-in loopback Codex proxy. */
-  temporaryLocalCodexProxy?: boolean;
+  /** Authenticates through the opt-in loopback Codex subscription proxy. */
+  localCodexProxy?: boolean;
 }
 
 export const PROVIDERS: Record<string, ProviderDef> = {
@@ -201,14 +201,14 @@ export const PROVIDERS: Record<string, ProviderDef> = {
     ),
     note: "GLM Coding Plan 订阅专用端点",
   },
-  // TEMPORARY: delete this entry with scripts/local-codex-proxy.mjs when the
-  // browser can use subscription auth through a supported mechanism.
+  // Local-only subscription auth bridge; OAuth credentials never enter the
+  // browser.
   "codex-local": {
     name: "codex-local",
-    label: "OpenAI Codex subscription (temporary local proxy)",
+    label: "OpenAI Codex subscription (local proxy)",
     api: "openai-codex-responses",
     transport: "http",
-    auth: "temporary-proxy",
+    auth: "local-proxy",
     baseUrl: "http://127.0.0.1:1456",
     defaultModel: "gpt-5.6-sol",
     loadModels: modelCatalogue("codex-local", "gpt-5.6-sol", () =>
@@ -216,8 +216,8 @@ export const PROVIDERS: Record<string, ProviderDef> = {
         (module) => module.OPENAI_CODEX_MODELS,
       ),
     ),
-    note: "temporary loopback proxy; start it with npm run codex-proxy",
-    temporaryLocalCodexProxy: true,
+    note: "loopback subscription proxy · start with npm run codex-proxy",
+    localCodexProxy: true,
   },
   local: {
     name: "local",

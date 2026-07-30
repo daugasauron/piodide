@@ -13,6 +13,12 @@ import { executeWasi } from "./runner.ts";
 import type { WasiFs } from "./fs.ts";
 
 const ASSET_BASE_URL = "https://runno.dev/langs";
+export type ToolchainAssetName = "clang.wasm" | "wasm-ld.wasm" | "clang-fs.tar.gz";
+export const TOOLCHAIN_ASSET_SHA256: Readonly<Record<ToolchainAssetName, string>> = {
+  "clang.wasm": "2a466f0e990329d3230b869d04fc20803eae96a7feb3a3f6c93e25a77b8aed1d",
+  "wasm-ld.wasm": "36419ed202011765222098d7701218378b67f634d50f0a4625059ae2c9860f48",
+  "clang-fs.tar.gz": "7ed12063619882e4dfa710ab371fc91848b256f85a4075747e8bd5c167902b50",
+};
 const TAR_BLOCK_SIZE = 512;
 const SYSROOT_PREFIX = "/sys";
 const CLANG_VERSION = "8.0.1";
@@ -80,15 +86,35 @@ export interface ToolchainRunResult {
 const byteCache = new Map<string, Promise<ArrayBuffer>>();
 const compiledCache = new Map<string, Promise<WebAssembly.Module>>();
 
-function fetchBytes(url: string): Promise<ArrayBuffer> {
-  let cached = byteCache.get(url);
+function hex(bytes: ArrayBuffer): string {
+  return Array.from(new Uint8Array(bytes), (byte) => byte.toString(16).padStart(2, "0")).join("");
+}
+
+export async function verifyToolchainAsset(
+  name: ToolchainAssetName,
+  bytes: ArrayBuffer,
+): Promise<ArrayBuffer> {
+  const digest = await globalThis.crypto.subtle.digest("SHA-256", bytes);
+  const actual = hex(digest);
+  const expected = TOOLCHAIN_ASSET_SHA256[name];
+  if (actual !== expected) {
+    throw new Error(
+      `Integrity check failed for ${name}: expected SHA-256 ${expected}, received ${actual}.`,
+    );
+  }
+  return bytes;
+}
+
+function fetchBytes(name: ToolchainAssetName): Promise<ArrayBuffer> {
+  let cached = byteCache.get(name);
   if (!cached) {
     cached = (async () => {
+      const url = `${ASSET_BASE_URL}/${name}`;
       const response = await fetch(url);
       if (!response.ok) throw new Error(`Could not download ${url} (HTTP ${response.status}).`);
-      return response.arrayBuffer();
+      return verifyToolchainAsset(name, await response.arrayBuffer());
     })();
-    byteCache.set(url, cached);
+    byteCache.set(name, cached);
   }
   return cached;
 }
@@ -100,7 +126,7 @@ function fetchBytes(url: string): Promise<ArrayBuffer> {
 export function getToolchainModule(name: "clang.wasm" | "wasm-ld.wasm"): Promise<WebAssembly.Module> {
   let cached = compiledCache.get(name);
   if (!cached) {
-    cached = fetchBytes(`${ASSET_BASE_URL}/${name}`).then((bytes) => WebAssembly.compile(bytes));
+    cached = fetchBytes(name).then((bytes) => WebAssembly.compile(bytes));
     compiledCache.set(name, cached);
   }
   return cached;
@@ -108,7 +134,7 @@ export function getToolchainModule(name: "clang.wasm" | "wasm-ld.wasm"): Promise
 
 /** Fetch the gzipped sysroot tar once (main-thread cache). */
 export function getSysrootTarBytes(): Promise<ArrayBuffer> {
-  return fetchBytes(`${ASSET_BASE_URL}/clang-fs.tar.gz`);
+  return fetchBytes("clang-fs.tar.gz");
 }
 
 /** Decompress + unpack the sysroot tar into a fresh MemoryFs. */

@@ -37,6 +37,8 @@ tools, and vice versa.
 - The in-browser C toolchain (clang + wasm-ld, fetched lazily from
   runno.dev) runs on the same host with a `/sys` sysroot overlay, so
   `compile_c` output lands directly in `/home/web`.
+  All three downloaded toolchain assets are checked against pinned SHA-256
+  digests before compilation or extraction.
 
 Ways to run programs:
 
@@ -161,6 +163,10 @@ toggle Neovim (`:Ex` browses the same `/home/web` files used by the agent and
 Python) and `Ctrl+Shift+S` to toggle the slop shell. In the terminal views,
 `Ctrl+Shift+C` copies the active selection and `Ctrl+Shift+V` pastes plain
 clipboard text.
+
+The local/default build includes the optional Neovim view. The public GitHub
+Pages build sets `VITE_ENABLE_NEOVIM=0` and omits it because the current
+`monaco-neovim-wasm` packages do not publish license metadata.
 
 ## Agent tools
 

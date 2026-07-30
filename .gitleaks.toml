@@ -1,0 +1,12 @@
+title = "piodide secret scanning"
+
+[extend]
+useDefault = true
+
+[[allowlists]]
+description = "Chrome WebGPU feature names are flags, not an API credential"
+condition = "AND"
+targetRules = ["generic-api-key"]
+regexTarget = "line"
+paths = ['''^scripts/chrome-webgpu\.sh$''']
+regexes = ['''--enable-dawn-features=allow_unsafe_apis,vulkan_enable_f16_on_nvidia''']

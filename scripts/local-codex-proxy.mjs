@@ -1,12 +1,12 @@
 #!/usr/bin/env node
 /**
- * TEMPORARY local-only bridge from piodide to ChatGPT-managed Codex auth.
+ * Local-only bridge from piodide to ChatGPT-managed Codex auth.
  *
  * OAuth credentials stay in this process and disappear when it exits. The
- * browser receives only a random, process-local capability token. Remove this
- * file and the clearly marked `codex-local` integration when it is no longer
- * needed; see TEMPORARY_CODEX_PROXY.md.
+ * browser receives only a random, process-local capability token through a
+ * URL fragment. See LOCAL_CODEX_PROXY.md.
  */
+import { spawn } from "node:child_process";
 import { randomBytes, timingSafeEqual } from "node:crypto";
 import { createServer } from "node:http";
 import { Readable } from "node:stream";
@@ -23,6 +23,7 @@ import { openaiCodexProvider } from "@earendil-works/pi-ai/providers/openai-code
 
 export const DEFAULT_PROXY_HOST = "127.0.0.1";
 export const DEFAULT_PROXY_PORT = 1456;
+export const DEFAULT_PIODIDE_URL = "http://localhost:5173/piodide/";
 export const CODEX_UPSTREAM_URL = "https://chatgpt.com/backend-api/codex/responses";
 const JWT_AUTH_CLAIM = "https://api.openai.com/auth";
 const MAX_REQUEST_BYTES = 16 * 1024 * 1024;
@@ -53,7 +54,7 @@ function base64UrlJson(value) {
 export function createCapabilityToken() {
   const header = base64UrlJson({ alg: "none", typ: "JWT" });
   const payload = base64UrlJson({
-    [JWT_AUTH_CLAIM]: { chatgpt_account_id: "temporary-local-proxy" },
+    [JWT_AUTH_CLAIM]: { chatgpt_account_id: "piodide-local-proxy" },
     nonce: randomBytes(24).toString("base64url"),
   });
   const signature = randomBytes(32).toString("base64url");
@@ -69,6 +70,18 @@ export function extractAccountId(accessToken) {
   } catch {
     throw new Error("OpenAI OAuth token did not contain a ChatGPT account id");
   }
+}
+
+/** Put the local capability in a fragment so no web server or referrer sees it. */
+export function createPiodideConnectionLocation(piodideUrl, capability) {
+  const target = new URL(piodideUrl);
+  if (target.protocol !== "http:" && target.protocol !== "https:") {
+    throw new Error("PIODIDE_URL must use http or https");
+  }
+  const fragment = new URLSearchParams(target.hash.slice(1));
+  fragment.set("codex_proxy_token", capability);
+  target.hash = fragment.toString();
+  return target.href;
 }
 
 function tokenMatches(actual, expected) {
@@ -136,6 +149,7 @@ export function createLocalCodexProxyServer({
   capability,
   getAccessToken,
   allowedOrigins = DEFAULT_ALLOWED_ORIGINS,
+  connectTarget,
   upstreamFetch = fetch,
   upstreamUrl = CODEX_UPSTREAM_URL,
   maxRequestBytes = MAX_REQUEST_BYTES,
@@ -143,20 +157,50 @@ export function createLocalCodexProxyServer({
   shutdownSignal,
 }) {
   const origins = new Set(allowedOrigins);
+  let connectLocation = "";
+  if (connectTarget) {
+    const targetOrigin = new URL(connectTarget).origin;
+    if (!origins.has(targetOrigin)) {
+      throw new Error(`PIODIDE_URL origin ${targetOrigin} is not in PIODIDE_ORIGINS`);
+    }
+    connectLocation = createPiodideConnectionLocation(connectTarget, capability);
+  }
   let shutdownRequested = false;
 
   return createServer(async (request, response) => {
+    const url = new URL(request.url || "/", "http://127.0.0.1");
+    response.setHeader("cache-control", "no-store");
+
+    // Top-level navigation does not carry an Origin header. This fixed
+    // loopback redirect is the only unauthenticated route, and its target was
+    // checked against the exact origin allowlist above.
+    if (url.pathname === "/connect") {
+      if (!connectLocation) {
+        writeJson(response, 404, { error: "connection target is not configured" });
+      } else if (request.method !== "GET") {
+        writeJson(response, 405, { error: "method not allowed" });
+      } else {
+        response.statusCode = 302;
+        response.setHeader("location", connectLocation);
+        response.setHeader("referrer-policy", "no-referrer");
+        response.end();
+      }
+      return;
+    }
+
     const origin = typeof request.headers.origin === "string" ? request.headers.origin : "";
     if (!origins.has(origin)) {
-      writeJson(response, 403, { error: "origin is not allowed by the temporary Codex proxy" });
+      writeJson(response, 403, { error: "origin is not allowed by the local Codex proxy" });
       return;
     }
     const privateNetwork = request.headers["access-control-request-private-network"] === "true";
     setCors(response, origin, privateNetwork);
-    response.setHeader("cache-control", "no-store");
 
-    const url = new URL(request.url || "/", "http://127.0.0.1");
-    const allowedPath = url.pathname === "/auth/status" || url.pathname === "/shutdown" || url.pathname === "/codex/responses";
+    const allowedPath =
+      url.pathname === "/health" ||
+      url.pathname === "/auth/status" ||
+      url.pathname === "/shutdown" ||
+      url.pathname === "/codex/responses";
     if (!allowedPath) {
       writeJson(response, 404, { error: "not found" });
       return;
@@ -171,13 +215,18 @@ export function createLocalCodexProxyServer({
       return;
     }
 
+    if (url.pathname === "/health" && request.method === "GET") {
+      writeJson(response, 200, { ready: true });
+      return;
+    }
+
     if (!tokenMatches(bearerToken(request), capability)) {
-      writeJson(response, 401, { error: "invalid temporary proxy token" });
+      writeJson(response, 401, { error: "invalid local proxy token" });
       return;
     }
 
     if (url.pathname === "/auth/status" && request.method === "GET") {
-      writeJson(response, 200, { authenticated: true, temporary: true });
+      writeJson(response, 200, { authenticated: true, local: true });
       return;
     }
     if (url.pathname === "/shutdown" && request.method === "POST") {
@@ -255,7 +304,69 @@ function configuredOrigins() {
   return configured?.length ? configured : DEFAULT_ALLOWED_ORIGINS;
 }
 
-async function loginWithChatGPT(models) {
+function configuredPiodideUrl(origins) {
+  const value = process.env.PIODIDE_URL?.trim() || DEFAULT_PIODIDE_URL;
+  const parsed = new URL(value);
+  if (parsed.protocol !== "http:" && parsed.protocol !== "https:") {
+    throw new Error("PIODIDE_URL must use http or https");
+  }
+  if (!origins.includes(parsed.origin)) {
+    throw new Error(`PIODIDE_URL origin ${parsed.origin} is not in PIODIDE_ORIGINS`);
+  }
+  return parsed.href;
+}
+
+async function openInBrowser(url) {
+  const configuredBrowser = process.env.CODEX_PROXY_BROWSER?.trim();
+  const candidates = configuredBrowser
+    ? [{ executable: configuredBrowser, args: [url] }]
+    : process.platform === "darwin"
+      ? [{ executable: "open", args: [url] }]
+      : process.platform === "win32"
+        ? [{ executable: "rundll32.exe", args: ["url.dll,FileProtocolHandler", url] }]
+        : [
+            process.env.CHROME_BIN?.trim()
+              ? { executable: process.env.CHROME_BIN.trim(), args: [url] }
+              : null,
+            { executable: "google-chrome-stable", args: [url] },
+            { executable: "google-chrome", args: [url] },
+            { executable: "xdg-open", args: [url] },
+          ].filter(Boolean);
+
+  let lastError;
+  for (const command of candidates) {
+    try {
+      await new Promise((resolveOpen, rejectOpen) => {
+        const child = spawn(command.executable, command.args, { stdio: "ignore" });
+        child.once("error", rejectOpen);
+        child.once("close", (code) => {
+          if (code === 0) resolveOpen();
+          else rejectOpen(new Error(`${command.executable} exited with code ${code}`));
+        });
+      });
+      return;
+    } catch (error) {
+      lastError = error;
+    }
+  }
+  throw (
+    lastError ??
+    new Error("no browser command is available")
+  );
+}
+
+function openOrShow(url, description, autoOpen) {
+  if (!autoOpen) {
+    console.log(`\n${description}:\n${url}\n`);
+    return;
+  }
+  console.log(`${description}…`);
+  void openInBrowser(url).catch((error) => {
+    console.warn(`Could not open the browser (${error.message}). Open this URL:\n${url}\n`);
+  });
+}
+
+async function loginWithChatGPT(models, autoOpen) {
   const readline = createInterface({ input: process.stdin, output: process.stdout });
   const deviceAuth = process.env.CODEX_PROXY_DEVICE_AUTH === "1";
   try {
@@ -267,9 +378,10 @@ async function loginWithChatGPT(models) {
       },
       notify: (event) => {
         if (event.type === "auth_url") {
-          console.log(`\nOpen this URL in your browser:\n${event.url}\n`);
+          openOrShow(event.url, "Opening ChatGPT authorization", autoOpen);
         } else if (event.type === "device_code") {
-          console.log(`\nOpen ${event.verificationUri} and enter code: ${event.userCode}\n`);
+          console.log(`\nEnter this device code in the browser: ${event.userCode}`);
+          openOrShow(event.verificationUri, "Opening device authorization", autoOpen);
         } else if (event.type === "info" || event.type === "progress") {
           console.log(event.message);
         }
@@ -281,13 +393,16 @@ async function loginWithChatGPT(models) {
 }
 
 async function main() {
+  const origins = configuredOrigins();
+  const piodideUrl = configuredPiodideUrl(origins);
+  const autoOpen = process.env.CODEX_PROXY_NO_OPEN !== "1";
   const credentials = new InMemoryCredentialStore();
   const models = createModels({ credentials });
   models.setProvider(openaiCodexProvider());
 
-  console.log("Temporary piodide Codex proxy — credentials are memory-only.");
-  console.log("Press Ctrl-C at any time to remove them and stop the proxy.\n");
-  await loginWithChatGPT(models);
+  console.log("Piodide Codex subscription proxy");
+  console.log("OpenAI credentials stay in this process and are removed when it exits.\n");
+  await loginWithChatGPT(models, autoOpen);
 
   const capability = createCapabilityToken();
   const host = DEFAULT_PROXY_HOST;
@@ -306,7 +421,8 @@ async function main() {
   server = createLocalCodexProxyServer({
     capability,
     getAccessToken: async () => (await models.getAuth("openai-codex"))?.auth.apiKey,
-    allowedOrigins: configuredOrigins(),
+    allowedOrigins: origins,
+    connectTarget: piodideUrl,
     onShutdown: () => void shutdown(),
     shutdownSignal: shutdownController.signal,
   });
@@ -318,17 +434,13 @@ async function main() {
     server.listen(port, host, resolveListen);
   });
 
-  const encodedToken = encodeURIComponent(capability);
   console.log(`\nProxy ready at http://${host}:${port}`);
-  console.log(`Allowed browser origins: ${configuredOrigins().join(", ")}`);
-  console.log("\nOpen one of these URLs:");
-  // Keep the capability in the URL fragment: browsers do not send fragments
-  // to Vite, GitHub Pages, referrers, or any other server.
-  console.log(`  Local:  http://localhost:5173/piodide/#codex_proxy_token=${encodedToken}`);
-  console.log(`  Pages:  https://daugasauron.github.io/piodide/#codex_proxy_token=${encodedToken}`);
-  console.log("\nOr select /provider codex-local and paste this value into /login:");
-  console.log(`  ${capability}`);
-  console.log("\nStop with Ctrl-C or /logout in piodide. Nothing is persisted.\n");
+  openOrShow(
+    `http://${host}:${port}/connect`,
+    `Opening Piodide at ${piodideUrl}`,
+    autoOpen,
+  );
+  console.log("Stop with Ctrl-C or /logout in Piodide. Nothing is persisted.\n");
 }
 
 const invokedPath = process.argv[1] ? resolve(process.argv[1]) : "";
