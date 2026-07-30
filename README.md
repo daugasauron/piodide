@@ -164,9 +164,8 @@ Python) and `Ctrl+Shift+S` to toggle the slop shell. In the terminal views,
 `Ctrl+Shift+C` copies the active selection and `Ctrl+Shift+V` pastes plain
 clipboard text.
 
-The local/default build includes the optional Neovim view. The public GitHub
-Pages build sets `VITE_ENABLE_NEOVIM=0` and omits it because the current
-`monaco-neovim-wasm` packages do not publish license metadata.
+The default and GitHub Pages builds include the optional Neovim view. Set
+`VITE_ENABLE_NEOVIM=0` when building to omit its runtime and UI entry points.
 
 ## Agent tools
 

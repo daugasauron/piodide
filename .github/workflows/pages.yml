@@ -35,10 +35,6 @@ jobs:
       - name: Test
         run: npm test
       - name: Build
-        env:
-          # The upstream monaco-neovim-wasm packages publish no license
-          # metadata, so the public artifact omits that optional local view.
-          VITE_ENABLE_NEOVIM: "0"
         run: npm run build
       - name: Configure Pages
         uses: actions/configure-pages@45bfe0192ca1faeb007ade9deae92b16b8254a0d # v6
