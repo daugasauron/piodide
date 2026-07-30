@@ -151,7 +151,12 @@ async function shortcut(client, key, code) {
   await press(client, key, code, 10);
 }
 
-async function screenshot(client, name, height = viewport.height) {
+async function screenshot(
+  client,
+  name,
+  height = viewport.height,
+  width = viewport.width,
+) {
   const { data } = await client.send("Page.captureScreenshot", {
     format: "png",
     fromSurface: true,
@@ -159,7 +164,7 @@ async function screenshot(client, name, height = viewport.height) {
     clip: {
       x: 0,
       y: 0,
-      width: viewport.width,
+      width,
       height,
       scale: 1,
     },
@@ -230,6 +235,136 @@ async function main() {
     await shortcut(client, "e", "KeyE");
     await sleep(8_000);
     await screenshot(client, "neovim.png");
+
+    await client.send("Emulation.setTouchEmulationEnabled", {
+      enabled: true,
+      maxTouchPoints: 5,
+    });
+    await client.send("Emulation.setDeviceMetricsOverride", {
+      width: 390,
+      height: 844,
+      deviceScaleFactor: 1,
+      mobile: true,
+    });
+    await client.send("Page.reload", { ignoreCache: true });
+    await waitForPython(client);
+    const { result: mobileEnvironment } = await client.send("Runtime.evaluate", {
+      expression: `JSON.stringify({
+        width: innerWidth,
+        touchPoints: navigator.maxTouchPoints,
+        enabled: document.body.classList.contains("mobile-commands-enabled"),
+        triggerHidden: document.querySelector("#mobile-command-trigger")?.hidden
+      })`,
+      returnByValue: true,
+    });
+    console.log(`mobile environment ${mobileEnvironment.value}`);
+
+    // Exercise the actual edge gesture, not only the visible fallback button.
+    await client.send("Input.dispatchTouchEvent", {
+      type: "touchStart",
+      touchPoints: [{ x: 388, y: 420 }],
+    });
+    await client.send("Input.dispatchTouchEvent", {
+      type: "touchMove",
+      touchPoints: [{ x: 300, y: 420 }],
+    });
+    await client.send("Input.dispatchTouchEvent", {
+      type: "touchEnd",
+      touchPoints: [],
+    });
+    await sleep(300);
+    const { result: commandResult } = await client.send("Runtime.evaluate", {
+      expression: `JSON.stringify(
+        [...document.querySelectorAll("[data-mobile-command]")]
+          .map((button) => button.dataset.mobileCommand)
+      )`,
+      returnByValue: true,
+    });
+    if (commandResult.value !== '["/provider","/login","/model"]') {
+      throw new Error(`Unexpected mobile command drawer: ${commandResult.value}`);
+    }
+    await screenshot(client, "mobile-commands.png", 844, 390);
+
+    await client.send("Runtime.evaluate", {
+      expression: `document.querySelector('[data-mobile-command="/provider"]').click()`,
+    });
+    await sleep(300);
+    await client.send("Runtime.evaluate", {
+      expression: `(
+        [...document.querySelectorAll(".mobile-option-button")]
+          .find((button) => button.textContent.includes("智谱 GLM (Coding 套餐)"))
+          ?.click()
+      )`,
+    });
+    await sleep(1_000);
+    await client.send("Runtime.evaluate", {
+      expression: `document.querySelector("#mobile-command-trigger").click()`,
+    });
+    await client.send("Runtime.evaluate", {
+      expression: `document.querySelector('[data-mobile-command="/model"]').click()`,
+    });
+    await sleep(500);
+    const { result: modelResult } = await client.send("Runtime.evaluate", {
+      expression: `(
+        [...document.querySelectorAll(".mobile-option-button")]
+          .some((button) => button.textContent.toLowerCase().includes("glm-5.2"))
+      )`,
+      returnByValue: true,
+    });
+    if (modelResult.value !== true) throw new Error("GLM-5.2 is missing from the mobile model list");
+    await client.send("Runtime.evaluate", {
+      expression: `(
+        [...document.querySelectorAll(".mobile-option-button")]
+          .find((button) => button.textContent.toLowerCase().includes("glm-5.2"))
+          ?.click()
+      )`,
+    });
+    await sleep(300);
+    const { result: selectedModelResult } = await client.send("Runtime.evaluate", {
+      expression: `(
+        document.querySelector("#footer-model")?.textContent.includes("zhipu-coding")
+        && document.querySelector("#footer-model")?.textContent.includes("glm-5.2")
+      )`,
+      returnByValue: true,
+    });
+    if (selectedModelResult.value !== true) {
+      throw new Error("Mobile flow did not activate GLM-5.2 on the GLM Coding provider");
+    }
+    await client.send("Runtime.evaluate", {
+      expression: `document.querySelector("#mobile-command-trigger").click()`,
+    });
+    await client.send("Runtime.evaluate", {
+      expression: `document.querySelector('[data-mobile-command="/login"]').click()`,
+    });
+    await sleep(300);
+    const { result: loginResult } = await client.send("Runtime.evaluate", {
+      expression: `JSON.stringify({
+        type: document.querySelector(".mobile-command-input")?.type,
+        paste: [...document.querySelectorAll("button")].some((button) => button.textContent === "Paste"),
+        connect: [...document.querySelectorAll("button")].some((button) => button.textContent === "Connect")
+      })`,
+      returnByValue: true,
+    });
+    if (loginResult.value !== '{"type":"password","paste":true,"connect":true}') {
+      throw new Error(`Unexpected mobile login form: ${loginResult.value}`);
+    }
+    await screenshot(client, "mobile-login.png", 844, 390);
+    await client.send("Runtime.evaluate", {
+      expression: `(() => {
+        const input = document.querySelector(".mobile-command-input");
+        input.value = "mobile-flow-test-key";
+        input.dispatchEvent(new Event("input", { bubbles: true }));
+        input.form.requestSubmit();
+      })()`,
+    });
+    await sleep(300);
+    const { result: connectedResult } = await client.send("Runtime.evaluate", {
+      expression: `!document.querySelector("#mobile-command-layer").classList.contains("open")
+        && document.querySelector(".mobile-command-input") === null`,
+      returnByValue: true,
+    });
+    if (connectedResult.value !== true) throw new Error("Mobile login did not complete");
+    console.log("validated mobile GLM Coding → GLM-5.2 → login flow");
   } finally {
     client?.close();
     chrome.kill("SIGTERM");

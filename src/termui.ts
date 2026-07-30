@@ -273,6 +273,7 @@ export interface PromptOptions {
   onCycleThinking?: () => void;
   commands?: readonly CommandSuggestion[];
   commandMenu?: HTMLElement;
+  mobilePrompt?: MobilePromptSurface;
 }
 
 export interface CommandSuggestion {
@@ -290,6 +291,12 @@ export interface SelectRequest<T> {
   title: string;
   options: readonly SelectOption<T>[];
   active?: T;
+}
+
+export interface MobilePromptSurface {
+  enabled(): boolean;
+  ask(question: string, hidden?: boolean): Promise<string>;
+  select<T>(request: SelectRequest<T>): Promise<T | null>;
 }
 
 interface ActiveSelect {
@@ -311,6 +318,7 @@ export class PromptLine {
   private history: string[] = [];
   private histIdx = -1;
   private busy = false;
+  private mobileInteraction = false;
 
   // current prompt prefix (may contain ANSI) and its visible cell width
   private prefix = CHEVRON;
@@ -334,7 +342,24 @@ export class PromptLine {
 
   /** True while switching views would strand an active run or modal prompt. */
   isOccupied() {
-    return this.busy || this.resolveRead !== null || this.selection !== null;
+    return (
+      this.busy ||
+      this.mobileInteraction ||
+      this.resolveRead !== null ||
+      this.selection !== null
+    );
+  }
+
+  /** Submit a command from an external control while preserving terminal history. */
+  submitExternal(value: string): boolean {
+    if (this.isOccupied()) return false;
+    this.text = value;
+    this.pos = value.length;
+    this.hidden = false;
+    this.commandDismissed = true;
+    this.redraw();
+    this.submit();
+    return true;
   }
 
   /** Draw a fresh, empty prompt at the current cursor (assumed at col 0). */
@@ -357,6 +382,20 @@ export class PromptLine {
    */
   ask(question: string, hidden = false): Promise<string> {
     if (this.selection) throw new Error("Cannot read a line while a selection menu is open.");
+    if (this.opts.mobilePrompt?.enabled()) {
+      if (this.mobileInteraction || this.resolveRead) {
+        throw new Error("Another interactive prompt is already open.");
+      }
+      this.opts.writer.ensureNewline();
+      this.opts.writer.writeln(question.trimEnd());
+      this.mobileInteraction = true;
+      this.hideCommandPopup();
+      return this.opts.mobilePrompt
+        .ask(question, hidden)
+        .finally(() => {
+          this.mobileInteraction = false;
+        });
+    }
     this.opts.writer.ensureNewline();
     this.prefix = question;
     this.prefixVisible = [...question].length;
@@ -376,6 +415,16 @@ export class PromptLine {
       throw new Error("Another interactive prompt is already open.");
     }
     if (request.options.length === 0) return Promise.resolve(null);
+    if (this.opts.mobilePrompt?.enabled()) {
+      if (this.mobileInteraction) {
+        throw new Error("Another interactive prompt is already open.");
+      }
+      this.mobileInteraction = true;
+      this.hideCommandPopup();
+      return this.opts.mobilePrompt.select(request).finally(() => {
+        this.mobileInteraction = false;
+      });
+    }
 
     this.opts.writer.ensureNewline();
     return new Promise<T | null>((resolve) => {

@@ -66,6 +66,7 @@ import {
 import { makeJsRunner, startWasiProgram, supportsWorkerWasi } from "./wasi/browser-runner.ts";
 import { installWasiPythonModule } from "./wasi/python-module.ts";
 import { SlopSession } from "./slop.ts";
+import { MobileCommandUi } from "./mobile-command-ui.ts";
 
 const NEOVIM_ENABLED = import.meta.env.VITE_ENABLE_NEOVIM !== "0";
 
@@ -203,6 +204,21 @@ const neovimEditorEl = document.getElementById("neovim-editor") as HTMLElement;
 const neovimCommandlineEl = document.getElementById("neovim-commandline") as HTMLElement;
 const neovimStatusEl = document.getElementById("neovim-status") as HTMLElement;
 const commandMenuEl = document.getElementById("command-menu") as HTMLElement;
+const mobileCommandLayerEl = document.getElementById("mobile-command-layer") as HTMLElement;
+const mobileCommandDrawerEl = document.getElementById("mobile-command-drawer") as HTMLElement;
+const mobileCommandBackdropEl = document.getElementById(
+  "mobile-command-backdrop",
+) as HTMLButtonElement;
+const mobileCommandTriggerEl = document.getElementById(
+  "mobile-command-trigger",
+) as HTMLButtonElement;
+const mobileCommandCloseEl = document.getElementById(
+  "mobile-command-close",
+) as HTMLButtonElement;
+const mobileCommandTitleEl = document.getElementById("mobile-command-title") as HTMLElement;
+const mobileCommandContentEl = document.getElementById(
+  "mobile-command-content",
+) as HTMLElement;
 const htmlPreviewEl = document.getElementById("html-preview") as HTMLElement;
 const htmlPreviewTitleEl = document.getElementById("html-preview-title") as HTMLElement;
 const htmlPreviewFrameEl = document.getElementById("html-preview-frame") as HTMLIFrameElement;
@@ -217,6 +233,7 @@ let slopHandle: TerminalHandle | null = null;
 let slopTerminalStarting: Promise<TerminalHandle> | null = null;
 let writer!: TermWriter;
 let prompt!: PromptLine;
+let mobileCommands!: MobileCommandUi;
 let markdown!: AssistantMarkdown;
 let spinner!: Spinner;
 
@@ -2046,6 +2063,16 @@ async function main() {
 
   mount.addEventListener("click", () => term.focus());
 
+  mobileCommands = new MobileCommandUi({
+    layer: mobileCommandLayerEl,
+    drawer: mobileCommandDrawerEl,
+    backdrop: mobileCommandBackdropEl,
+    trigger: mobileCommandTriggerEl,
+    close: mobileCommandCloseEl,
+    title: mobileCommandTitleEl,
+    content: mobileCommandContentEl,
+    onCommand: (command) => prompt.submitExternal(command),
+  });
   prompt = new PromptLine({
     writer,
     onSubmit,
@@ -2053,6 +2080,7 @@ async function main() {
     onCycleThinking: cycleThinkingLevel,
     commands: COMMANDS,
     commandMenu: commandMenuEl,
+    mobilePrompt: mobileCommands,
   });
   term.onData((data: string) => inputHandler(data));
 

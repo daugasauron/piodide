@@ -47,7 +47,8 @@ npm run docs:screenshots
 ```
 
 Set `DOCS_SCREENSHOT_URL` or `CHROME_BIN` to override the defaults. The script
-uses an isolated temporary Chrome profile and writes to `screens/`.
+uses an isolated temporary Chrome profile, validates the mobile GLM login flow,
+and writes to `screens/`.
 
 ## GitHub Pages
 

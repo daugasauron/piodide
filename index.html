@@ -2,7 +2,10 @@
 <html lang="en">
   <head>
     <meta charset="UTF-8" />
-    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta
+      name="viewport"
+      content="width=device-width, initial-scale=1.0, viewport-fit=cover"
+    />
     <title>piodide</title>
   </head>
   <body>
@@ -46,6 +49,36 @@
       </div>
     </footer>
     <div id="status" hidden></div>
+    <button
+      id="mobile-command-trigger"
+      type="button"
+      aria-label="Open commands"
+      aria-controls="mobile-command-drawer"
+      hidden
+    >
+      /
+    </button>
+    <div id="mobile-command-layer" aria-hidden="true">
+      <button
+        id="mobile-command-backdrop"
+        type="button"
+        aria-label="Close commands"
+      ></button>
+      <aside
+        id="mobile-command-drawer"
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby="mobile-command-title"
+      >
+        <header id="mobile-command-header">
+          <span id="mobile-command-title">Commands</span>
+          <button id="mobile-command-close" type="button" aria-label="Close commands">
+            ×
+          </button>
+        </header>
+        <div id="mobile-command-content"></div>
+      </aside>
+    </div>
     <script type="module" src="/src/main.ts"></script>
   </body>
 </html>
