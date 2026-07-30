@@ -1,5 +1,6 @@
 import * as monaco from "monaco-editor";
 import EditorWorker from "monaco-editor/esm/vs/editor/editor.worker?worker";
+import neovimWorkerSource from "../node_modules/@monaco-neovim-wasm/lib/dist/nvimWorkerAsyncify.worker.js?raw";
 import {
   createMonacoNeovim,
   type MonacoNeovimClient,
@@ -382,6 +383,8 @@ export async function createNeovimController(
   );
   let commandText: string | null = null;
   let messageText: string | null = null;
+  let clientActive = true;
+  let startupFailure = "";
 
   defineTheme();
   const model = monaco.editor.createModel("", "markdown");
@@ -411,6 +414,9 @@ export async function createNeovimController(
     commandline.textContent = value;
     commandline.classList.toggle("visible", value.length > 0);
   };
+  const reportClientStatus = (message: string, warning = false) => {
+    if (clientActive) setStatus(message, warning);
+  };
 
   const readmePath = `${PY_ROOT}/README.md`;
   const startPath = initialTree.files.includes(readmePath)
@@ -432,8 +438,24 @@ export async function createNeovimController(
     vim.cmd("syntax enable")
   `;
 
+  const workerUrl = URL.createObjectURL(
+    new Blob([neovimWorkerSource], { type: "text/javascript" }),
+  );
+  let worker: Worker;
+  try {
+    worker = new Worker(workerUrl, { type: "module" });
+  } catch (error) {
+    URL.revokeObjectURL(workerUrl);
+    editor.dispose();
+    model.dispose();
+    throw error;
+  }
+
   let client: MonacoNeovimClient;
   client = createMonacoNeovim(editor, {
+    // Keep the worker entry out of the COI service-worker fetch path. The
+    // worker still fetches the large WASM/runtime assets by their normal URLs.
+    worker,
     env: { PWD: pyodideCwd(py) },
     inputMode: "message",
     hostCommands: true,
@@ -456,12 +478,26 @@ export async function createNeovimController(
       readText: () => navigator.clipboard.readText(),
       writeText: (text) => navigator.clipboard.writeText(text),
     },
-    status: (text, warn) => setStatus(text, warn),
-    onStartError: (message) => setStatus(message || "Neovim failed to start", true),
-    onWarning: (message) => setStatus(message, true),
-    onExit: (code, stderr) =>
-      setStatus(`Neovim exited (${code})${stderr ? `: ${stderr}` : ""}`, true),
-    onModeChange: (mode) => setStatus(`${mode} · Ctrl+Shift+E toggles agent`),
+    status: reportClientStatus,
+    onStartError: (message) => {
+      const reason = message?.trim().split(/\r?\n/, 1)[0] || "";
+      startupFailure =
+        reason === "worker error"
+          ? "Neovim worker failed to load"
+          : reason || "Neovim failed to start";
+      reportClientStatus(startupFailure, true);
+    },
+    onWarning: (message) => reportClientStatus(message, true),
+    onExit: (code, stderr) => {
+      const detail = stderr?.trim() || "";
+      if (code !== 0 && detail && !startupFailure) startupFailure = detail;
+      reportClientStatus(
+        `Neovim exited (${code})${detail ? `: ${detail}` : ""}`,
+        code !== 0,
+      );
+    },
+    onModeChange: (mode) =>
+      reportClientStatus(`${mode} · Ctrl+Shift+E toggles agent`),
     onCmdline: (text) => {
       commandText = text;
       renderCommandline();
@@ -491,10 +527,15 @@ export async function createNeovimController(
     const hasExplore = await client.call<number>("nvim_eval", ["exists(':Explore')"]);
     if (Number(hasExplore) !== 2) throw new Error("the :Ex browser did not register");
   } catch (error) {
+    clientActive = false;
     client.dispose();
     editor.dispose();
     model.dispose();
-    throw error;
+    const message =
+      startupFailure || (error instanceof Error ? error.message : String(error));
+    throw new Error(message, { cause: error });
+  } finally {
+    URL.revokeObjectURL(workerUrl);
   }
 
   setStatus(

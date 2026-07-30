@@ -59,10 +59,38 @@ test("COI service worker bypasses cross-origin response streams", () => {
   assert.equal(fetchCalls, 0);
 });
 
-test("COI service worker adds isolation headers to same-origin responses", async () => {
-  let intercepted: Promise<Response> | undefined;
+test("COI service worker bypasses same-origin subresources", () => {
+  let intercepted = false;
   onFetch({
     request: new Request("https://piodide.test/assets/runner.worker.js"),
+    respondWith() {
+      intercepted = true;
+    },
+  });
+
+  assert.equal(intercepted, false);
+  assert.equal(fetchCalls, 0);
+});
+
+function navigationRequest(url = "https://piodide.test/"): Request {
+  return {
+    url,
+    mode: "navigate",
+  } as Request;
+}
+
+function workerRequest(url = "https://piodide.test/assets/runner.worker.js"): Request {
+  return {
+    url,
+    mode: "same-origin",
+    destination: "worker",
+  } as Request;
+}
+
+test("COI service worker adds isolation headers to same-origin navigations", async () => {
+  let intercepted: Promise<Response> | undefined;
+  onFetch({
+    request: navigationRequest(),
     respondWith(response) {
       intercepted = response;
     },
@@ -76,13 +104,29 @@ test("COI service worker adds isolation headers to same-origin responses", async
   assert.equal(await response.text(), "ok");
 });
 
-test("COI service worker does not duplicate a failed request", async () => {
+test("COI service worker adds isolation headers to same-origin worker scripts", async () => {
+  let intercepted: Promise<Response> | undefined;
+  onFetch({
+    request: workerRequest(),
+    respondWith(response) {
+      intercepted = response;
+    },
+  });
+
+  assert.ok(intercepted);
+  const response = await intercepted;
+  assert.equal(fetchCalls, 1);
+  assert.equal(response.headers.get("cross-origin-opener-policy"), "same-origin");
+  assert.equal(response.headers.get("cross-origin-embedder-policy"), "credentialless");
+});
+
+test("COI service worker does not duplicate a failed navigation", async () => {
   fetchImpl = async () => {
     throw new Error("network failed");
   };
   let intercepted: Promise<Response> | undefined;
   onFetch({
-    request: new Request("https://piodide.test/assets/runner.worker.js"),
+    request: navigationRequest(),
     respondWith(response) {
       intercepted = response;
     },

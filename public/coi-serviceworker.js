@@ -9,13 +9,18 @@ self.addEventListener("install", () => self.skipWaiting());
 self.addEventListener("activate", (event) => event.waitUntil(self.clients.claim()));
 
 self.addEventListener("fetch", (event) => {
-  // Cross-origin streams (including the loopback Codex proxy) must bypass the
-  // worker. Firefox can otherwise fail while transferring their response
-  // bodies through a synthetic Response.
-  if (new URL(event.request.url).origin !== self.location.origin) return;
-  if (event.request.cache === "only-if-cached" && event.request.mode !== "same-origin") {
+  // Only documents and dedicated worker entry scripts need isolation headers.
+  // Leave WASM, runtime archives, streams, and other subresources on the
+  // browser's direct fetch path; wrapping them is unnecessary and fragile in
+  // Firefox.
+  if (
+    event.request.mode !== "navigate" &&
+    event.request.destination !== "worker" &&
+    event.request.destination !== "sharedworker"
+  ) {
     return;
   }
+  if (new URL(event.request.url).origin !== self.location.origin) return;
   event.respondWith(
     fetch(event.request).then((response) => {
       if (response.status === 0 || response.type === "opaque") return response;

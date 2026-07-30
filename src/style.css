@@ -21,22 +21,26 @@ body {
 }
 
 #agent-view,
+#slop-view,
 #neovim-view {
   width: 100%;
   height: calc(100% - var(--footer-height));
 }
 
 #agent-view[hidden],
+#slop-view[hidden],
 #neovim-view[hidden] {
   display: none;
 }
 
-#terminal {
+#terminal,
+#slop-terminal {
   width: 100%;
   height: 100%;
 }
 
-#terminal canvas {
+#terminal canvas,
+#slop-terminal canvas {
   display: block;
 }
 

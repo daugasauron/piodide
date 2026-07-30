@@ -155,6 +155,8 @@ const COMMANDS: readonly CommandSuggestion[] = [
 
 const mount = document.getElementById("terminal") as HTMLElement;
 const agentViewEl = document.getElementById("agent-view") as HTMLElement;
+const slopViewEl = document.getElementById("slop-view") as HTMLElement;
+const slopMountEl = document.getElementById("slop-terminal") as HTMLElement;
 const neovimViewEl = document.getElementById("neovim-view") as HTMLElement;
 const neovimEditorEl = document.getElementById("neovim-editor") as HTMLElement;
 const neovimCommandlineEl = document.getElementById("neovim-commandline") as HTMLElement;
@@ -170,6 +172,8 @@ const footerModelEl = document.getElementById("footer-model") as HTMLElement;
 const statusEl = document.getElementById("status") as HTMLElement;
 
 let handle!: TerminalHandle;
+let slopHandle: TerminalHandle | null = null;
+let slopTerminalStarting: Promise<TerminalHandle> | null = null;
 let writer!: TermWriter;
 let prompt!: PromptLine;
 let markdown!: AssistantMarkdown;
@@ -466,6 +470,7 @@ async function getNeovim(): Promise<NeovimController> {
 
 async function toggleNeovim() {
   if (viewToggleRunning) return;
+  if (activeView === "slop") return;
   if (activeView === "agent" && (!pyReady || !py)) {
     footerLocationEl.textContent = "Neovim will be available when Python is ready";
     window.setTimeout(renderFooter, 1500);
@@ -516,10 +521,19 @@ async function toggleNeovim() {
       handle.term.focus();
     });
   } catch (error) {
-    setNeovimStatus(
-      `failed: ${error instanceof Error ? error.message : String(error)}`,
-      true,
-    );
+    const message = error instanceof Error ? error.message : String(error);
+    setNeovimStatus(`failed: ${message}`, true);
+    if (!neovim) {
+      activeView = "agent";
+      neovimViewEl.hidden = true;
+      agentViewEl.hidden = false;
+      renderFooter();
+      say(red(`  Neovim failed to start: ${message}`));
+      requestAnimationFrame(() => {
+        handle.fit.fit();
+        handle.term.focus();
+      });
+    }
   } finally {
     viewToggleRunning = false;
   }
@@ -530,58 +544,107 @@ async function toggleNeovim() {
 /* ------------------------------------------------------------------ */
 
 async function toggleSlop() {
-  if (activeView === "slop") {
-    activeView = "agent";
-    inputHandler = (data) => prompt.feed(data);
-    renderFooter();
-    say(dim("  — agent view · Ctrl+Shift+S returns to slop —"));
-    if (!prompt.isOccupied()) prompt.start();
-    return;
-  }
-  if (activeView !== "agent") return;
-  if (!pyReady || !py) {
-    footerLocationEl.textContent = "slop will be available when Python is ready";
-    window.setTimeout(renderFooter, 1500);
-    return;
-  }
-  if (prompt.isOccupied()) {
-    footerLocationEl.textContent = "Finish the current run or menu before opening slop";
-    window.setTimeout(renderFooter, 1500);
-    return;
-  }
-  if (!supportsWorkerWasi()) {
-    say(yellow("  slop needs cross-origin isolation (npm run dev / vite preview / coi service worker)"));
-    return;
-  }
-
-  activeView = "slop";
-  renderFooter();
-  if (!slop || !slop.alive) {
-    slop = new SlopSession({
-      py,
-      writeOut: writeProgramOutput,
-      note: (text) => say(dim(text)),
-      onExit: () => {
-        if (activeView === "slop") {
-          activeView = "agent";
-          inputHandler = (data) => prompt.feed(data);
-          renderFooter();
-          if (!prompt.isOccupied()) prompt.start();
-        }
-      },
-    });
-    try {
-      await slop.start();
-    } catch (error) {
+  if (viewToggleRunning) return;
+  viewToggleRunning = true;
+  try {
+    if (activeView === "slop") {
       activeView = "agent";
+      slopViewEl.hidden = true;
+      agentViewEl.hidden = false;
       renderFooter();
-      say(red(`  slop failed to start: ${error instanceof Error ? error.message : String(error)}`));
+      requestAnimationFrame(() => {
+        handle.fit.fit();
+        handle.term.focus();
+      });
       return;
     }
-  } else {
-    say(dim("  — slop shell · Ctrl+Shift+S returns to the agent —"));
+    if (activeView !== "agent") return;
+    if (!pyReady || !py) {
+      footerLocationEl.textContent = "slop will be available when Python is ready";
+      window.setTimeout(renderFooter, 1500);
+      return;
+    }
+    if (prompt.isOccupied()) {
+      footerLocationEl.textContent = "Finish the current run or menu before opening slop";
+      window.setTimeout(renderFooter, 1500);
+      return;
+    }
+    if (!supportsWorkerWasi()) {
+      say(
+        yellow(
+          "  slop needs cross-origin isolation (npm run dev / vite preview / coi service worker)",
+        ),
+      );
+      return;
+    }
+
+    activeView = "slop";
+    agentViewEl.hidden = true;
+    slopViewEl.hidden = false;
+    renderFooter();
+
+    const terminal = await getSlopTerminal();
+    if (!slop || !slop.alive) {
+      slop = new SlopSession({
+        py,
+        writeOut: writeSlopOutput,
+        note: writeSlopNote,
+        onExit: () => {
+          if (activeView === "slop") {
+            activeView = "agent";
+            slopViewEl.hidden = true;
+            agentViewEl.hidden = false;
+            renderFooter();
+            requestAnimationFrame(() => {
+              handle.fit.fit();
+              handle.term.focus();
+            });
+          }
+        },
+      });
+      await slop.start();
+    }
+    requestAnimationFrame(() => {
+      terminal.fit.fit();
+      terminal.term.focus();
+    });
+  } catch (error) {
+    activeView = "agent";
+    slopViewEl.hidden = true;
+    agentViewEl.hidden = false;
+    renderFooter();
+    say(
+      red(
+        `  slop failed to start: ${error instanceof Error ? error.message : String(error)}`,
+      ),
+    );
+    if (!prompt.isOccupied()) prompt.start();
+    requestAnimationFrame(() => {
+      handle.fit.fit();
+      handle.term.focus();
+    });
+  } finally {
+    viewToggleRunning = false;
   }
-  inputHandler = (data) => slop!.feed(data);
+}
+
+async function getSlopTerminal(): Promise<TerminalHandle> {
+  if (slopHandle) return slopHandle;
+  if (!slopTerminalStarting) {
+    slopTerminalStarting = createTerminal(slopMountEl)
+      .then((terminal) => {
+        slopHandle = terminal;
+        slopMountEl.addEventListener("click", () => terminal.term.focus());
+        terminal.term.onData((data: string) => {
+          if (activeView === "slop") slop?.feed(data);
+        });
+        return terminal;
+      })
+      .finally(() => {
+        slopTerminalStarting = null;
+      });
+  }
+  return slopTerminalStarting;
 }
 
 /* ------------------------------------------------------------------ */
@@ -673,6 +736,18 @@ function splitArgs(input: string): string[] {
 
 function writeProgramOutput(text: string) {
   writer.write(text.replaceAll("\r\n", "\n").replaceAll("\n", "\r\n"));
+}
+
+function writeSlopOutput(text: string) {
+  slopHandle?.writer.write(
+    text.replaceAll("\r\n", "\n").replaceAll("\n", "\r\n"),
+  );
+}
+
+function writeSlopNote(text: string) {
+  if (!slopHandle) return;
+  slopHandle.writer.ensureNewline();
+  slopHandle.writer.writeln(dim(text));
 }
 
 async function runInteractive(argline: string) {
@@ -1710,8 +1785,15 @@ async function main() {
           writer,
           run: (text: string) => handleSubmit(text),
           toggleEditor: () => toggleNeovim(),
+          toggleSlop: () => toggleSlop(),
           get neovim() {
             return neovim;
+          },
+          get slop() {
+            return slop;
+          },
+          get slopTerminal() {
+            return slopHandle;
           },
           get view() {
             return activeView;

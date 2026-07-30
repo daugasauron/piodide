@@ -14,6 +14,7 @@ const DIM = "\x1b[2m";
 const CYAN = "\x1b[36m";
 const GREEN = "\x1b[32m";
 const SPINNER_FRAMES = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+let terminalInitPromise: Promise<void> | null = null;
 
 const THEME: ITheme = {
   background: "#0b0c10",
@@ -149,7 +150,13 @@ function makeKittyImagesFollowScrollback(term: Terminal): void {
 
 export async function createTerminal(mount: HTMLElement): Promise<TerminalHandle> {
   await document.fonts.load(`${FONT_SIZE}px ${FONT_FAMILY}`);
-  await init();
+  if (!terminalInitPromise) {
+    terminalInitPromise = init();
+    terminalInitPromise.catch(() => {
+      terminalInitPromise = null;
+    });
+  }
+  await terminalInitPromise;
   const term = new Terminal({
     fontSize: FONT_SIZE,
     fontFamily: `${FONT_FAMILY}, monospace`,
