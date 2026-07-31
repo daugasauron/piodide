@@ -1,717 +1,1038 @@
 /*
- * slop — the piodide shell.
+ * slop - a small build-oriented shell for the piodide browser runtime.
  *
- * A minimal bash-ish REPL running as a WASI program against the live
- * Pyodide filesystem. External commands are other programs found on $PATH
- * (/bin only); they are started through the host's "piodide" spawn import,
- * which runs them as siblings and reports the exit code.
- *
- *   builtins:  cd, pwd, exit, help
- *   pipes:     cat file.txt | grep something | grep -v noise
- *   lists:     cmd && next, cmd || fallback, cmd ; next
- *   redirects: cmd > file (truncate), cmd >> file (append)
- *   expansion: $VAR, ${VAR}, $?, \$ (single quotes inhibit)
- *   pseudo:    cc/compile, ld/link (routed to the in-browser clang toolchain)
+ * This is intentionally not a complete POSIX shell. It provides the pieces
+ * that matter most for interactive work and build recipes: scripts and -c,
+ * quoting and parameter expansion, globbing, command lists, buffered pipes,
+ * redirects, useful builtins, and line-oriented if/for/while blocks.
  */
+#define _GNU_SOURCE
+#include <ctype.h>
 #include <errno.h>
+#include <glob.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
 #include <unistd.h>
 
-/* Spawn ABI v2: stdio routing for the child. Fields are read by the host. */
+/* Spawn ABI v2, implemented by the browser host. */
 typedef struct {
-  const char *stdin_data; /* NULL = shared session input (the tty) */
+  const char *stdin_data;
   int stdin_len;
-  char *capture;          /* NULL = stdout goes to the terminal or out_file */
+  char *capture;
   int capture_cap;
-  int *capture_len;       /* out: total stdout bytes (pre-truncation) */
-  const char *out_file;   /* NULL or absolute path for stdout */
+  int *capture_len;
+  const char *out_file;
   int out_append;
+  const char *env_data; /* NUL-separated KEY=VALUE entries */
+  int env_len;
 } slop_io;
 
-__attribute__((import_module("piodide"), import_name("spawn")))
+/* Linked against spawn_stub.c, then rewritten to the piodide.spawn import. */
 extern int piodide_spawn(const char *path, const char *argv_blob, const char *cwd,
                          slop_io *io);
 
-#define SLOP_MAX_ARGS 64
-#define SLOP_MAX_CMDS 16
-#define SLOP_MAX_LISTS 32
-#define SLOP_LINE 4096
-#define SLOP_PATH 4096
+#define MAX_ARGS 128
+#define MAX_CMDS 32
+#define MAX_LISTS 128
+#define MAX_LINES 4096
+#define LINE_CAP 65536
+#define PATH_CAP 4096
 #define PIPE_CAP (1024 * 1024)
+#define SCRIPT_CAP (2 * 1024 * 1024)
+#define LOOP_LIMIT 10000
+#define ENV_CAP 65536
 
-static char cwd[SLOP_PATH] = "/home/web";
-static int last_exit = 0;
-static char pipe_a[PIPE_CAP];
-static char pipe_b[PIPE_CAP];
+typedef struct { char *s; size_t len, cap; } Buf;
+typedef struct { char *text; int quoted; } Token;
+typedef struct {
+  char *argv[MAX_ARGS];
+  int argc;
+  char *in_file;
+  char *out_file;
+  int append;
+} Command;
+typedef enum { COND_ALWAYS, COND_AND, COND_OR } Condition;
+typedef struct { char *text; Condition condition; } ListItem;
 
-static void print_help(FILE *out) {
-  fprintf(out, "slop — the piodide shell\n");
-  fprintf(out, "  builtins:  cd [dir]   pwd   exit   help\n");
-  fprintf(out, "  commands:  ls cat grep echo env fd-find (exact name, first hit on $PATH=/bin)\n");
-  fprintf(out, "  pipes:     cat f.txt | grep x | grep -v y      redirects: cmd > f  cmd >> f\n");
-  fprintf(out, "  lists:     cmd && next   cmd || fallback   cmd ; next\n");
-  fprintf(out, "  expansion: $VAR ${VAR} $? \\$ ('...' inhibits)\n");
-  fprintf(out, "  toolchain: cc -c [flags] file.c -o file.o   ld [flags] file.o -o app.wasm\n");
-  fprintf(out, "             aliases: compile = cc, link = ld; run `cc --help` / `ld --help`\n");
-  fprintf(out, "  keys:      Ctrl+C kill child / cancel line · Ctrl+D exit shell / EOF\n");
-  fprintf(out, "files are the live Pyodide filesystem: Python, the agent and Neovim\n");
-  fprintf(out, "see everything you create immediately. Spawned programs inherit this cwd.\n");
+static char cwd[PATH_CAP] = "/home/web";
+static int last_status;
+static int shell_argc;
+static char **shell_argv;
+static const char *shell_name = "slop";
+static int exit_requested;
+static int exit_status;
+static int flow_signal; /* 1 break, 2 continue */
+static int option_errexit, option_xtrace;
+static int suppress_errexit;
+static int capture_active, capture_length;
+static char *capture_buffer;
+static char parse_error[256];
+static char *pipe_a, *pipe_b, *redirect_input, *spawn_env;
+
+static int execute_script(char *text);
+static int execute_command_list(char *line);
+
+static void *xmalloc(size_t n) {
+  void *p = malloc(n ? n : 1);
+  if (!p) { fprintf(stderr, "slop: out of memory\n"); exit(2); }
+  return p;
 }
 
-/* ------------------------------ path utils ------------------------------ */
+static char *xstrdup(const char *s) {
+  char *p = strdup(s ? s : "");
+  if (!p) { fprintf(stderr, "slop: out of memory\n"); exit(2); }
+  return p;
+}
+
+static void binit(Buf *b) {
+  b->cap = 128; b->len = 0; b->s = xmalloc(b->cap); b->s[0] = 0;
+}
+
+static void bgrow(Buf *b, size_t add) {
+  if (b->len + add + 1 <= b->cap) return;
+  while (b->len + add + 1 > b->cap) {
+    if (b->cap >= SCRIPT_CAP * 8u) {
+      fprintf(stderr, "slop: expansion is too large\n"); exit(2);
+    }
+    b->cap *= 2;
+  }
+  b->s = realloc(b->s, b->cap);
+  if (!b->s) { fprintf(stderr, "slop: out of memory\n"); exit(2); }
+}
+
+static void bputn(Buf *b, const char *s, size_t n) {
+  bgrow(b, n); memcpy(b->s + b->len, s, n); b->len += n; b->s[b->len] = 0;
+}
+static void bputs(Buf *b, const char *s) { bputn(b, s, strlen(s)); }
+static void bputc(Buf *b, char c) { bputn(b, &c, 1); }
+
+static char *trim(char *s) {
+  while (isspace((unsigned char)*s)) s++;
+  char *e = s + strlen(s);
+  while (e > s && isspace((unsigned char)e[-1])) *--e = 0;
+  return s;
+}
+
+static int valid_name_n(const char *s, size_t n) {
+  if (!n || !(s[0] == '_' || isalpha((unsigned char)s[0]))) return 0;
+  for (size_t i = 1; i < n; i++)
+    if (!(s[i] == '_' || isalnum((unsigned char)s[i]))) return 0;
+  return 1;
+}
+
+static int assignment_word(const char *s, const char **eq_out) {
+  const char *eq = strchr(s, '=');
+  if (!eq || !valid_name_n(s, (size_t)(eq - s))) return 0;
+  if (eq_out) *eq_out = eq;
+  return 1;
+}
+
+/* ----------------------------- path handling ----------------------------- */
 
 static void normalize(char *path) {
-  char *copy = strdup(path);
-  char *parts[512];
+  char *copy = xstrdup(path), *parts[512];
   int n = 0;
-  for (char *tok = strtok(copy, "/"); tok && n < 512; tok = strtok(NULL, "/")) {
-    if (strcmp(tok, ".") == 0) continue;
-    if (strcmp(tok, "..") == 0) {
-      if (n > 0) n--;
-      continue;
-    }
-    parts[n++] = tok;
+  for (char *p = strtok(copy, "/"); p && n < 512; p = strtok(NULL, "/")) {
+    if (!strcmp(p, ".")) continue;
+    if (!strcmp(p, "..")) { if (n) n--; continue; }
+    parts[n++] = p;
   }
-  char *out = path;
-  *out++ = '/';
+  char *o = path; *o++ = '/';
   for (int i = 0; i < n; i++) {
-    size_t len = strlen(parts[i]);
-    memcpy(out, parts[i], len);
-    out += len;
-    if (i < n - 1) *out++ = '/';
+    size_t z = strlen(parts[i]); memcpy(o, parts[i], z); o += z;
+    if (i + 1 < n) *o++ = '/';
   }
-  *out = '\0';
-  free(copy);
+  *o = 0; free(copy);
 }
 
-static void resolve(const char *in, char *out) {
-  if (in[0] == '/') snprintf(out, SLOP_PATH, "%s", in);
-  else if (strcmp(cwd, "/") == 0) snprintf(out, SLOP_PATH, "/%s", in);
-  else snprintf(out, SLOP_PATH, "%s/%s", cwd, in);
-  normalize(out);
+static int resolve_path(const char *in, char *out) {
+  int rc;
+  if (!in || !*in) return 0;
+  if (*in == '/') rc = snprintf(out, PATH_CAP, "%s", in);
+  else if (!strcmp(cwd, "/")) rc = snprintf(out, PATH_CAP, "/%s", in);
+  else rc = snprintf(out, PATH_CAP, "%s/%s", cwd, in);
+  if (rc < 0 || rc >= PATH_CAP) return 0;
+  normalize(out); return 1;
 }
 
 static int is_dir(const char *path) {
-  struct stat st;
-  return stat(path, &st) == 0 && S_ISDIR(st.st_mode);
+  struct stat st; return stat(path, &st) == 0 && S_ISDIR(st.st_mode);
 }
-
 static int is_reg(const char *path) {
-  struct stat st;
-  return stat(path, &st) == 0 && S_ISREG(st.st_mode);
+  struct stat st; return stat(path, &st) == 0 && S_ISREG(st.st_mode);
 }
 
-/* ------------------------------ tokenizer ------------------------------- */
-
-/*
- * Produces malloc'd tokens. Operators |, >, >> become their own tokens even
- * when glued to words. $VAR, ${VAR} and $? expand outside single quotes;
- * \$ is a literal $. Unterminated quotes are an error (tok_err).
- */
-static char tok_err[128];
-
-static void buf_putc(char **buf, size_t *len, size_t *cap, char c) {
-  if (*len + 1 >= *cap) {
-    *cap *= 2;
-    *buf = realloc(*buf, *cap);
+static int find_command(const char *name, char *out) {
+  if (strchr(name, '/')) return resolve_path(name, out) && is_reg(out);
+  const char *path = getenv("PATH");
+  if (!path || !*path) path = "/bin";
+  char *copy = xstrdup(path);
+  int found = 0;
+  for (char *d = strtok(copy, ":"); d && !found; d = strtok(NULL, ":")) {
+    if (*d == '/') snprintf(out, PATH_CAP, "%s/%s", d, name);
+    else snprintf(out, PATH_CAP, "%s/%s/%s", cwd, d, name);
+    normalize(out);
+    if (is_reg(out)) found = 1;
   }
-  (*buf)[(*len)++] = c;
+  free(copy); return found;
 }
 
-static void buf_puts(char **buf, size_t *len, size_t *cap, const char *s) {
-  while (*s) buf_putc(buf, len, cap, *s++);
+/* ------------------------- expansion and tokenizer ----------------------- */
+
+static const char *positional(int index) {
+  if (index == 0) return shell_name;
+  return index > 0 && index <= shell_argc ? shell_argv[index - 1] : "";
 }
 
-static void expand_var(char **buf, size_t *len, size_t *cap, char **pp, int expand) {
-  char name[128];
-  size_t n = 0;
-  char *p = *pp;
+static void expand_text(Buf *out, const char *text, int depth);
+static char *capture_command(const char *text);
+
+static void append_all_args(Buf *out) {
+  for (int i = 0; i < shell_argc; i++) {
+    if (i) bputc(out, ' ');
+    bputs(out, shell_argv[i]);
+  }
+}
+
+static void expand_parameter(Buf *out, const char **pp, int depth) {
+  const char *p = *pp;
+  char temp[64], name[128];
+  const char *value = "";
   if (*p == '?') {
-    p++;
-    if (expand) {
-      char tmp[16];
-      snprintf(tmp, sizeof tmp, "%d", last_exit);
-      buf_puts(buf, len, cap, tmp);
-    } else {
-      buf_putc(buf, len, cap, 'x');
-    }
+    snprintf(temp, sizeof temp, "%d", last_status); value = temp; p++;
+  } else if (*p == '#') {
+    snprintf(temp, sizeof temp, "%d", shell_argc); value = temp; p++;
+  } else if (*p == '*' || *p == '@') {
+    append_all_args(out); p++; *pp = p; return;
+  } else if (isdigit((unsigned char)*p)) {
+    int n = 0; while (isdigit((unsigned char)*p)) n = n * 10 + (*p++ - '0');
+    value = positional(n);
   } else if (*p == '{') {
     p++;
-    while (*p && *p != '}' && n + 1 < sizeof name) name[n++] = *p++;
-    if (*p != '}') {
-      snprintf(tok_err, sizeof tok_err, "unterminated ${...}");
-    } else {
-      p++;
+    const char *start = p;
+    while (*p && *p != '}' && *p != ':' && *p != '-' && *p != '+' &&
+           *p != '=' && *p != '?') p++;
+    size_t n = (size_t)(p - start);
+    if (n >= sizeof name) n = sizeof name - 1;
+    memcpy(name, start, n); name[n] = 0;
+    int colon = 0; char op = 0;
+    if (*p == ':') { colon = 1; p++; }
+    if (strchr("-+=?", *p)) op = *p++;
+    const char *alt_start = p;
+    while (*p && *p != '}') p++;
+    if (*p != '}') { snprintf(parse_error, sizeof parse_error, "unterminated ${...}"); *pp = p; return; }
+    size_t alt_len = (size_t)(p - alt_start); p++;
+
+    if (name[0] && strspn(name, "0123456789") == strlen(name)) value = positional(atoi(name));
+    else if (!strcmp(name, "#")) { snprintf(temp, sizeof temp, "%d", shell_argc); value = temp; }
+    else { const char *v = getenv(name); value = v ? v : ""; }
+    int set = getenv(name) != NULL;
+    if (name[0] && isdigit((unsigned char)name[0])) set = atoi(name) <= shell_argc;
+    int missing = !set || (colon && !*value);
+    int use_alt = (op == '-' && missing) || (op == '+' && !missing);
+    if (op == '=' && missing) {
+      char *alt = xmalloc(alt_len + 1); memcpy(alt, alt_start, alt_len); alt[alt_len] = 0;
+      Buf expanded; binit(&expanded); expand_text(&expanded, alt, depth + 1);
+      if (valid_name_n(name, strlen(name))) setenv(name, expanded.s, 1);
+      value = valid_name_n(name, strlen(name)) ? getenv(name) : expanded.s;
+      bputs(out, value ? value : ""); free(expanded.s); free(alt); *pp = p; return;
     }
-  } else {
-    if (!(*p == '_' || (*p >= 'a' && *p <= 'z') || (*p >= 'A' && *p <= 'Z'))) {
-      buf_putc(buf, len, cap, '$'); /* lone $ */
-      *pp = p;
-      return;
+    if (op == '?' && missing) {
+      char *msg = xmalloc(alt_len + 1); memcpy(msg, alt_start, alt_len); msg[alt_len] = 0;
+      snprintf(parse_error, sizeof parse_error, "%s: %s", name, *msg ? msg : "parameter not set");
+      free(msg); *pp = p; return;
     }
-    while (*p == '_' || (*p >= 'a' && *p <= 'z') || (*p >= 'A' && *p <= 'Z') ||
-           (*p >= '0' && *p <= '9')) {
+    if (use_alt) {
+      char *alt = xmalloc(alt_len + 1); memcpy(alt, alt_start, alt_len); alt[alt_len] = 0;
+      expand_text(out, alt, depth + 1); free(alt);
+    } else if (!(op == '+' && missing)) bputs(out, value);
+    *pp = p; return;
+  } else if (*p == '_' || isalpha((unsigned char)*p)) {
+    size_t n = 0;
+    while (*p == '_' || isalnum((unsigned char)*p)) {
       if (n + 1 < sizeof name) name[n++] = *p;
       p++;
     }
-  }
-  name[n] = '\0';
-  if (expand) {
-    const char *value = getenv(name);
-    if (value) buf_puts(buf, len, cap, value);
+    name[n] = 0; const char *v = getenv(name); value = v ? v : "";
   } else {
-    buf_putc(buf, len, cap, 'x');
+    bputc(out, '$'); *pp = p; return;
   }
-  *pp = p;
+  bputs(out, value); *pp = p;
 }
 
-static char *next_token(char **pp, int expand) {
-  char *p = *pp;
-  while (*p == ' ' || *p == '\t' || *p == '\r' || *p == '\n') p++;
-  if (!*p) {
-    *pp = p;
-    return NULL;
+static void expand_substitution(Buf *out, const char **pp) {
+  const char *p = *pp;
+  if (*p != '(') return;
+  const char *start = ++p; int level = 1, sq = 0, dq = 0;
+  while (*p && level) {
+    if (*p == '\\' && p[1]) { p += 2; continue; }
+    if (*p == '\'' && !dq) sq = !sq;
+    else if (*p == '"' && !sq) dq = !dq;
+    else if (!sq && !dq && *p == '(') level++;
+    else if (!sq && !dq && *p == ')') level--;
+    if (level) p++;
   }
-  if (*p == '|' || *p == '>') {
-    char op[3] = {*p, 0, 0};
-    if (*p == '>' && p[1] == '>') {
-      op[1] = '>';
+  if (level) { snprintf(parse_error, sizeof parse_error, "unterminated command substitution"); *pp = p; return; }
+  size_t n = (size_t)(p - start); char *cmd = xmalloc(n + 1);
+  memcpy(cmd, start, n); cmd[n] = 0; p++;
+  char *value = capture_command(cmd);
+  if (value) { bputs(out, value); free(value); }
+  free(cmd); *pp = p;
+}
+
+static void expand_text(Buf *out, const char *text, int depth) {
+  if (depth > 32) { snprintf(parse_error, sizeof parse_error, "expansion is too deeply nested"); return; }
+  const char *p = text;
+  while (*p) {
+    if (*p == '$') {
       p++;
-    }
-    p++;
-    *pp = p;
-    return strdup(op);
+      if (*p == '$') { bputc(out, '$'); p++; }
+      else if (*p == '(') expand_substitution(out, &p);
+      else expand_parameter(out, &p, depth);
+    } else if (*p == '\\' && p[1]) {
+      p++; bputc(out, *p++);
+    } else bputc(out, *p++);
+  }
+}
+
+static int is_operator_char(char c) { return c == '|' || c == '>' || c == '<'; }
+
+static Token next_token(char **pp, int do_expand) {
+  Token t = {0};
+  char *p = *pp;
+  while (isspace((unsigned char)*p)) p++;
+  if (!*p) { *pp = p; return t; }
+  if (is_operator_char(*p)) {
+    char op[3] = {*p, 0, 0};
+    if (*p == '>' && p[1] == '>') { op[1] = '>'; p++; }
+    p++; t.text = xstrdup(op); *pp = p; return t;
   }
 
-  size_t cap = 64, len = 0;
-  char *buf = malloc(cap);
-  int done = 0;
-  while (*p && !done) {
-    char c = *p;
-    if (c == '\'') {
-      p++;
-      while (*p && *p != '\'') buf_putc(&buf, &len, &cap, *p++);
-      if (*p) p++;
-      else snprintf(tok_err, sizeof tok_err, "unterminated ' quote");
-    } else if (c == '"') {
-      p++;
+  Buf b; binit(&b);
+  int at_start = 1;
+  while (*p && !isspace((unsigned char)*p) && !is_operator_char(*p)) {
+    if (*p == '\'') {
+      t.quoted = 1; p++;
+      while (*p && *p != '\'') bputc(&b, *p++);
+      if (*p == '\'') p++; else snprintf(parse_error, sizeof parse_error, "unterminated single quote");
+    } else if (*p == '"') {
+      t.quoted = 1; p++;
       while (*p && *p != '"') {
-        if (*p == '$') {
-          if (p[1] == '$') {
-            buf_putc(&buf, &len, &cap, '$');
-            p += 2;
-          } else {
-            p++;
-            expand_var(&buf, &len, &cap, &p, expand);
-          }
-        } else if (*p == '\\' && p[1] == '$') {
-          buf_putc(&buf, &len, &cap, '$');
-          p += 2;
-        } else {
-          buf_putc(&buf, &len, &cap, *p++);
+        if (*p == '$' && do_expand) {
+          p++;
+          if (*p == '$') { bputc(&b, '$'); p++; }
+          else if (*p == '(') { const char *q = p; expand_substitution(&b, &q); p = (char *)q; }
+          else expand_parameter(&b, (const char **)&p, 0);
+        }
+        else if (*p == '\\' && (p[1] == '$' || p[1] == '"' || p[1] == '\\')) { p++; bputc(&b, *p++); }
+        else bputc(&b, *p++);
+      }
+      if (*p == '"') p++; else snprintf(parse_error, sizeof parse_error, "unterminated double quote");
+    } else if (*p == '\\') {
+      t.quoted = 1; p++;
+      if (*p) bputc(&b, *p++); else snprintf(parse_error, sizeof parse_error, "trailing backslash");
+    } else if (*p == '$' && do_expand) {
+      p++;
+      if (*p == '$') { bputc(&b, '$'); p++; }
+      else if (*p == '(') { const char *q = p; expand_substitution(&b, &q); p = (char *)q; }
+      else expand_parameter(&b, (const char **)&p, 0);
+    } else if (*p == '~' && at_start && do_expand) {
+      const char *home = getenv("HOME"); bputs(&b, home && *home ? home : "/home/web"); p++;
+    } else bputc(&b, *p++);
+    at_start = 0;
+  }
+  t.text = b.s; *pp = p; return t;
+}
+
+static void free_command(Command *c) {
+  for (int i = 0; i < c->argc; i++) free(c->argv[i]);
+  free(c->in_file); free(c->out_file); memset(c, 0, sizeof *c);
+}
+
+static int append_arg(Command *c, char *word) {
+  if (c->argc >= MAX_ARGS - 1) { snprintf(parse_error, sizeof parse_error, "too many arguments"); free(word); return 0; }
+  c->argv[c->argc++] = word; c->argv[c->argc] = NULL; return 1;
+}
+
+static int append_glob(Command *c, Token t) {
+  if (t.quoted || !strpbrk(t.text, "*?[")) return append_arg(c, t.text);
+  char pattern[PATH_CAP];
+  if (!resolve_path(t.text, pattern)) return append_arg(c, t.text);
+  glob_t g; memset(&g, 0, sizeof g);
+  if (glob(pattern, 0, NULL, &g) != 0) { globfree(&g); return append_arg(c, t.text); }
+  int absolute = t.text[0] == '/';
+  size_t prefix = !strcmp(cwd, "/") ? 1 : strlen(cwd) + 1;
+  for (size_t i = 0; i < g.gl_pathc; i++) {
+    const char *name = g.gl_pathv[i];
+    if (!absolute && !strncmp(name, cwd, strlen(cwd)) && name[strlen(cwd)] == '/') name += prefix;
+    if (!append_arg(c, xstrdup(name))) { globfree(&g); free(t.text); return 0; }
+  }
+  globfree(&g); free(t.text); return 1;
+}
+
+static int parse_pipeline(char *text, Command *cmds, int expand) {
+  memset(cmds, 0, MAX_CMDS * sizeof *cmds); parse_error[0] = 0;
+  int n = 0; Command *cur = &cmds[0]; char *p = text;
+  for (;;) {
+    Token t = next_token(&p, expand);
+    if (!t.text) break;
+    if (!strcmp(t.text, "|")) {
+      free(t.text);
+      if (!cur->argc) { snprintf(parse_error, sizeof parse_error, "empty command before |"); return -1; }
+      if (++n >= MAX_CMDS) { snprintf(parse_error, sizeof parse_error, "too many pipeline stages"); return -1; }
+      cur = &cmds[n]; continue;
+    }
+    if (!strcmp(t.text, ">") || !strcmp(t.text, ">>") || !strcmp(t.text, "<")) {
+      int input = t.text[0] == '<', append = t.text[1] == '>'; free(t.text);
+      Token file = next_token(&p, expand);
+      if (!file.text || is_operator_char(file.text[0])) {
+        free(file.text); snprintf(parse_error, sizeof parse_error, "redirect needs a file"); return -1;
+      }
+      if (input) { free(cur->in_file); cur->in_file = file.text; }
+      else { free(cur->out_file); cur->out_file = file.text; cur->append = append; }
+      continue;
+    }
+    if (expand) { if (!append_glob(cur, t)) return -1; }
+    else if (!append_arg(cur, t.text)) return -1;
+  }
+  if (parse_error[0]) return -1;
+  if (!cur->argc && n) { snprintf(parse_error, sizeof parse_error, "empty command after |"); return -1; }
+  return cur->argc ? n + 1 : 0;
+}
+
+/* ---------------------------- command lists ------------------------------ */
+
+static char *copy_trimmed(const char *a, const char *b) {
+  while (a < b && isspace((unsigned char)*a)) a++;
+  while (b > a && isspace((unsigned char)b[-1])) b--;
+  size_t n = (size_t)(b - a); char *s = xmalloc(n + 1); memcpy(s, a, n); s[n] = 0; return s;
+}
+
+static void free_list(ListItem *items, int n) {
+  for (int i = 0; i < n; i++) free(items[i].text);
+}
+
+static int parse_list(char *line, ListItem *items) {
+  memset(items, 0, MAX_LISTS * sizeof *items);
+  const char *start = line, *last_op = NULL; Condition next = COND_ALWAYS;
+  int count = 0, sq = 0, dq = 0, escaped = 0, word_start = 1;
+  for (char *p = line;; p++) {
+    char c = *p;
+    int separator = !sq && !dq && !escaped && (c == ';' || c == '\n' ||
+      (c == '&' && p[1] == '&') || (c == '|' && p[1] == '|'));
+    if (!c || separator) {
+      char *piece = copy_trimmed(start, p);
+      const char *op = c == '&' ? "&&" : c == '|' ? "||" : c == ';' ? ";" : c == '\n' ? "newline" : NULL;
+      if (*piece) {
+        if (count >= MAX_LISTS) { free(piece); snprintf(parse_error, sizeof parse_error, "too many commands"); free_list(items, count); return -1; }
+        items[count].text = piece; items[count++].condition = next;
+      } else {
+        free(piece);
+        if (c && c != '\n') {
+          snprintf(parse_error, sizeof parse_error, "empty command before %s", op);
+          free_list(items, count); return -1;
+        }
+        if (!c && last_op && strcmp(last_op, ";") && strcmp(last_op, "newline")) {
+          snprintf(parse_error, sizeof parse_error, "empty command after %s", last_op);
+          free_list(items, count); return -1;
         }
       }
-      if (*p) p++;
-      else snprintf(tok_err, sizeof tok_err, "unterminated \" quote");
-    } else if (c == '$') {
-      p++;
-      expand_var(&buf, &len, &cap, &p, expand);
-    } else if (c == '\\' && p[1] == '$') {
-      buf_putc(&buf, &len, &cap, '$');
-      p += 2;
-    } else if (c == ' ' || c == '\t' || c == '\r' || c == '\n' || c == '|' || c == '>') {
-      done = 1;
-    } else {
-      buf_putc(&buf, &len, &cap, *p++);
+      if (!c) break;
+      last_op = op;
+      if (c == '&') { next = COND_AND; p++; }
+      else if (c == '|') { next = COND_OR; p++; }
+      else next = COND_ALWAYS;
+      start = p + 1; word_start = 1; continue;
     }
+    if (!sq && !dq && !escaped && c == '&' && p[1] != '&') {
+      snprintf(parse_error, sizeof parse_error, "unsupported operator &"); free_list(items, count); return -1;
+    }
+    if (!sq && !dq && !escaped && c == '#' && word_start) {
+      char *q = p; while (*q && *q != '\n') *q++ = ' ';
+      p--; continue;
+    }
+    if (escaped) { escaped = 0; word_start = 0; continue; }
+    if (c == '\\' && !sq) { escaped = 1; continue; }
+    if (c == '\'' && !dq) { sq = !sq; word_start = 0; continue; }
+    if (c == '"' && !sq) { dq = !dq; word_start = 0; continue; }
+    word_start = isspace((unsigned char)c);
   }
-  buf_putc(&buf, &len, &cap, '\0');
-  *pp = p;
-  return buf;
-}
-
-/* ------------------------------ pipeline -------------------------------- */
-
-typedef struct {
-  char *argv[SLOP_MAX_ARGS];
-  int argc;
-  char *out_file; /* malloc'd, NULL otherwise */
-  int append;
-} Command;
-
-static int parse_pipeline(char *line, Command *cmds, int expand) {
-  char *p = line;
-  int ncmd = 0;
-  memset(cmds, 0, SLOP_MAX_CMDS * sizeof *cmds);
-  Command *cur = &cmds[ncmd];
-  char *tok;
-  tok_err[0] = '\0';
-  while ((tok = next_token(&p, expand)) != NULL) {
-    if (strcmp(tok, "|") == 0) {
-      free(tok);
-      if (cur->argc == 0) {
-        snprintf(tok_err, sizeof tok_err, "empty command before |");
-        return -1;
-      }
-      if (ncmd + 1 >= SLOP_MAX_CMDS) {
-        snprintf(tok_err, sizeof tok_err, "too many commands in pipeline");
-        return -1;
-      }
-      ncmd++;
-      cur = &cmds[ncmd];
-      continue;
-    }
-    if (strcmp(tok, ">") == 0 || strcmp(tok, ">>") == 0) {
-      int append = tok[1] == '>';
-      free(tok);
-      char *target = next_token(&p, expand);
-      if (!target) {
-        snprintf(tok_err, sizeof tok_err, "redirect needs a file");
-        return -1;
-      }
-      if (strcmp(target, "|") == 0 || strcmp(target, ">") == 0 ||
-          strcmp(target, ">>") == 0) {
-        snprintf(tok_err, sizeof tok_err, "redirect needs a file");
-        free(target);
-        return -1;
-      }
-      if (cur->argc == 0) {
-        snprintf(tok_err, sizeof tok_err, "redirect needs a command");
-        free(target);
-        return -1;
-      }
-      free(cur->out_file);
-      cur->out_file = target;
-      cur->append = append;
-      continue;
-    }
-    if (cur->argc >= SLOP_MAX_ARGS - 1) {
-      snprintf(tok_err, sizeof tok_err, "too many arguments");
-      free(tok);
-      return -1;
-    }
-    cur->argv[cur->argc++] = tok;
+  if (sq || dq) {
+    snprintf(parse_error, sizeof parse_error, "unterminated %c quote", sq ? '\'' : '"');
+    free_list(items, count); return -1;
   }
-  if (tok_err[0] != '\0') return -1;
-  if (cur->argc == 0 && ncmd > 0) {
-    snprintf(tok_err, sizeof tok_err, "empty command after |");
-    return -1;
-  }
-  return cur->argc > 0 ? ncmd + 1 : 0;
-}
-
-static void free_pipeline(Command *cmds, int ncmd) {
-  for (int i = 0; i < ncmd; i++) {
-    for (int a = 0; a < cmds[i].argc; a++) free(cmds[i].argv[a]);
-    free(cmds[i].out_file);
-  }
-}
-
-/* ---------------------------- command lists ----------------------------- */
-
-typedef enum {
-  LIST_ALWAYS,
-  LIST_AND,
-  LIST_OR,
-} ListCondition;
-
-typedef struct {
-  char *text;
-  ListCondition condition;
-} ListItem;
-
-static void free_command_list(ListItem *items, int count) {
-  for (int i = 0; i < count; i++) free(items[i].text);
-}
-
-static char *copy_trimmed(const char *start, const char *end) {
-  while (start < end && (*start == ' ' || *start == '\t' || *start == '\r' || *start == '\n')) {
-    start++;
-  }
-  while (end > start && (end[-1] == ' ' || end[-1] == '\t' || end[-1] == '\r' || end[-1] == '\n')) {
-    end--;
-  }
-  size_t length = (size_t)(end - start);
-  char *text = malloc(length + 1);
-  if (!text) return NULL;
-  memcpy(text, start, length);
-  text[length] = '\0';
-  return text;
-}
-
-/*
- * Split a raw line before expansion so each selected pipeline expands with
- * the status of the previously executed pipeline. Operators inside quotes
- * remain ordinary text. The complete list is validated before execution.
- */
-static int parse_command_list(char *line, ListItem *items) {
-  memset(items, 0, SLOP_MAX_LISTS * sizeof *items);
-  const char *start = line;
-  const char *last_operator = NULL;
-  ListCondition next_condition = LIST_ALWAYS;
-  char quote = '\0';
-  int count = 0;
-
-  for (char *p = line; *p; p++) {
-    if (quote) {
-      if (*p == quote) quote = '\0';
-      continue;
-    }
-    if (*p == '\'' || *p == '"') {
-      quote = *p;
-      continue;
-    }
-
-    const char *op = NULL;
-    int op_length = 0;
-    ListCondition following = LIST_ALWAYS;
-    if (*p == '&') {
-      if (p[1] != '&') {
-        snprintf(tok_err, sizeof tok_err, "unsupported operator &");
-        free_command_list(items, count);
-        return -1;
-      }
-      op = "&&";
-      op_length = 2;
-      following = LIST_AND;
-    } else if (*p == '|' && p[1] == '|') {
-      op = "||";
-      op_length = 2;
-      following = LIST_OR;
-    } else if (*p == ';') {
-      op = ";";
-      op_length = 1;
-      following = LIST_ALWAYS;
-    } else {
-      continue;
-    }
-
-    char *text = copy_trimmed(start, p);
-    if (!text) {
-      snprintf(tok_err, sizeof tok_err, "out of memory");
-      free_command_list(items, count);
-      return -1;
-    }
-    if (!*text) {
-      snprintf(tok_err, sizeof tok_err, "empty command before %s", op);
-      free(text);
-      free_command_list(items, count);
-      return -1;
-    }
-    if (count >= SLOP_MAX_LISTS) {
-      snprintf(tok_err, sizeof tok_err, "too many pipelines in command list");
-      free(text);
-      free_command_list(items, count);
-      return -1;
-    }
-    items[count].text = text;
-    items[count].condition = next_condition;
-    count++;
-    next_condition = following;
-    last_operator = op;
-    p += op_length - 1;
-    start = p + 1;
-  }
-
-  if (quote) {
-    snprintf(tok_err, sizeof tok_err, "unterminated %c quote", quote);
-    free_command_list(items, count);
-    return -1;
-  }
-
-  const char *end = line + strlen(line);
-  char *text = copy_trimmed(start, end);
-  if (!text) {
-    snprintf(tok_err, sizeof tok_err, "out of memory");
-    free_command_list(items, count);
-    return -1;
-  }
-  if (*text) {
-    if (count >= SLOP_MAX_LISTS) {
-      snprintf(tok_err, sizeof tok_err, "too many pipelines in command list");
-      free(text);
-      free_command_list(items, count);
-      return -1;
-    }
-    items[count].text = text;
-    items[count].condition = next_condition;
-    count++;
-  } else {
-    free(text);
-    if (count == 0) return 0;
-    if (!last_operator || strcmp(last_operator, ";") != 0) {
-      snprintf(tok_err, sizeof tok_err, "empty command after %s", last_operator);
-      free_command_list(items, count);
-      return -1;
-    }
-  }
-
-  /* Validate every pipeline before any command can cause side effects. */
+  /* Validate the whole list before executing any side effects. */
   for (int i = 0; i < count; i++) {
-    Command validation[SLOP_MAX_CMDS];
-    int ncmd = parse_pipeline(items[i].text, validation, 0);
-    if (ncmd <= 0) {
-      if (tok_err[0] == '\0') snprintf(tok_err, sizeof tok_err, "empty pipeline");
-      free_pipeline(validation, SLOP_MAX_CMDS);
-      free_command_list(items, count);
-      return -1;
+    Command validation[MAX_CMDS]; int n = parse_pipeline(items[i].text, validation, 0);
+    if (n <= 0) {
+      for (int j = 0; j < MAX_CMDS; j++) free_command(&validation[j]);
+      free_list(items, count); return -1;
     }
-    free_pipeline(validation, ncmd);
+    for (int j = 0; j < n; j++) free_command(&validation[j]);
   }
   return count;
 }
 
-/* ------------------------------ builtins -------------------------------- */
+/* ------------------------------- builtins -------------------------------- */
 
-static int find_command(const char *cmd, char *out) {
-  if (strchr(cmd, '/') != NULL) {
-    resolve(cmd, out);
-    return is_reg(out);
+static int builtin_name(const char *s) {
+  static const char *names[] = {"cd","pwd","help","echo","printf",":","true","false",
+    "export","readonly","unset","set","test","[","shift","read","type","command","eval",
+    ".","source","break","continue","umask",NULL};
+  for (int i = 0; names[i]; i++) if (!strcmp(s, names[i])) return 1;
+  return 0;
+}
+
+static int test_builtin(char **v, int n) {
+  if (n && !strcmp(v[n - 1], "]")) n--;
+  if (!n) return 1;
+  if (!strcmp(v[0], "!")) return !test_builtin(v + 1, n - 1) ? 0 : 1;
+  if (n == 1) return *v[0] ? 0 : 1;
+  if (n == 2) {
+    if (!strcmp(v[0], "-n")) return *v[1] ? 0 : 1;
+    if (!strcmp(v[0], "-z")) return *v[1] ? 1 : 0;
+    char path[PATH_CAP]; struct stat st;
+    if (!resolve_path(v[1], path)) return 1;
+    int ok = stat(path, &st) == 0;
+    if (!strcmp(v[0], "-e")) return ok ? 0 : 1;
+    if (!strcmp(v[0], "-f")) return ok && S_ISREG(st.st_mode) ? 0 : 1;
+    if (!strcmp(v[0], "-d")) return ok && S_ISDIR(st.st_mode) ? 0 : 1;
+    if (!strcmp(v[0], "-s")) return ok && st.st_size > 0 ? 0 : 1;
+    if (!strcmp(v[0], "-r") || !strcmp(v[0], "-w")) return ok ? 0 : 1;
   }
-  const char *path_env = getenv("PATH");
-  if (path_env == NULL || *path_env == '\0') path_env = "/bin";
-  char *copy = strdup(path_env);
-  int found = 0;
-  for (char *dir = strtok(copy, ":"); dir && !found; dir = strtok(NULL, ":")) {
-    snprintf(out, SLOP_PATH, "%s/%s", dir, cmd);
-    if (is_reg(out)) found = 1;
+  if (n == 3) {
+    if (!strcmp(v[1], "=") || !strcmp(v[1], "==")) return strcmp(v[0], v[2]) ? 1 : 0;
+    if (!strcmp(v[1], "!=")) return strcmp(v[0], v[2]) ? 0 : 1;
+    long a = strtol(v[0], NULL, 10), b = strtol(v[2], NULL, 10);
+    if (!strcmp(v[1], "-eq")) return a == b ? 0 : 1;
+    if (!strcmp(v[1], "-ne")) return a != b ? 0 : 1;
+    if (!strcmp(v[1], "-lt")) return a < b ? 0 : 1;
+    if (!strcmp(v[1], "-le")) return a <= b ? 0 : 1;
+    if (!strcmp(v[1], "-gt")) return a > b ? 0 : 1;
+    if (!strcmp(v[1], "-ge")) return a >= b ? 0 : 1;
   }
-  free(copy);
-  return found;
-}
-
-static int is_builtin(const char *name) {
-  return strcmp(name, "cd") == 0 || strcmp(name, "pwd") == 0 || strcmp(name, "help") == 0;
-}
-
-static int is_toolchain_command(const char *name) {
-  return strcmp(name, "cc") == 0 || strcmp(name, "ld") == 0 ||
-         strcmp(name, "compile") == 0 || strcmp(name, "link") == 0;
-}
-
-static int append_spawn_arg(char *blob, size_t cap, size_t *offset, const char *arg) {
-  size_t length = strlen(arg) + 1;
-  /* Reserve one final NUL after the last argument. */
-  if (*offset >= cap || length >= cap - *offset) return 0;
-  memcpy(blob + *offset, arg, length);
-  *offset += length;
   return 1;
 }
 
-/* Runs a builtin; output goes to `out`. Returns the exit code. */
-static int run_builtin(const char *name, char **args, int argc, FILE *out) {
-  if (strcmp(name, "pwd") == 0) {
-    fprintf(out, "%s\n", cwd);
-    return 0;
+static void print_escaped(FILE *out, const char *s) {
+  while (*s) {
+    if (*s != '\\') { fputc(*s++, out); continue; }
+    s++;
+    if (*s == 'n') { fputc('\n', out); s++; }
+    else if (*s == 't') { fputc('\t', out); s++; }
+    else if (*s == 'r') { fputc('\r', out); s++; }
+    else if (*s == 'b') { fputc('\b', out); s++; }
+    else if (*s == '\\') { fputc('\\', out); s++; }
+    else if (*s) fputc(*s++, out);
   }
-  if (strcmp(name, "help") == 0) {
-    print_help(out);
-    return 0;
-  }
-  /* cd */
-  char resolved[SLOP_PATH];
-  resolve(argc > 1 ? args[1] : "/home/web", resolved);
-  if (!is_dir(resolved)) {
-    fprintf(out, "cd: no such directory: %s\n", argc > 1 ? args[1] : resolved);
-    return 1;
-  }
-  if (chdir(resolved) != 0) {
-    fprintf(out, "cd: %s: %s\n", args[1], strerror(errno));
-    return 1;
-  }
-  snprintf(cwd, sizeof cwd, "%s", resolved);
-  if (setenv("PWD", cwd, 1) != 0) {
-    fprintf(stderr, "slop: could not update PWD: %s\n", strerror(errno));
+}
+
+static int printf_builtin(char **v, int n, FILE *out) {
+  if (!n) return 0;
+  const char *f = v[0]; int ai = 1;
+  for (size_t i = 0; f[i]; i++) {
+    if (f[i] == '\\') {
+      char pair[3] = {'\\', f[i + 1], 0}; print_escaped(out, pair); if (f[i + 1]) i++;
+    } else if (f[i] == '%' && f[i + 1]) {
+      char spec = f[++i];
+      if (spec == '%') fputc('%', out);
+      else if (spec == 's') fputs(ai < n ? v[ai++] : "", out);
+      else if (spec == 'd' || spec == 'i') fprintf(out, "%ld", ai < n ? strtol(v[ai++], NULL, 0) : 0L);
+      else { fputc('%', out); fputc(spec, out); }
+    } else fputc(f[i], out);
   }
   return 0;
 }
 
-/* ------------------------------ execution ------------------------------- */
+static char *read_file(const char *name, int *length, int cap) {
+  char path[PATH_CAP];
+  if (!resolve_path(name, path)) { fprintf(stderr, "slop: path too long: %s\n", name); return NULL; }
+  FILE *f = fopen(path, "rb");
+  if (!f) { fprintf(stderr, "slop: %s: %s\n", name, strerror(errno)); return NULL; }
+  char *data = xmalloc((size_t)cap + 1); size_t n = fread(data, 1, (size_t)cap, f);
+  if (!feof(f)) { fprintf(stderr, "slop: %s exceeds %d-byte input limit\n", name, cap); fclose(f); free(data); return NULL; }
+  if (ferror(f)) { fprintf(stderr, "slop: %s: read error\n", name); fclose(f); free(data); return NULL; }
+  fclose(f); data[n] = 0; *length = (int)n; return data;
+}
+
+static void print_help(FILE *out) {
+  fputs("slop - build-oriented shell for piodide\n"
+        "usage: slop [-c command [name [args...]]] [script [args...]]\n"
+        "syntax: quotes, $var/${var:-default}, $(command), $?, $1.., globs, < > >>, |, &&, ||, ;\n"
+        "blocks: line-oriented if/then/else/fi, for/in/do/done, while/do/done\n"
+        "builtins: cd pwd echo printf export unset test [ shift read type source true false\n"
+        "commands are resolved on PATH; cc/compile and ld/link route to the browser toolchain\n"
+        "limits: pipelines are sequential and buffered; jobs and stderr redirection are unavailable\n", out);
+}
+
+static int run_builtin(Command *c, FILE *out, const char *input, int input_len) {
+  char **a = c->argv; int n = c->argc; const char *name = a[0];
+  if (!strcmp(name, ":") || !strcmp(name, "true")) return 0;
+  if (!strcmp(name, "false")) return 1;
+  if (!strcmp(name, "pwd")) { fprintf(out, "%s\n", cwd); return 0; }
+  if (!strcmp(name, "help")) { print_help(out); return 0; }
+  if (!strcmp(name, "cd")) {
+    const char *dest = n > 1 ? a[1] : getenv("HOME"); char path[PATH_CAP];
+    if (!dest || !resolve_path(dest, path) || !is_dir(path)) { fprintf(stderr, "slop: cd: %s: no such directory\n", dest ? dest : ""); return 1; }
+    snprintf(cwd, sizeof cwd, "%s", path); setenv("PWD", cwd, 1); return 0;
+  }
+  if (!strcmp(name, "echo")) {
+    int i = 1, newline = 1;
+    if (i < n && !strcmp(a[i], "-n")) { newline = 0; i++; }
+    for (; i < n; i++) { if (i > (newline ? 1 : 2)) fputc(' ', out); fputs(a[i], out); }
+    if (newline) fputc('\n', out); return 0;
+  }
+  if (!strcmp(name, "printf")) return printf_builtin(a + 1, n - 1, out);
+  if (!strcmp(name, "set")) {
+    for (int i = 1; i < n; i++) {
+      if (!strcmp(a[i], "-e")) option_errexit = 1;
+      else if (!strcmp(a[i], "+e")) option_errexit = 0;
+      else if (!strcmp(a[i], "-x")) option_xtrace = 1;
+      else if (!strcmp(a[i], "+x")) option_xtrace = 0;
+      else if (!strcmp(a[i], "-u") || !strcmp(a[i], "+u")) { /* accepted */ }
+      else if (!strcmp(a[i], "--")) break;
+      else { fprintf(stderr, "slop: set: unsupported option: %s\n", a[i]); return 2; }
+    }
+    return 0;
+  }
+  if (!strcmp(name, "export") || !strcmp(name, "readonly")) {
+    for (int i = 1; i < n; i++) {
+      const char *eq;
+      if (assignment_word(a[i], &eq)) {
+        size_t z = (size_t)(eq - a[i]); char key[128];
+        if (z >= sizeof key) return 2; memcpy(key, a[i], z); key[z] = 0; setenv(key, eq + 1, 1);
+      } else if (!valid_name_n(a[i], strlen(a[i]))) { fprintf(stderr, "slop: export: invalid name: %s\n", a[i]); return 2; }
+    }
+    return 0;
+  }
+  if (!strcmp(name, "unset")) {
+    for (int i = 1; i < n; i++) if (valid_name_n(a[i], strlen(a[i]))) unsetenv(a[i]);
+    return 0;
+  }
+  if (!strcmp(name, "test") || !strcmp(name, "[")) return test_builtin(a + 1, n - 1);
+  if (!strcmp(name, "shift")) {
+    int by = n > 1 ? atoi(a[1]) : 1;
+    if (by < 0 || by > shell_argc) return 1;
+    shell_argv += by; shell_argc -= by; return 0;
+  }
+  if (!strcmp(name, "read")) {
+    const char *var = n > 1 ? a[1] : "REPLY";
+    if (!valid_name_n(var, strlen(var))) return 2;
+    char line[4096]; size_t z = 0;
+    if (input) { while (z + 1 < sizeof line && z < (size_t)input_len && input[z] != '\n') { line[z] = input[z]; z++; } }
+    else if (fgets(line, sizeof line, stdin)) z = strcspn(line, "\r\n");
+    else return 1;
+    line[z] = 0; setenv(var, line, 1); return 0;
+  }
+  if (!strcmp(name, "command")) {
+    if (n > 1 && !strcmp(a[1], "-v")) {
+      int rc = 0;
+      for (int i = 2; i < n; i++) { char path[PATH_CAP]; if (builtin_name(a[i])) fprintf(out, "%s\n", a[i]); else if (find_command(a[i], path)) fprintf(out, "%s\n", path); else rc = 1; }
+      return rc;
+    }
+    fprintf(stderr, "slop: command: only 'command -v' is supported\n"); return 2;
+  }
+  if (!strcmp(name, "eval")) {
+    Buf text; binit(&text); for (int i = 1; i < n; i++) { if (i > 1) bputc(&text, ' '); bputs(&text, a[i]); }
+    int rc = execute_command_list(text.s); free(text.s); return rc;
+  }
+  if (!strcmp(name, "umask")) return 0;
+  if (!strcmp(name, "type")) {
+    int rc = 0;
+    for (int i = 1; i < n; i++) {
+      char path[PATH_CAP];
+      if (builtin_name(a[i])) fprintf(out, "%s is a shell builtin\n", a[i]);
+      else if (find_command(a[i], path)) fprintf(out, "%s is %s\n", a[i], path);
+      else { fprintf(out, "%s not found\n", a[i]); rc = 1; }
+    }
+    return rc;
+  }
+  if (!strcmp(name, ".") || !strcmp(name, "source")) {
+    if (n < 2) { fprintf(stderr, "slop: %s: filename required\n", name); return 2; }
+    int z; char *script = read_file(a[1], &z, SCRIPT_CAP); (void)z;
+    if (!script) return 1; int rc = execute_script(script); free(script); return rc;
+  }
+  if (!strcmp(name, "break")) { flow_signal = 1; return 0; }
+  if (!strcmp(name, "continue")) { flow_signal = 2; return 0; }
+  return 127;
+}
+
+/* ------------------------------- execution ------------------------------- */
+
+static int wasm_program(const char *path) {
+  FILE *f = fopen(path, "rb"); if (!f) return 0;
+  unsigned char magic[4]; size_t n = fread(magic, 1, 4, f); fclose(f);
+  return n == 4 && magic[0] == 0 && magic[1] == 'a' && magic[2] == 's' && magic[3] == 'm';
+}
+
+extern char **environ;
+
+static int serialize_environment(void) {
+  size_t used = 0;
+  for (char **entry = environ; entry && *entry; entry++) {
+    size_t n = strlen(*entry) + 1;
+    if (used + n + 1 > ENV_CAP) { fprintf(stderr, "slop: environment exceeds %d bytes\n", ENV_CAP); return -1; }
+    memcpy(spawn_env + used, *entry, n); used += n;
+  }
+  spawn_env[used++] = 0;
+  return (int)used;
+}
+
+static int toolchain_command(const char *s) {
+  return !strcmp(s, "cc") || !strcmp(s, "compile") || !strcmp(s, "ld") || !strcmp(s, "link");
+}
+
+static int append_spawn_arg(char *blob, size_t cap, size_t *off, const char *s) {
+  size_t n = strlen(s) + 1;
+  if (*off + n + 1 > cap) return 0;
+  memcpy(blob + *off, s, n); *off += n; return 1;
+}
+
+static int apply_assignments(Command *c) {
+  int first = 0;
+  while (first < c->argc) {
+    const char *eq;
+    if (!assignment_word(c->argv[first], &eq)) break;
+    size_t n = (size_t)(eq - c->argv[first]); char name[128];
+    if (n >= sizeof name) return -1;
+    memcpy(name, c->argv[first], n); name[n] = 0; setenv(name, eq + 1, 1); first++;
+  }
+  if (first) {
+    for (int i = first; i < c->argc; i++) c->argv[i - first] = c->argv[i];
+    c->argc -= first; c->argv[c->argc] = NULL;
+  }
+  return c->argc;
+}
+
+static int load_redirect(const char *name) {
+  char path[PATH_CAP];
+  if (!resolve_path(name, path)) { fprintf(stderr, "slop: %s: path too long\n", name); return -1; }
+  FILE *f = fopen(path, "rb");
+  if (!f) { fprintf(stderr, "slop: %s: %s\n", name, strerror(errno)); return -1; }
+  size_t n = fread(redirect_input, 1, PIPE_CAP, f);
+  if (!feof(f)) { fprintf(stderr, "slop: %s: input exceeds %d bytes\n", name, PIPE_CAP); fclose(f); return -1; }
+  fclose(f); return (int)n;
+}
 
 static int run_pipeline(Command *cmds, int ncmd) {
-  static char blob[8192];
-  static char resolved[SLOP_PATH];
-  static char out_path[SLOP_PATH];
-  int capture_len = 0;
-  const char *prev_buf = NULL;
-  int prev_len = 0;
-  char *cur_buf = pipe_a;
-  char *nxt_buf = pipe_b;
-  int code = 0;
-
+  static char blob[16384], resolved[PATH_CAP], out_path[PATH_CAP];
+  char *cur = pipe_a, *next = pipe_b;
+  const char *previous = NULL; int previous_len = 0, code = 0;
   for (int i = 0; i < ncmd; i++) {
-    Command *c = &cmds[i];
-    int is_last = i == ncmd - 1;
-    int pseudo = is_toolchain_command(c->argv[0]);
+    Command *c = &cmds[i]; int last = i + 1 == ncmd;
+    if (apply_assignments(c) < 0) return 2;
+    if (!c->argc) { code = 0; continue; }
 
-    /* Where does this command's stdout go? (redirect beats pipe, like bash.) */
+    const char *input = previous; int input_len = previous_len;
+    if (c->in_file) {
+      input_len = load_redirect(c->in_file);
+      if (input_len < 0) return 1;
+      input = redirect_input;
+    }
     const char *out_file = NULL;
     if (c->out_file) {
-      resolve(c->out_file, out_path);
+      if (!resolve_path(c->out_file, out_path)) { fprintf(stderr, "slop: output path too long\n"); return 1; }
       out_file = out_path;
     }
 
-    /* Builtins run in-process. */
-    if (!pseudo && is_builtin(c->argv[0])) {
-      int rc;
-      if (!out_file && is_last) {
-        rc = run_builtin(c->argv[0], c->argv, c->argc, stdout);
-        prev_buf = NULL;
-        prev_len = 0;
-      } else if (out_file) {
-        FILE *out = fopen(out_file, c->append ? "a" : "w");
-        if (!out) {
-          fprintf(stderr, "slop: %s: %s\n", out_file, strerror(errno));
-          code = 1;
-          break;
-        }
-        rc = run_builtin(c->argv[0], c->argv, c->argc, out);
-        fclose(out);
-        prev_buf = NULL;
-        prev_len = 0; /* redirected: the pipe gets nothing */
-      } else {
-        FILE *mem = fmemopen(cur_buf, PIPE_CAP, "w");
-        rc = run_builtin(c->argv[0], c->argv, c->argc, mem);
-        capture_len = (int)ftell(mem);
-        fclose(mem);
-        prev_buf = cur_buf;
-        prev_len = capture_len;
+    if (builtin_name(c->argv[0])) {
+      FILE *out = stdout; int capture = 0;
+      if (out_file) {
+        out = fopen(out_file, c->append ? "a" : "w");
+        if (!out) { fprintf(stderr, "slop: %s: %s\n", c->out_file, strerror(errno)); return 1; }
+      } else if (!last || capture_active) {
+        out = fmemopen(cur, PIPE_CAP, "w"); capture = 1;
+        if (!out) return 1;
       }
-      code = rc;
-      goto next;
-    }
-
-    /* External or pseudo-command. */
-    const char *prog = c->argv[0];
-    if (!pseudo && !find_command(prog, resolved)) {
-      fprintf(stderr, "slop: command not found: %s\n", prog);
-      code = 127;
-      break;
-    }
-    size_t off = 0;
-    int args_ok = 1;
-    if (!append_spawn_arg(blob, sizeof blob, &off, pseudo ? prog : resolved)) {
-      fprintf(stderr, "slop: serialized arguments exceed %zu bytes\n", sizeof blob);
-      args_ok = 0;
-    }
-    for (int a = 1; args_ok && a < c->argc; a++) {
-      if (!append_spawn_arg(blob, sizeof blob, &off, c->argv[a])) {
-        fprintf(stderr, "slop: serialized arguments exceed %zu bytes\n", sizeof blob);
-        args_ok = 0;
-      }
-    }
-    if (!args_ok) {
-      code = 2;
-      break;
-    }
-    blob[off] = '\0';
-
-    slop_io io;
-    memset(&io, 0, sizeof io);
-    io.stdin_data = prev_buf;
-    io.stdin_len = prev_len;
-    if (out_file) {
-      io.out_file = out_file;
-      io.out_append = c->append;
-    } else if (!is_last) {
-      io.capture = cur_buf;
-      io.capture_cap = PIPE_CAP;
-      io.capture_len = &capture_len;
-    }
-    code = piodide_spawn(pseudo ? prog : resolved, blob, cwd, &io);
-
-    if (out_file) {
-      prev_buf = NULL;
-      prev_len = 0;
-    } else if (!is_last) {
-      if (capture_len > PIPE_CAP) {
-        fprintf(stderr, "\x1b[2mslop: pipe truncated at %d bytes\x1b[0m\n", PIPE_CAP);
-        capture_len = PIPE_CAP;
-      }
-      prev_buf = cur_buf;
-      prev_len = capture_len;
+      code = run_builtin(c, out, input, input_len);
+      if (capture) {
+        previous_len = (int)ftell(out); fclose(out);
+        if (last && capture_active) {
+          capture_length = previous_len > PIPE_CAP ? PIPE_CAP : previous_len;
+          memcpy(capture_buffer, cur, (size_t)capture_length); previous = NULL; previous_len = 0;
+        } else previous = cur;
+      } else { if (out_file) fclose(out); previous = NULL; previous_len = 0; }
     } else {
-      prev_buf = NULL;
-      prev_len = 0;
+      int pseudo = toolchain_command(c->argv[0]);
+      if (!pseudo && !find_command(c->argv[0], resolved)) {
+        fprintf(stderr, "slop: command not found: %s\n", c->argv[0]); return 127;
+      }
+      int script = !pseudo && !wasm_program(resolved);
+      const char *spawn_path = pseudo ? c->argv[0] : script ? "/bin/slop" : resolved;
+      size_t off = 0;
+      if (!append_spawn_arg(blob, sizeof blob, &off, spawn_path)) return 2;
+      if (script && !append_spawn_arg(blob, sizeof blob, &off, resolved)) return 2;
+      for (int a = 1; a < c->argc; a++)
+        if (!append_spawn_arg(blob, sizeof blob, &off, c->argv[a])) { fprintf(stderr, "slop: argument list too long\n"); return 2; }
+      blob[off] = 0;
+      int captured = 0;
+      slop_io io; memset(&io, 0, sizeof io);
+      io.stdin_data = input; io.stdin_len = input_len;
+      int env_len = serialize_environment(); if (env_len < 0) return 2;
+      io.env_data = spawn_env; io.env_len = env_len;
+      if (out_file || !last || capture_active) { io.capture = cur; io.capture_cap = PIPE_CAP; io.capture_len = &captured; }
+      code = piodide_spawn(spawn_path, blob, cwd, &io);
+      if (captured > PIPE_CAP) { fprintf(stderr, "slop: output truncated at %d bytes\n", PIPE_CAP); captured = PIPE_CAP; }
+      if (out_file) {
+        FILE *f = fopen(out_file, c->append ? "ab" : "wb");
+        if (!f) { fprintf(stderr, "slop: %s: %s\n", c->out_file, strerror(errno)); return 1; }
+        if (captured && fwrite(cur, 1, (size_t)captured, f) != (size_t)captured) code = 1;
+        fclose(f); previous = NULL; previous_len = 0;
+      } else if (!last) {
+        previous = cur; previous_len = captured;
+      } else if (capture_active) {
+        capture_length = captured; memcpy(capture_buffer, cur, (size_t)captured);
+        previous = NULL; previous_len = 0;
+      } else { previous = NULL; previous_len = 0; }
     }
-
-  next:;
-    char *swap = cur_buf;
-    cur_buf = nxt_buf;
-    nxt_buf = swap;
+    char *swap = cur; cur = next; next = swap;
   }
-
   return code;
 }
 
-/* --------------------------------- REPL ---------------------------------- */
+static int execute_command_list(char *line) {
+  ListItem items[MAX_LISTS];
+  int n = parse_list(line, items);
+  if (n < 0) { fprintf(stderr, "slop: %s\n", parse_error); return 2; }
+  for (int i = 0; i < n && !exit_requested && !flow_signal; i++) {
+    int run = items[i].condition == COND_ALWAYS ||
+      (items[i].condition == COND_AND && last_status == 0) ||
+      (items[i].condition == COND_OR && last_status != 0);
+    if (!run) continue;
+    Command cmds[MAX_CMDS]; int nc = parse_pipeline(items[i].text, cmds, 1);
+    if (nc <= 0) {
+      fprintf(stderr, "slop: %s\n", parse_error[0] ? parse_error : "invalid command");
+      for (int j = 0; j < MAX_CMDS; j++) free_command(&cmds[j]); last_status = 2; break;
+    }
+    if (option_xtrace) fprintf(stderr, "+ %s\n", items[i].text);
+    if (nc == 1 && cmds[0].argc && !strcmp(cmds[0].argv[0], "exit")) {
+      exit_status = cmds[0].argc > 1 ? atoi(cmds[0].argv[1]) : last_status;
+      exit_requested = 1; last_status = exit_status;
+    } else last_status = run_pipeline(cmds, nc);
+    for (int j = 0; j < nc; j++) free_command(&cmds[j]);
+    int guarded = i + 1 < n && (items[i + 1].condition == COND_AND || items[i + 1].condition == COND_OR);
+    if (option_errexit && !suppress_errexit && last_status && !guarded) {
+      exit_requested = 1; exit_status = last_status;
+    }
+  }
+  free_list(items, n > 0 ? n : 0); return last_status;
+}
 
-int main(void) {
-  setvbuf(stdout, NULL, _IONBF, 0);
-  setvbuf(stderr, NULL, _IONBF, 0);
-  const char *quiet_env = getenv("SLOP_QUIET");
-  int quiet = quiet_env && *quiet_env && strcmp(quiet_env, "0") != 0;
+static char *capture_command(const char *text) {
+  if (capture_active) { snprintf(parse_error, sizeof parse_error, "nested command substitution is unsupported"); return xstrdup(""); }
+  int saved_status = last_status, saved_exit = exit_requested, saved_exit_status = exit_status;
+  int saved_flow = flow_signal;
+  capture_active = 1; capture_length = 0; suppress_errexit++;
+  char *copy = xstrdup(text); execute_command_list(copy); free(copy);
+  suppress_errexit--; capture_active = 0;
+  while (capture_length > 0 && (capture_buffer[capture_length - 1] == '\n' || capture_buffer[capture_length - 1] == '\r')) capture_length--;
+  char *result = xmalloc((size_t)capture_length + 1);
+  memcpy(result, capture_buffer, (size_t)capture_length); result[capture_length] = 0;
+  last_status = saved_status; exit_requested = saved_exit; exit_status = saved_exit_status; flow_signal = saved_flow;
+  return result;
+}
 
+/* -------------------------- line-oriented blocks ------------------------- */
+
+static int starts_word(const char *s, const char *word) {
+  size_t n = strlen(word); return !strncmp(s, word, n) && (!s[n] || isspace((unsigned char)s[n]));
+}
+
+static int find_if_end(char **lines, int start, int end) {
+  int depth = 1;
+  for (int i = start + 1; i < end; i++) {
+    char *s = trim(lines[i]);
+    if (starts_word(s, "if")) depth++;
+    else if (!strcmp(s, "fi") && --depth == 0) return i;
+  }
+  return -1;
+}
+
+static int find_if_clause(char **lines, int start, int finish) {
+  int depth = 1;
+  for (int i = start + 1; i < finish; i++) {
+    char *s = trim(lines[i]);
+    if (starts_word(s, "if")) depth++;
+    else if (!strcmp(s, "fi")) depth--;
+    else if (depth == 1 && (!strcmp(s, "else") || starts_word(s, "elif"))) return i;
+  }
+  return -1;
+}
+
+static int find_done(char **lines, int start, int end) {
+  int depth = 1;
+  for (int i = start + 1; i < end; i++) {
+    char *s = trim(lines[i]);
+    if (starts_word(s, "for") || starts_word(s, "while")) depth++;
+    else if (!strcmp(s, "done") && --depth == 0) return i;
+  }
+  return -1;
+}
+
+static char *strip_suffix_keyword(char *s, const char *keyword) {
+  s = trim(s); size_t a = strlen(s), b = strlen(keyword);
+  if (a >= b && !strcmp(s + a - b, keyword)) {
+    s[a - b] = 0; s = trim(s);
+    a = strlen(s); if (a && s[a - 1] == ';') s[a - 1] = 0;
+  }
+  return trim(s);
+}
+
+static int run_condition(char *text) {
+  suppress_errexit++;
+  int rc = execute_command_list(text);
+  suppress_errexit--;
+  return rc;
+}
+
+static int execute_range(char **lines, int start, int end) {
+  for (int i = start; i < end && !exit_requested; i++) {
+    char *s = trim(lines[i]);
+    if (!*s || *s == '#') continue;
+    if (starts_word(s, "if")) {
+      int finish = find_if_end(lines, i, end);
+      if (finish < 0) { fprintf(stderr, "slop: missing fi\n"); return last_status = 2; }
+      int clause = i, handled = 0;
+      while (!handled) {
+        char *cs = trim(lines[clause]);
+        char *cond = strip_suffix_keyword(trim(cs + (starts_word(cs, "elif") ? 4 : 2)), "then");
+        int body = clause + 1;
+        if (!*cond && body < finish && !strcmp(trim(lines[body]), "then")) body++;
+        int next_clause = find_if_clause(lines, clause, finish);
+        if (run_condition(cond) == 0) {
+          execute_range(lines, body, next_clause >= 0 ? next_clause : finish); handled = 1;
+        } else if (next_clause < 0) handled = 1;
+        else if (!strcmp(trim(lines[next_clause]), "else")) {
+          execute_range(lines, next_clause + 1, finish); handled = 1;
+        } else clause = next_clause;
+      }
+      i = finish; continue;
+    }
+    if (starts_word(s, "for")) {
+      int finish = find_done(lines, i, end);
+      if (finish < 0) { fprintf(stderr, "slop: missing done\n"); return last_status = 2; }
+      char *spec = strip_suffix_keyword(trim(s + 3), "do");
+      char *p = spec; Token var = next_token(&p, 0);
+      if (!var.text || !valid_name_n(var.text, strlen(var.text))) { free(var.text); fprintf(stderr, "slop: bad for variable\n"); return last_status = 2; }
+      while (isspace((unsigned char)*p)) p++;
+      int explicit_in = starts_word(p, "in");
+      if (explicit_in) p = trim(p + 2);
+      Command words; memset(&words, 0, sizeof words);
+      if (!explicit_in && !*p) {
+        for (int a = 0; a < shell_argc; a++) append_arg(&words, xstrdup(shell_argv[a]));
+      } else while (*p) { Token w = next_token(&p, 1); if (!w.text) break; append_glob(&words, w); }
+      int body = i + 1; if (body < finish && !strcmp(trim(lines[body]), "do")) body++;
+      for (int w = 0; w < words.argc && !exit_requested; w++) {
+        setenv(var.text, words.argv[w], 1); flow_signal = 0;
+        execute_range(lines, body, finish);
+        if (flow_signal == 1) { flow_signal = 0; break; }
+        if (flow_signal == 2) flow_signal = 0;
+      }
+      free(var.text); free_command(&words); i = finish; continue;
+    }
+    if (starts_word(s, "while")) {
+      int finish = find_done(lines, i, end);
+      if (finish < 0) { fprintf(stderr, "slop: missing done\n"); return last_status = 2; }
+      char *cond = strip_suffix_keyword(trim(s + 5), "do");
+      int body = i + 1; if (body < finish && !strcmp(trim(lines[body]), "do")) body++;
+      int loops = 0;
+      while (!exit_requested && run_condition(cond) == 0) {
+        if (++loops > LOOP_LIMIT) { fprintf(stderr, "slop: loop limit (%d) exceeded\n", LOOP_LIMIT); last_status = 2; break; }
+        flow_signal = 0; execute_range(lines, body, finish);
+        if (flow_signal == 1) { flow_signal = 0; break; }
+        if (flow_signal == 2) flow_signal = 0;
+      }
+      i = finish; continue;
+    }
+    if (!strcmp(s, "then") || !strcmp(s, "else") || starts_word(s, "elif") || !strcmp(s, "fi") ||
+        !strcmp(s, "do") || !strcmp(s, "done")) {
+      fprintf(stderr, "slop: unexpected %s\n", s); return last_status = 2;
+    }
+    execute_command_list(s);
+    if (flow_signal) return last_status;
+  }
+  return last_status;
+}
+
+static int execute_script(char *text) {
+  /* Remove backslash-newline continuations in place. */
+  char *r = text, *w = text;
+  while (*r) {
+    if (r[0] == '\\' && r[1] == '\n') { r += 2; continue; }
+    *w++ = *r++;
+  }
+  *w = 0;
+  char *lines[MAX_LINES]; int n = 0;
+  char *p = text;
+  while (p && *p) {
+    if (n >= MAX_LINES) { fprintf(stderr, "slop: script has too many lines\n"); return 2; }
+    lines[n++] = p;
+    char *nl = strchr(p, '\n');
+    if (!nl) break;
+    *nl = 0; p = nl + 1;
+  }
+  return execute_range(lines, 0, n);
+}
+
+/* ---------------------------------- main --------------------------------- */
+
+static int block_delta(const char *line) {
+  char *copy = xstrdup(line), *s = trim(copy); int d = 0;
+  if (starts_word(s, "if") || starts_word(s, "for") || starts_word(s, "while")) d = 1;
+  if (!strcmp(s, "fi") || !strcmp(s, "done")) d = -1;
+  free(copy); return d;
+}
+
+int main(int argc, char **argv) {
+  setvbuf(stdout, NULL, _IONBF, 0); setvbuf(stderr, NULL, _IONBF, 0);
+  pipe_a = xmalloc(PIPE_CAP); pipe_b = xmalloc(PIPE_CAP); redirect_input = xmalloc(PIPE_CAP); capture_buffer = xmalloc(PIPE_CAP); spawn_env = xmalloc(ENV_CAP);
   const char *pwd = getenv("PWD");
-  if (pwd && is_dir(pwd)) chdir(pwd);
-  else chdir("/home/web");
-  if (getcwd(cwd, sizeof cwd) == NULL) snprintf(cwd, sizeof cwd, "/home/web");
-  normalize(cwd);
-  if (setenv("PWD", cwd, 1) != 0) {
-    fprintf(stderr, "slop: could not initialize PWD: %s\n", strerror(errno));
+  if (pwd && *pwd == '/' && is_dir(pwd)) snprintf(cwd, sizeof cwd, "%s", pwd);
+  else snprintf(cwd, sizeof cwd, "/home/web");
+  normalize(cwd); setenv("PWD", cwd, 1);
+  if (!getenv("PATH")) setenv("PATH", "/bin", 1);
+
+  int force_stdin = 0;
+  if (argc > 1 && !strcmp(argv[1], "--version")) { puts("slop 0.2 (piodide build shell)"); return 0; }
+  if (argc > 1 && (!strcmp(argv[1], "-h") || !strcmp(argv[1], "--help"))) { print_help(stdout); return 0; }
+  if (argc > 2 && !strcmp(argv[1], "-c")) {
+    shell_name = argc > 3 ? argv[3] : argv[0];
+    shell_argc = argc > 4 ? argc - 4 : 0; shell_argv = argc > 4 ? argv + 4 : NULL;
+    char *script = xstrdup(argv[2]); int rc = execute_script(script); free(script);
+    return exit_requested ? exit_status : rc;
+  }
+  if (argc > 1 && strcmp(argv[1], "-s")) {
+    shell_name = argv[1]; shell_argc = argc - 2; shell_argv = argv + 2;
+    int z; char *script = read_file(argv[1], &z, SCRIPT_CAP); (void)z;
+    if (!script) return 2; int rc = execute_script(script); free(script);
+    return exit_requested ? exit_status : rc;
+  }
+  if (argc > 1 && !strcmp(argv[1], "-s")) { shell_argc = argc - 2; shell_argv = argv + 2; force_stdin = 1; }
+
+  int interactive = !force_stdin && isatty(0);
+  const char *quiet_env = getenv("SLOP_QUIET");
+  if (quiet_env && *quiet_env && strcmp(quiet_env, "0")) interactive = 0;
+  if (!interactive) {
+    Buf script; binit(&script); char chunk[8192];
+    while (fgets(chunk, sizeof chunk, stdin)) {
+      if (script.len + strlen(chunk) > SCRIPT_CAP) { fprintf(stderr, "slop: input script too large\n"); free(script.s); return 2; }
+      bputs(&script, chunk);
+    }
+    int rc = execute_script(script.s); free(script.s); return exit_requested ? exit_status : rc;
   }
 
-  if (!quiet) printf("\x1b[1mslop\x1b[0m — the piodide shell · type 'help'\n");
-
-  static char line[SLOP_LINE];
-  static ListItem items[SLOP_MAX_LISTS];
-
-  int exit_requested = 0;
+  printf("\033[1mslop\033[0m — build shell · type 'help'\n");
+  char line[LINE_CAP]; Buf block; binit(&block); int depth = 0;
   while (!exit_requested) {
-    if (!quiet) printf("\x1b[35mslop\x1b[0m \x1b[36m%s\x1b[0m ❯ ", cwd);
-    if (fgets(line, sizeof line, stdin) == NULL) {
-      if (!quiet) printf("\n");
-      break;
-    }
-    int nitems = parse_command_list(line, items);
-    if (nitems < 0) {
-      last_exit = 2;
-      fprintf(stderr, "slop: %s\n", tok_err);
-      continue;
-    }
-    if (nitems == 0) continue;
-
-    for (int i = 0; i < nitems; i++) {
-      int should_run = items[i].condition == LIST_ALWAYS ||
-                       (items[i].condition == LIST_AND && last_exit == 0) ||
-                       (items[i].condition == LIST_OR && last_exit != 0);
-      if (!should_run) continue;
-
-      Command cmds[SLOP_MAX_CMDS];
-      int ncmd = parse_pipeline(items[i].text, cmds, 1);
-      if (ncmd <= 0) {
-        last_exit = 2;
-        fprintf(stderr, "slop: %s\n", tok_err[0] ? tok_err : "invalid pipeline");
-        free_pipeline(cmds, SLOP_MAX_CMDS);
-        break;
-      }
-      if (ncmd == 1 && cmds[0].out_file == NULL && strcmp(cmds[0].argv[0], "exit") == 0) {
-        free_pipeline(cmds, ncmd);
-        exit_requested = 1;
-        break;
-      }
-
-      last_exit = run_pipeline(cmds, ncmd);
-      free_pipeline(cmds, ncmd);
-    }
-
-    free_command_list(items, nitems);
-    if (!quiet && !exit_requested && last_exit != 0) {
-      printf("\x1b[2m↳ exit %d\x1b[0m\n", last_exit);
-    }
+    printf(depth ? "\033[2m> \033[0m" : "\033[35mslop\033[0m \033[36m%s\033[0m ❯ ", cwd);
+    if (!fgets(line, sizeof line, stdin)) { putchar('\n'); break; }
+    bputs(&block, line); depth += block_delta(line);
+    if (depth > 0) continue;
+    if (depth < 0) { fprintf(stderr, "slop: unexpected block terminator\n"); depth = 0; block.len = 0; block.s[0] = 0; continue; }
+    execute_script(block.s); block.len = 0; block.s[0] = 0;
+    if (!exit_requested && last_status) printf("\033[2m↳ exit %d\033[0m\n", last_status);
   }
-  return last_exit;
+  free(block.s); return exit_requested ? exit_status : last_status;
 }

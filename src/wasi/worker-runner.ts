@@ -32,6 +32,58 @@ export interface WorkerPort {
   setHandler(handler: (message: WasiWorkerInit) => void): void;
 }
 
+function parseEnvironment(bytes: Uint8Array): Record<string, string> {
+  const env: Record<string, string> = {};
+  for (const entry of new TextDecoder().decode(bytes).split("\0")) {
+    const equals = entry.indexOf("=");
+    if (equals > 0) env[entry.slice(0, equals)] = entry.slice(equals + 1);
+  }
+  return env;
+}
+
+function createSpawnImport(host: WasiHost, fs: RpcFsClient, withEnvironment: boolean) {
+  return (pathPtr: number, argvPtr: number, cwdPtr: number, ioPtr: number): number => {
+    const path = host.readCString(pathPtr);
+    const args = host.readCStringArray(argvPtr);
+    const cwd = host.readCString(cwdPtr);
+
+    let stdinText: Uint8Array | undefined;
+    let capture = false;
+    let outFile: string | undefined;
+    let append = false;
+    let capturePtr = 0;
+    let captureCap = 0;
+    let captureLenPtr = 0;
+    let env: Record<string, string> | undefined;
+
+    if (ioPtr !== 0) {
+      const stdinPtr = host.readUint32(ioPtr);
+      const stdinLen = host.readUint32(ioPtr + 4);
+      capturePtr = host.readUint32(ioPtr + 8);
+      captureCap = host.readUint32(ioPtr + 12);
+      captureLenPtr = host.readUint32(ioPtr + 16);
+      const outFilePtr = host.readUint32(ioPtr + 20);
+      append = host.readUint32(ioPtr + 24) !== 0;
+      if (stdinPtr !== 0 && stdinLen > 0) stdinText = host.readBytes(stdinPtr, stdinLen);
+      capture = capturePtr !== 0;
+      if (outFilePtr !== 0) outFile = host.readCString(outFilePtr);
+      if (withEnvironment) {
+        const envPtr = host.readUint32(ioPtr + 28);
+        const envLen = host.readUint32(ioPtr + 32);
+        if (envPtr !== 0 && envLen > 0) env = parseEnvironment(host.readBytes(envPtr, envLen));
+      }
+    }
+
+    const result = fs.spawnRpc({ path, args, cwd, stdinText, capture, outFile, append, env });
+    if (capture && result.stdout) {
+      const copied = Math.min(captureCap, result.stdout.byteLength);
+      host.writeBytes(capturePtr, result.stdout.subarray(0, copied));
+      if (captureLenPtr !== 0) host.writeUint32(captureLenPtr, result.stdout.byteLength);
+    }
+    return result.exitCode;
+  };
+}
+
 export function startWasiWorker(port: WorkerPort): void {
   port.setHandler((init) => {
     void (async () => {
@@ -51,60 +103,10 @@ export function startWasiWorker(port: WorkerPort): void {
           extendImports: init.spawnApi
             ? (host: WasiHost) => ({
                 piodide: {
-                  /**
-                   * spawn(path, argv_blob, cwd, io*) — the io struct (slop_io
-                   * in shell/src/slop.c) routes stdin/stdout:
-                   *   +0  stdin_data ptr   +4  stdin_len
-                   *   +8  capture ptr      +12 capture_cap
-                   *   +16 capture_len out-ptr
-                   *   +20 out_file ptr     +24 out_append
-                   */
-                  spawn: (pathPtr: number, argvPtr: number, cwdPtr: number, ioPtr: number): number => {
-                    const path = host.readCString(pathPtr);
-                    const args = host.readCStringArray(argvPtr);
-                    const cwd = host.readCString(cwdPtr);
-
-                    let stdinText: Uint8Array | undefined;
-                    let capture = false;
-                    let outFile: string | undefined;
-                    let append = false;
-                    let capturePtr = 0;
-                    let captureCap = 0;
-                    let captureLenPtr = 0;
-
-                    if (ioPtr !== 0) {
-                      const stdinPtr = host.readUint32(ioPtr);
-                      const stdinLen = host.readUint32(ioPtr + 4);
-                      capturePtr = host.readUint32(ioPtr + 8);
-                      captureCap = host.readUint32(ioPtr + 12);
-                      captureLenPtr = host.readUint32(ioPtr + 16);
-                      const outFilePtr = host.readUint32(ioPtr + 20);
-                      append = host.readUint32(ioPtr + 24) !== 0;
-                      if (stdinPtr !== 0 && stdinLen > 0) {
-                        stdinText = host.readBytes(stdinPtr, stdinLen);
-                      }
-                      capture = capturePtr !== 0;
-                      if (outFilePtr !== 0) outFile = host.readCString(outFilePtr);
-                    }
-
-                    const result = fs.spawnRpc({
-                      path,
-                      args,
-                      cwd,
-                      stdinText,
-                      capture,
-                      outFile,
-                      append,
-                    });
-                    if (capture && result.stdout) {
-                      const copied = Math.min(captureCap, result.stdout.byteLength);
-                      host.writeBytes(capturePtr, result.stdout.subarray(0, copied));
-                      if (captureLenPtr !== 0) {
-                        host.writeUint32(captureLenPtr, result.stdout.byteLength);
-                      }
-                    }
-                    return result.exitCode;
-                  },
+                  // v2 remains available to older shell binaries. v3 appends
+                  // a NUL-separated exported-environment blob to slop_io.
+                  spawn: createSpawnImport(host, fs, false),
+                  spawn_v3: createSpawnImport(host, fs, true),
                 },
               })
             : undefined,

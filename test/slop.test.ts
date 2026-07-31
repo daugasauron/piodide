@@ -16,6 +16,10 @@ import { WasiHost } from "../src/wasi/host.ts";
 const here = dirname(fileURLToPath(import.meta.url));
 const shellBin = (name: string) =>
   new Uint8Array(readFileSync(join(here, "..", "shell", "bin", name)));
+const COREUTILS = [
+  "rm", "cp", "mv", "mkdir", "rmdir", "touch", "ln", "head", "tail", "wc", "sort",
+  "cut", "tr", "tee", "basename", "dirname", "seq", "cmp", "install", "readlink", "find", "mktemp",
+];
 
 interface SlopRun {
   stdout: string;
@@ -24,9 +28,12 @@ interface SlopRun {
 }
 
 function installShell(fs: MemoryFs): void {
-  for (const name of ["slop", "ls", "cat", "fd-find", "echo", "env", "grep"]) {
+  for (const name of ["slop", "make", "sed", "ar", "ls", "cat", "fd-find", "echo", "env", "grep"]) {
     fs.writeFile(`/bin/${name}`, shellBin(`${name}.wasm`));
   }
+  fs.writeFile("/bin/sh", shellBin("slop.wasm"));
+  const coreutils = shellBin("coreutils.wasm");
+  for (const name of COREUTILS) fs.writeFile(`/bin/${name}`, coreutils);
 }
 
 async function runSlop(
@@ -36,9 +43,12 @@ async function runSlop(
 ): Promise<SlopRun> {
   // Pre-compile child modules (instantiation itself is synchronous).
   const modules = new Map<string, WebAssembly.Module>();
-  for (const name of ["slop", "cat", "ls", "fd-find", "echo", "env", "grep"] as const) {
+  for (const name of ["slop", "make", "sed", "ar", "cat", "ls", "fd-find", "echo", "env", "grep"] as const) {
     modules.set(name, await WebAssembly.compile(shellBin(`${name}.wasm`) as BufferSource));
   }
+  const coreutilsModule = await WebAssembly.compile(shellBin("coreutils.wasm") as BufferSource);
+  for (const name of COREUTILS) modules.set(name, coreutilsModule);
+  modules.set("sh", modules.get("slop")!);
 
   let stdout = "";
   const decoder = new TextDecoder();
@@ -51,6 +61,7 @@ async function runSlop(
     capture?: { ptr: number; cap: number; lenPtr: number };
     outFile?: string;
     append?: boolean;
+    env?: Record<string, string>;
   }
 
   const runProgram = (
@@ -67,7 +78,7 @@ async function runSlop(
     const fileChunks: Uint8Array[] = [];
     const host = new WasiHost({
       args,
-      env: { PATH: "/bin", PWD: cwd, TERM: "ghostty" },
+      env: { PATH: "/bin", PWD: cwd, TERM: "ghostty", ...(io.env ?? {}) },
       fs,
       preopens: [{ name: ".", path: cwd }, "/home/web", "/", "/bin"],
       stdin: () => {
@@ -89,9 +100,10 @@ async function runSlop(
       },
       extendImports: (childHost) => ({
         piodide: {
-          spawn: (pathPtr: number, argvPtr: number, cwdPtr: number, ioPtr: number): number => {
-            return handleSpawn(childHost, pathPtr, argvPtr, cwdPtr, ioPtr);
-          },
+          spawn: (pathPtr: number, argvPtr: number, cwdPtr: number, ioPtr: number): number =>
+            handleSpawn(childHost, pathPtr, argvPtr, cwdPtr, ioPtr, false),
+          spawn_v3: (pathPtr: number, argvPtr: number, cwdPtr: number, ioPtr: number): number =>
+            handleSpawn(childHost, pathPtr, argvPtr, cwdPtr, ioPtr, true),
         },
       }),
     });
@@ -133,6 +145,7 @@ async function runSlop(
     argvPtr: number,
     cwdPtr: number,
     ioPtr: number,
+    withEnvironment: boolean,
   ): number => {
     const path = callerHost.readCString(pathPtr);
     const childArgs = callerHost.readCStringArray(argvPtr);
@@ -157,6 +170,17 @@ async function runSlop(
       if (outFilePtr !== 0) {
         io.outFile = callerHost.readCString(outFilePtr);
         io.append = append;
+      }
+      if (withEnvironment) {
+        const envPtr = callerHost.readUint32(ioPtr + 28);
+        const envLen = callerHost.readUint32(ioPtr + 32);
+        if (envPtr !== 0 && envLen > 0) {
+          io.env = {};
+          for (const entry of decoder.decode(callerHost.readBytes(envPtr, envLen)).split("\0")) {
+            const equals = entry.indexOf("=");
+            if (equals > 0) io.env[entry.slice(0, equals)] = entry.slice(equals + 1);
+          }
+        }
       }
     }
     return runProgram(childName, childArgs, childCwd, io, callerHost);
@@ -186,9 +210,10 @@ async function runSlop(
     },
     extendImports: (host) => ({
       piodide: {
-        spawn: (pathPtr: number, argvPtr: number, cwdPtr: number, ioPtr: number): number => {
-          return handleSpawn(host, pathPtr, argvPtr, cwdPtr, ioPtr);
-        },
+        spawn: (pathPtr: number, argvPtr: number, cwdPtr: number, ioPtr: number): number =>
+          handleSpawn(host, pathPtr, argvPtr, cwdPtr, ioPtr, false),
+        spawn_v3: (pathPtr: number, argvPtr: number, cwdPtr: number, ioPtr: number): number =>
+          handleSpawn(host, pathPtr, argvPtr, cwdPtr, ioPtr, true),
       },
     }),
   });
@@ -206,6 +231,40 @@ test("slop: quiet one-shot mode emits only command output", async () => {
 
   assert.equal(run.exitCode, 0);
   assert.equal(run.stdout, "exact output\n");
+});
+
+test("slop: scripts, control flow, utilities, substitution, and exported env", async () => {
+  const fs = new MemoryFs();
+  fs.mkdirTree("/home/web");
+  installShell(fs);
+  fs.writeFile("/home/web/one.txt", "one\n");
+  fs.writeFile("/home/web/two.txt", "two\n");
+
+  const run = await runSlop(
+    fs,
+    [
+      "set -e",
+      "export CHILD_VALUE=inherited",
+      "env | grep CHILD_VALUE",
+      "for x in c a b; do",
+      "  echo $x >> raw.txt",
+      "done",
+      "FIRST=$(sort raw.txt | head -n 1)",
+      "if test \"$FIRST\" = a; then",
+      "  echo control-ok",
+      "else",
+      "  echo control-failed",
+      "fi",
+      "echo *.txt | grep one.txt",
+    ],
+    { quiet: true },
+  );
+
+  assert.equal(run.exitCode, 0);
+  assert.match(run.stdout, /CHILD_VALUE=inherited\n/);
+  assert.match(run.stdout, /control-ok\n/);
+  assert.match(run.stdout, /one\.txt/);
+  assert.doesNotMatch(run.stdout, /control-failed/);
 });
 
 test("slop: builtins, PATH lookup, spawning, and cwd", async () => {
@@ -413,10 +472,10 @@ test("slop: oversized expanded spawn arguments fail before the host call", async
   fs.mkdirTree("/home/web");
   installShell(fs);
 
-  const run = await runSlop(fs, [`echo ${"$PWD".repeat(1020)}`]);
+  const run = await runSlop(fs, [`cat ${"$PWD".repeat(2000)}`]);
 
   assert.equal(run.exitCode, 2);
-  assert.match(run.stdout, /serialized arguments exceed 8192 bytes/);
+  assert.match(run.stdout, /argument list too long/);
 });
 
 test("slop: command-list syntax errors have no side effects", async () => {

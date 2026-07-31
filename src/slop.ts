@@ -19,8 +19,16 @@ import { runToolchainInBrowser } from "./c-compiler.ts";
 import { normalizePath } from "./wasi/abi.ts";
 import type { CompileOptions, LinkOptions } from "./wasi/toolchain.ts";
 
-const SHELL_BINARIES = ["slop", "ls", "cat", "fd-find", "echo", "env", "grep"];
-const SHELL_SOURCES = ["slop.c", "ls.c", "cat.c", "fd-find.c", "echo.c", "env.c", "grep.c"];
+const SHELL_BINARIES = ["slop", "make", "sed", "ar", "ls", "cat", "fd-find", "echo", "env", "grep"];
+const COREUTILS = [
+  "rm", "cp", "mv", "mkdir", "rmdir", "touch", "ln", "head", "tail", "wc", "sort",
+  "cut", "tr", "tee", "basename", "dirname", "seq", "cmp", "install", "readlink", "find", "mktemp",
+];
+const SHELL_SOURCES = [
+  "slop.c", "make.c", "coreutils.c", "sed.c", "ar.c", "spawn_stub.c", "patch_import.py",
+  "Makefile", "README.md",
+  "ls.c", "cat.c", "fd-find.c", "echo.c", "env.c", "grep.c",
+];
 const MAX_CHILDREN = 32;
 const MAX_C_SOURCE_BYTES = 512 * 1024;
 const MAX_TOOLCHAIN_INPUTS = 32;
@@ -47,8 +55,16 @@ export function ensureSlopInstalled(py: Pyodide, note?: (text: string) => void):
       for (const name of SHELL_BINARIES) {
         const response = await fetch(`${base}slop/bin/${name}`);
         if (!response.ok) throw new Error(`could not fetch ${name} (HTTP ${response.status})`);
-        py.FS.writeFile(`/bin/${name}`, new Uint8Array(await response.arrayBuffer()));
+        const bytes = new Uint8Array(await response.arrayBuffer());
+        py.FS.writeFile(`/bin/${name}`, bytes);
+        if (name === "slop") py.FS.writeFile("/bin/sh", bytes);
       }
+      const coreutilsResponse = await fetch(`${base}slop/bin/coreutils`);
+      if (!coreutilsResponse.ok) {
+        throw new Error(`could not fetch coreutils (HTTP ${coreutilsResponse.status})`);
+      }
+      const coreutils = new Uint8Array(await coreutilsResponse.arrayBuffer());
+      for (const name of COREUTILS) py.FS.writeFile(`/bin/${name}`, coreutils);
       try {
         for (const name of SHELL_SOURCES) {
           const response = await fetch(`${base}slop/src/${name}`);
@@ -76,6 +92,8 @@ interface SpawnRequest {
   capture?: boolean;
   outFile?: string;
   append?: boolean;
+  /** Exported environment supplied by the spawning shell (spawn ABI v3). */
+  env?: Record<string, string>;
 }
 
 interface SpawnResult {
@@ -104,7 +122,7 @@ export class SlopSpawner {
   }
 
   async onSpawn(request: SpawnRequest): Promise<SpawnResult> {
-    const { path, args, cwd, stdinText, capture, outFile, append } = request;
+    const { path, args, cwd, stdinText, capture, outFile, append, env } = request;
     if (path === "compile" || path === "cc") {
       return { exitCode: await this.toolchainCompile(args.slice(1), cwd, path) };
     }
@@ -168,7 +186,7 @@ export class SlopSpawner {
       {
         executablePath: path,
         args: args.slice(1),
-        env: { PATH: "/bin", PWD: cwd, TERM: "ghostty" },
+        env: { PATH: "/bin", PWD: cwd, TERM: "ghostty", ...(env ?? {}) },
         preopens: shellPreopens(cwd),
         interactiveStdin: true,
         stdinProvider,

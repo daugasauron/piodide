@@ -66,6 +66,7 @@ export interface WasiProgramRequest {
     capture?: boolean;
     outFile?: string;
     append?: boolean;
+    env?: Record<string, string>;
   }) => Promise<{ exitCode: number; stdout?: Uint8Array }>;
   /** Internal: current spawn nesting depth. */
   spawnDepth?: number;
@@ -216,6 +217,7 @@ function startInWorker(
       cwd,
       stdinText,
       capture,
+      env,
     }: {
       path: string;
       args: string[];
@@ -224,13 +226,14 @@ function startInWorker(
       capture?: boolean;
       outFile?: string;
       append?: boolean;
+      env?: Record<string, string>;
     }): Promise<{ exitCode: number; stdout?: Uint8Array }> => {
       if (spawnDepth >= MAX_SPAWN_DEPTH) return { exitCode: 126 };
       const captured: Uint8Array[] = [];
       const child = startWasiProgram(py, {
         executablePath: path,
         args: args.slice(1),
-        env: { PATH: "/bin", PWD: cwd, ...(request.env ?? {}) },
+        env: { PATH: "/bin", PWD: cwd, ...(request.env ?? {}), ...(env ?? {}) },
         preopens: [{ name: ".", path: cwd }, "/home/web", "/", "/bin"],
         timeoutMs: request.timeoutMs ?? DEFAULT_TIMEOUT_MS,
         spawnDepth: spawnDepth + 1,

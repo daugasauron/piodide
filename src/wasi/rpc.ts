@@ -140,6 +140,7 @@ export class RpcFsClient implements WasiFs {
     capture?: boolean;
     outFile?: string;
     append?: boolean;
+    env?: Record<string, string>;
   }): { exitCode: number; stdout?: Uint8Array } {
     const { response, blob } = this.request(
       "spawn",
@@ -150,6 +151,7 @@ export class RpcFsClient implements WasiFs {
         capture: request.capture ?? false,
         outFile: request.outFile ?? null,
         append: request.append ?? false,
+        env: request.env ?? null,
       },
       request.stdinText,
     );
@@ -288,6 +290,7 @@ export interface RpcFsServerOptions {
     capture?: boolean;
     outFile?: string;
     append?: boolean;
+    env?: Record<string, string>;
   }) => Promise<{ exitCode: number; stdout?: Uint8Array }>;
   signal?: AbortSignal;
 }
@@ -447,6 +450,7 @@ export function serveWasiFsRpc(options: RpcFsServerOptions): RpcFsServer {
             capture: args.capture === true,
             outFile: (args.outFile as string) ?? undefined,
             append: args.append === true,
+            env: (args.env as Record<string, string>) ?? undefined,
           });
           respond({ errno: 0, exitCode: result.exitCode }, result.stdout);
         } catch (error) {

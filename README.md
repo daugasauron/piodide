@@ -46,7 +46,7 @@ Open <http://localhost:5173/piodide/>, run `/provider`, then `/model`.
 | [Workspace](docs/workspace.md) | Pyodide filesystem, Neovim, files, GitHub |
 | [Local models](docs/local-models.md) | WebLLM, Wllama, GPU setup, model cache |
 | [Agent tools](docs/agent-tools.md) | Python, files, Git, previews, C toolchain |
-| [Slop shell](docs/slop.md) | Commands, pipes, redirects, compilation |
+| [Slop build shell](docs/slop.md) | Scripts, Make, utilities, pipes, and compilation |
 | [WASI runtime](docs/wasi.md) | Host design, execution modes, Python bridge |
 | [Development](docs/development.md) | Scripts, tests, Pages, screenshots |
 | [Codex proxy](docs/codex-proxy.md) | Optional loopback subscription bridge |
