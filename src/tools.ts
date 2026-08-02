@@ -8,6 +8,7 @@
  *   download -> save a MEMFS file through the browser
  *   git     -> local Dulwich repositories + GitHub API synchronization
  *   image   -> display an image file from the MEMFS
+ *   html_debug -> check an HTML file in a hidden sandbox
  *   html    -> display an HTML file in a sandboxed browser popout
  *   compile_c -> compile one C source file to a wasm32-wasi object
  *   link_wasi -> link object files into a WASI executable
@@ -117,6 +118,19 @@ const HtmlParams = Type.Object({
   path: Type.String({
     description: "Self-contained HTML file in the in-browser filesystem.",
   }),
+});
+
+const HtmlDebugParams = Type.Object({
+  path: Type.String({
+    description: "Self-contained HTML file in the in-browser filesystem.",
+  }),
+  settleMs: Type.Optional(
+    Type.Number({
+      minimum: 100,
+      maximum: 5000,
+      description: "Time after load to capture asynchronous errors (default 1000 ms).",
+    }),
+  ),
 });
 
 const CompileCParams = Type.Object({
@@ -239,6 +253,10 @@ export interface HtmlDetails {
   path: string;
   bytes: number;
 }
+export interface HtmlDebugDetails extends HtmlDetails {
+  durationMs: number;
+  messages: string[];
+}
 export interface CompileCDetails {
   path: string;
   output: string;
@@ -261,8 +279,13 @@ export interface SlopDetails {
   command: string;
   cwd: string;
   exitCode: number;
+  stdout: string;
+  stderr: string;
+  stdoutBytes: number;
+  stderrBytes: number;
   outputBytes: number;
   truncated: boolean;
+  stream?: "stdout" | "stderr";
 }
 
 /* ------------------------------- python -------------------------------- */
@@ -555,16 +578,40 @@ export function createSlopTool(
         throw new Error("Command line too long.");
       }
 
-      let output = "";
+      let stdout = "";
+      let stderr = "";
       let truncated = false;
-      const append = (chunk: string) => {
-        if (output.length >= MAX_WASI_OUTPUT_CHARS) {
+      let outputLength = 0;
+      const append = (channel: "stdout" | "stderr", chunk: string) => {
+        if (outputLength >= MAX_WASI_OUTPUT_CHARS) {
           truncated = true;
-          return;
+          return "";
         }
-        const remaining = MAX_WASI_OUTPUT_CHARS - output.length;
-        output += chunk.slice(0, remaining);
+        const remaining = MAX_WASI_OUTPUT_CHARS - outputLength;
+        const captured = chunk.slice(0, remaining);
+        if (channel === "stdout") stdout += captured;
+        else stderr += captured;
+        outputLength += captured.length;
         if (chunk.length > remaining) truncated = true;
+        return captured;
+      };
+
+      const emitUpdate = (channel: "stdout" | "stderr", chunk: string) => {
+        onUpdate?.({
+          content: [text(chunk)],
+          details: {
+            command: params.command,
+            cwd,
+            exitCode: -1,
+            stdout,
+            stderr,
+            stdoutBytes: byteLength(stdout),
+            stderrBytes: byteLength(stderr),
+            outputBytes: byteLength(stdout) + byteLength(stderr),
+            truncated,
+            stream: channel,
+          },
+        });
       };
 
       const result = await runSlopCommand(
@@ -573,32 +620,37 @@ export function createSlopTool(
         {
           cwd,
           onStdout: (chunk) => {
-            append(chunk);
-            onUpdate?.({
-              content: [text(chunk)],
-              details: {
-                command: params.command,
-                cwd,
-                exitCode: -1,
-                outputBytes: byteLength(output),
-                truncated,
-              },
-            });
+            const captured = append("stdout", chunk);
+            if (captured) emitUpdate("stdout", captured);
+          },
+          onStderr: (chunk) => {
+            const captured = append("stderr", chunk);
+            if (captured) emitUpdate("stderr", captured);
           },
           signal,
         },
       );
+
+      const renderChannel = (name: string, value: string) => {
+        const body = value || "(empty)\n";
+        return `${name}:\n${body}${body.endsWith("\n") ? "" : "\n"}`;
+      };
       const rendered =
-        (output || "") +
+        renderChannel("stdout", stdout) +
+        renderChannel("stderr", stderr) +
         (truncated ? "\n…<slop output truncated>\n" : "") +
         `[exit ${result.exitCode}]\n`;
       return {
-        content: [text(rendered || `(no output)\n[exit ${result.exitCode}]\n`)],
+        content: [text(rendered)],
         details: {
           command: params.command,
           cwd,
           exitCode: result.exitCode,
-          outputBytes: byteLength(output),
+          stdout,
+          stderr,
+          stdoutBytes: byteLength(stdout),
+          stderrBytes: byteLength(stderr),
+          outputBytes: byteLength(stdout) + byteLength(stderr),
           truncated,
         },
       };
@@ -682,6 +734,191 @@ export function createImageTool(py: Pyodide): AgentTool<typeof ImageParams, Imag
 }
 
 /* -------------------------------- html --------------------------------- */
+
+const HTML_DEBUG_CHANNEL = "piodide-html-debug";
+const MAX_HTML_DEBUG_MESSAGES = 40;
+const MAX_HTML_DEBUG_MESSAGE_LENGTH = 1000;
+
+interface HtmlDebugReport {
+  channel: typeof HTML_DEBUG_CHANNEL;
+  token: string;
+  kind: "ready" | "load" | "console" | "error";
+  level?: "log" | "info" | "warn" | "error";
+  message?: string;
+}
+
+/** Inject diagnostics before the page's own scripts without changing its origin. */
+export function instrumentHtmlForDebug(html: string, token: string): string {
+  const prelude = `<script>(() => {
+  const channel = ${JSON.stringify(HTML_DEBUG_CHANNEL)};
+  const token = ${JSON.stringify(token)};
+  const send = (kind, detail = {}) => parent.postMessage({ channel, token, kind, ...detail }, "*");
+  const format = (value) => {
+    if (value instanceof Error) return value.stack || (value.name + ": " + value.message);
+    if (typeof value === "string") return value;
+    try { return JSON.stringify(value); } catch { return String(value); }
+  };
+  for (const level of ["log", "info", "warn", "error"]) {
+    const original = console[level].bind(console);
+    console[level] = (...values) => {
+      send("console", { level, message: values.map(format).join(" ") });
+      original(...values);
+    };
+  }
+  addEventListener("error", (event) => {
+    if (event.target !== window) {
+      const target = event.target;
+      const location = target?.src || target?.href || target?.currentSrc || "";
+      send("error", { message: "Resource failed: " + (target?.tagName || "unknown") + (location ? " " + location : "") });
+      return;
+    }
+    send("error", { message: event.error?.stack || event.message || "Unknown script error" });
+  }, true);
+  addEventListener("unhandledrejection", (event) => {
+    send("error", { message: "Unhandled promise rejection: " + format(event.reason) });
+  });
+  addEventListener("load", () => send("load"), { once: true });
+  send("ready");
+})();</script>`;
+
+  const head = /<head(?:\s[^>]*)?>/i.exec(html);
+  if (head?.index !== undefined) {
+    const offset = head.index + head[0].length;
+    return html.slice(0, offset) + prelude + html.slice(offset);
+  }
+  const doctype = /^\s*<!doctype[^>]*>/i.exec(html);
+  const offset = doctype?.[0].length ?? 0;
+  return html.slice(0, offset) + prelude + html.slice(offset);
+}
+
+function htmlDebugMessage(report: HtmlDebugReport): string {
+  const prefix = report.kind === "console" ? `[console.${report.level}] ` : "";
+  return (prefix + (report.message ?? ""))
+    .replace(/[\r\n]+/g, " ")
+    .slice(0, MAX_HTML_DEBUG_MESSAGE_LENGTH);
+}
+
+export function createHtmlDebugTool(
+  py: Pyodide,
+): AgentTool<typeof HtmlDebugParams, HtmlDebugDetails> {
+  return {
+    name: "html_debug",
+    label: "HTML debug",
+    description:
+      "Run a self-contained HTML file in an invisible opaque-origin sandbox before showing " +
+      "it. Captures console output, console errors, uncaught exceptions, unhandled promise " +
+      "rejections, and resource failures. Fix reported errors and rerun this tool until it " +
+      "passes, then call html exactly once for the user-visible result.",
+    parameters: HtmlDebugParams,
+    executionMode: "sequential",
+    async execute(_id, params, signal) {
+      const path = fsResolve(py, params.path);
+      if (!fsExists(py, path)) throw new Error(`File not found: ${path}`);
+      if (fsIsDir(py, path)) throw new Error(`Path is a directory: ${path}`);
+
+      const html = fsReadText(py, path);
+      const bytes = byteLength(html);
+      if (bytes > MAX_HTML_BYTES) {
+        throw new Error(`HTML exceeds the ${MAX_HTML_BYTES / 1024 / 1024} MB limit.`);
+      }
+
+      const settleMs = Math.max(100, Math.min(5000, params.settleMs ?? 1000));
+      const token = typeof crypto.randomUUID === "function"
+        ? crypto.randomUUID()
+        : `${Date.now()}-${Math.random()}`;
+      const iframe = document.createElement("iframe");
+      iframe.dataset.htmlDebug = "true";
+      iframe.setAttribute("aria-hidden", "true");
+      iframe.setAttribute("tabindex", "-1");
+      iframe.inert = true;
+      iframe.setAttribute("sandbox", "allow-scripts allow-forms");
+      iframe.setAttribute("referrerpolicy", "no-referrer");
+      iframe.style.cssText =
+        "position:fixed;inset:0;width:100vw;height:100vh;border:0;opacity:0;" +
+        "pointer-events:none;z-index:-1";
+
+      const reports: HtmlDebugReport[] = [];
+      const errors = new Set<string>();
+      let ready = false;
+      let loaded = false;
+      let settleTimer = 0;
+      let hardTimer = 0;
+      let cleanup = () => {};
+      const startedAt = performance.now();
+
+      await new Promise<void>((resolve) => {
+        let finished = false;
+        const finish = () => {
+          if (finished) return;
+          finished = true;
+          window.clearTimeout(settleTimer);
+          window.clearTimeout(hardTimer);
+          resolve();
+        };
+        const onMessage = (event: MessageEvent) => {
+          const report = event.data as Partial<HtmlDebugReport> | null;
+          if (
+            event.source !== iframe.contentWindow ||
+            report?.channel !== HTML_DEBUG_CHANNEL ||
+            report.token !== token
+          ) return;
+          if (report.kind === "ready") ready = true;
+          if (report.kind === "load") {
+            loaded = true;
+            window.clearTimeout(hardTimer);
+            window.clearTimeout(settleTimer);
+            settleTimer = window.setTimeout(finish, settleMs);
+          }
+          if (report.kind === "console" || report.kind === "error") {
+            const normalized = htmlDebugMessage(report as HtmlDebugReport);
+            if (reports.length < MAX_HTML_DEBUG_MESSAGES) {
+              reports.push(report as HtmlDebugReport);
+            }
+            if (report.kind === "error" || report.level === "error") errors.add(normalized);
+          }
+        };
+        const onAbort = () => {
+          errors.add("HTML debug aborted");
+          finish();
+        };
+        cleanup = () => {
+          window.removeEventListener("message", onMessage);
+          signal?.removeEventListener("abort", onAbort);
+        };
+        if (signal?.aborted) {
+          onAbort();
+          return;
+        }
+        window.addEventListener("message", onMessage);
+        signal?.addEventListener("abort", onAbort, { once: true });
+        hardTimer = window.setTimeout(() => {
+          errors.add("Page did not finish loading within 5 seconds");
+          finish();
+        }, 5000);
+        document.body.append(iframe);
+        iframe.srcdoc = instrumentHtmlForDebug(html, token);
+      });
+
+      cleanup();
+      iframe.remove();
+      if (!ready) errors.add("Debug instrumentation did not start");
+      if (!loaded) errors.add("Page load event was not reached");
+      const durationMs = Math.round(performance.now() - startedAt);
+      const messages = reports.map(htmlDebugMessage).filter(Boolean);
+      if (errors.size > 0) {
+        throw new Error(`HTML debug failed for ${path}:\n${[...errors].map((error) => `- ${error}`).join("\n")}`);
+      }
+
+      const output = messages.length > 0
+        ? `\n${messages.join("\n")}`
+        : "";
+      return {
+        content: [text(`HTML debug passed: ${path} (${bytes} bytes, ${durationMs} ms)${output}\n`)],
+        details: { path, bytes, durationMs, messages },
+      };
+    },
+  };
+}
 
 export function createHtmlTool(py: Pyodide): AgentTool<typeof HtmlParams, HtmlDetails> {
   return {
@@ -966,6 +1203,7 @@ export function createAllTools(
     createGitTool(py, getGitHubCredentials),
     createFetchTool(py),
     createImageTool(py),
+    createHtmlDebugTool(py),
     createHtmlTool(py),
   ];
 }

@@ -231,6 +231,108 @@ async function exerciseHtmlPreview(client, expectedWidth, expectedHeight, expect
   if (!closed.value) throw new Error("HTML preview did not return to the agent");
 }
 
+async function exerciseHtmlDebug(client) {
+  const evaluation = await client.send("Runtime.evaluate", {
+    expression: `(async () => {
+      const tool = window.__pi.agent.state.tools.find(({ name }) => name === "html_debug");
+      if (!tool) throw new Error("html_debug tool is missing");
+      window.__pi.py.FS.writeFile(
+        "/home/web/e2e-debug-good.html",
+        "<!doctype html><script>console.log('debug-ready')</script><h1>ok</h1>"
+      );
+      const passed = await tool.execute(
+        "e2e-html-debug-good",
+        { path: "/home/web/e2e-debug-good.html", settleMs: 100 }
+      );
+      window.__pi.py.FS.writeFile(
+        "/home/web/e2e-debug-bad.html",
+        "<!doctype html><script>setTimeout(() => { throw new Error('debug-sentinel') }, 0)</script>"
+      );
+      let failed = "";
+      try {
+        await tool.execute(
+          "e2e-html-debug-bad",
+          { path: "/home/web/e2e-debug-bad.html", settleMs: 100 }
+        );
+      } catch (error) {
+        failed = error instanceof Error ? error.message : String(error);
+      }
+      return {
+        passed: passed.content?.[0]?.text ?? "",
+        failed,
+        previewHidden: document.querySelector("#html-preview").hidden,
+        debugFrames: document.querySelectorAll("iframe[data-html-debug]").length
+      };
+    })()`,
+    awaitPromise: true,
+    returnByValue: true,
+  });
+  if (evaluation.exceptionDetails) {
+    throw new Error(
+      `HTML debug check threw: ${evaluation.exceptionDetails.exception?.description ?? evaluation.exceptionDetails.text}`,
+    );
+  }
+  const state = evaluation.result.value;
+  if (
+    !state.passed.includes("HTML debug passed") ||
+    !state.passed.includes("debug-ready") ||
+    !state.failed.includes("debug-sentinel") ||
+    !state.previewHidden ||
+    state.debugFrames !== 0
+  ) {
+    throw new Error(`Unexpected HTML debug result: ${JSON.stringify(state)}`);
+  }
+}
+
+async function exerciseSlopChannels(client) {
+  const evaluation = await client.send("Runtime.evaluate", {
+    expression: `(async () => {
+      const tool = window.__pi.agent.state.tools.find(({ name }) => name === "slop");
+      if (!tool) throw new Error("slop tool is missing");
+      const systemPrompt = window.__pi.agent.state.systemPrompt;
+      const result = await tool.execute(
+        "e2e-slop-channels",
+        { command: "echo shell-out; python -c \\\"import sys; print('python-out'); print('python-err', file=sys.stderr)\\\"; nosuchcmd" }
+      );
+      return {
+        stdout: result.details?.stdout ?? "",
+        stderr: result.details?.stderr ?? "",
+        stdoutBytes: result.details?.stdoutBytes ?? -1,
+        stderrBytes: result.details?.stderrBytes ?? -1,
+        content: result.content?.[0]?.text ?? "",
+        promptUsesDirectWasi:
+          systemPrompt.includes("run_wasi")
+          && (
+            systemPrompt.includes("do not route ordinary WASI execution through Python")
+            || systemPrompt.includes("Do not run WASI through Python")
+          )
+      };
+    })()`,
+    awaitPromise: true,
+    returnByValue: true,
+  });
+  if (evaluation.exceptionDetails) {
+    throw new Error(
+      `Slop channel check threw: ${evaluation.exceptionDetails.exception?.description ?? evaluation.exceptionDetails.text}`,
+    );
+  }
+  const state = evaluation.result.value;
+  if (
+    !state.stdout.includes("shell-out") ||
+    !state.stdout.includes("python-out") ||
+    state.stdout.includes("python-err") ||
+    !state.stderr.includes("python-err") ||
+    !state.stderr.includes("command not found: nosuchcmd") ||
+    state.stdoutBytes <= 0 ||
+    state.stderrBytes <= 0 ||
+    !state.content.includes("stdout:\n") ||
+    !state.content.includes("stderr:\n") ||
+    !state.promptUsesDirectWasi
+  ) {
+    throw new Error(`Unexpected Slop channels: ${JSON.stringify(state)}`);
+  }
+}
+
 async function shortcut(client, key, code) {
   // DevTools modifier bits: Ctrl=2, Shift=8.
   await press(client, key, code, 10);
@@ -296,6 +398,8 @@ async function main() {
       mobile: false,
     });
     await waitForPython(client);
+    await exerciseHtmlDebug(client);
+    await exerciseSlopChannels(client);
     await exerciseHtmlPreview(client, viewport.width, viewport.height, false);
     await focusTerminal(client);
 
@@ -362,6 +466,32 @@ async function main() {
       returnByValue: true,
     });
     console.log(`mobile environment ${mobileEnvironment.value}`);
+    const { result: mobileFooterResult } = await client.send("Runtime.evaluate", {
+      expression: `(() => {
+        const usage = document.querySelector("#footer-usage");
+        const model = document.querySelector("#footer-model");
+        const usageRect = usage.getBoundingClientRect();
+        const modelRect = model.getBoundingClientRect();
+        return JSON.stringify({
+          usageX: Math.round(usageRect.x),
+          usageY: Math.round(usageRect.y),
+          modelX: Math.round(modelRect.x),
+          modelY: Math.round(modelRect.y),
+          usageFits: usage.scrollWidth <= usage.clientWidth,
+          modelFits: model.scrollWidth <= model.clientWidth
+        });
+      })()`,
+      returnByValue: true,
+    });
+    const mobileFooter = JSON.parse(mobileFooterResult.value);
+    if (
+      mobileFooter.usageX !== mobileFooter.modelX ||
+      mobileFooter.modelY <= mobileFooter.usageY ||
+      !mobileFooter.usageFits ||
+      !mobileFooter.modelFits
+    ) {
+      throw new Error(`Unexpected mobile footer layout: ${mobileFooterResult.value}`);
+    }
 
     // Exercise the actual edge gesture, not only the visible fallback button.
     await client.send("Input.dispatchTouchEvent", {
@@ -661,8 +791,16 @@ async function main() {
     const { result: viewportResult } = await client.send("Runtime.evaluate", {
       expression: `JSON.stringify({
         appHeight: getComputedStyle(document.documentElement).getPropertyValue("--app-height"),
+        appWidth: getComputedStyle(document.documentElement).getPropertyValue("--app-width"),
         visualHeight: Math.round(visualViewport.height),
+        visualWidth: Math.round(visualViewport.width),
+        bodyX: Math.round(document.body.getBoundingClientRect().x),
+        bodyY: Math.round(document.body.getBoundingClientRect().y),
+        bodyWidth: Math.round(document.body.getBoundingClientRect().width),
         bodyHeight: Math.round(document.body.getBoundingClientRect().height),
+        layoutScrollX: window.scrollX,
+        layoutScrollY: window.scrollY,
+        terminalInputFontSize: getComputedStyle(window.__pi.term.textarea).fontSize,
         viewportAtBottom: window.__pi.term.viewportY
       })`,
       returnByValue: true,
@@ -670,7 +808,14 @@ async function main() {
     const keyboardViewport = JSON.parse(viewportResult.value);
     if (
       keyboardViewport.appHeight !== `${keyboardViewport.visualHeight}px` ||
+      keyboardViewport.appWidth !== `${keyboardViewport.visualWidth}px` ||
+      keyboardViewport.bodyX !== 0 ||
+      keyboardViewport.bodyY !== 0 ||
+      keyboardViewport.bodyWidth !== keyboardViewport.visualWidth ||
       keyboardViewport.bodyHeight !== keyboardViewport.visualHeight ||
+      keyboardViewport.layoutScrollX !== 0 ||
+      keyboardViewport.layoutScrollY !== 0 ||
+      keyboardViewport.terminalInputFontSize !== "16px" ||
       keyboardViewport.viewportAtBottom !== 0
     ) {
       throw new Error(`Terminal did not follow the visual viewport: ${viewportResult.value}`);

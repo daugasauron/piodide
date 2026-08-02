@@ -8,12 +8,13 @@ All tools operate inside the browser and share `/home/web`.
 | --- | --- |
 | `python` | Long-lived Pyodide CPython |
 | `read`, `write`, `edit` | Bounded text-file operations |
-| `slop` | One shell command or pipeline |
+| `slop` | One shell command or pipeline; separate stdout/stderr |
 | `compile_c`, `link_wasi`, `run_wasi` | Build and run wasm32-wasi programs |
 | `git` | Local Dulwich repository and GitHub snapshots |
 | `fetch` | Browser fetch, subject to CORS |
 | `download` | Export a file after the user asks |
 | `image` | Render PNG, JPEG, GIF, or WebP in the terminal |
+| `html_debug` | Check HTML errors in a hidden sandbox |
 | `html` | Open a sandboxed, full-screen HTML preview |
 
 | Image output | HTML preview |

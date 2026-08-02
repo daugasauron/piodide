@@ -183,12 +183,26 @@ function configureTouchScroll(term: Terminal, mount: HTMLElement): void {
   let startX = 0;
   let startY = 0;
   let lastY = 0;
-  let rowCarry = 0;
+  let pendingRows = 0;
+  let scrollFrame = 0;
   let scrolling = false;
 
+  const flushScroll = () => {
+    scrollFrame = 0;
+    if (pendingRows === 0) return;
+    term.scrollLines(-pendingRows);
+    pendingRows = 0;
+  };
+
+  const queueScroll = (rows: number) => {
+    pendingRows += rows;
+    if (!scrollFrame) scrollFrame = requestAnimationFrame(flushScroll);
+  };
+
   const reset = () => {
+    if (scrollFrame) cancelAnimationFrame(scrollFrame);
+    flushScroll();
     touchId = null;
-    rowCarry = 0;
     scrolling = false;
   };
 
@@ -202,7 +216,7 @@ function configureTouchScroll(term: Terminal, mount: HTMLElement): void {
     startX = touch.clientX;
     startY = touch.clientY;
     lastY = touch.clientY;
-    rowCarry = 0;
+    pendingRows = 0;
     scrolling = false;
   }, { passive: true, capture: true });
 
@@ -220,13 +234,11 @@ function configureTouchScroll(term: Terminal, mount: HTMLElement): void {
     event.preventDefault();
     event.stopPropagation();
     const rowHeight = Math.max(12, mount.clientHeight / Math.max(1, term.rows));
-    rowCarry += (touch.clientY - lastY) / rowHeight;
+    // ghostty-web accepts fractional rows. Applying them once per animation
+    // frame avoids redundant canvas renders and removes the old whole-row
+    // stepping that made short drags feel sticky.
+    queueScroll(((touch.clientY - lastY) / rowHeight) * 1.35);
     lastY = touch.clientY;
-    const rows = Math.trunc(rowCarry);
-    if (rows !== 0) {
-      term.scrollLines(-rows);
-      rowCarry -= rows;
-    }
   }, { passive: false, capture: true });
 
   const finish = (event: TouchEvent) => {

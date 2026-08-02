@@ -81,7 +81,7 @@ Tools:
 - python: run focused, valid CPython 3 code; stdout/stderr is shown live and returned to you. Never use notebook ! commands, pip, os.system, or subprocess. Install a pure-Python package only when needed with: import micropip; await micropip.install("pkg").
 - compile_c: compile one bounded C source file to a wasm32-wasi .o object. It supports C11/C17, -O0/-O1/-O2/-O3/-Os, DWARF debug info, warnings/-Werror, -D definitions, and additional /home/web include directories.
 - link_wasi: link one or more .o files into a WASI .wasm executable with wasm-ld and WASI libc. It can export selected symbols and optionally strip the result. The compiler, linker, and sysroot assets are lazily downloaded.
-- run_wasi: run a WASI .wasm file from /home/web with arguments, stdin, and environment variables. The program shares the live Pyodide filesystem (no copying): files it creates, edits, or deletes are immediately visible everywhere. Relative paths start at /home/web, and absolute /home/web paths also work. From Python you can also import wasi and await wasi.run_wasi(path, args=[...], stdin="...").
+- run_wasi: run a WASI .wasm file from /home/web with arguments, stdin, and environment variables. The program shares the live Pyodide filesystem (no copying): files it creates, edits, or deletes are immediately visible everywhere. Relative paths start at /home/web, and absolute /home/web paths also work. Use this tool directly to verify a linked executable; do not route ordinary WASI execution through Python.
 - slop: run one command line in the Slop build shell. It supports buffered pipes, < / > / >> redirects, &&/|| lists, variables and defaults, command substitution, globbing, and common builtins. /bin includes make, sh, sed, basic ar, file utilities, ls/cat/grep/echo/env/fd-find, and host-routed cc/ld. Each tool call uses a fresh shell — filesystem changes persist, shell variables and cwd do not (pass cwd; default /home/web). Use slop for bounded shell-style jobs instead of Python file crunching.
 - read: read a text file with line numbers; offset (1-based) and limit paginate large files.
 - write: create or overwrite a file; parent directories are created automatically.
@@ -90,7 +90,8 @@ Tools:
 - git: use a real Dulwich Git repository in /home/web for init/status/add/commit/log/diff. GitHub clone/pull/push use its browser-compatible API; private access is registered by the user with /github and is never visible to you. The remote adapter synchronizes committed snapshots, so commit before push and push before pull.
 - fetch: fetch a URL via the browser's native fetch (CORS-limited); set path to save a binary response in /home/web. Saving a file does not display it.
 - image: display a PNG, JPEG, GIF, or WebP file from /home/web directly in the terminal. This is the only display path; call it exactly once.
-- html: open a self-contained HTML file from /home/web in a closeable browser preview. Write one file with inline CSS and JavaScript, then call html exactly once. The sandboxed srcdoc has an opaque origin: localStorage, sessionStorage, IndexedDB, relative fetches, and relative MEMFS assets are unavailable. Keep state in JavaScript memory and embed every required asset, including Wasm bytes, in the HTML.
+- html_debug: run a self-contained HTML file invisibly in the same opaque-origin sandbox and report console errors, uncaught exceptions, rejected promises, and resource failures. Use it after writing or editing HTML, fix every reported error, then call html.
+- html: open a self-contained HTML file from /home/web in a closeable browser preview only after html_debug passes. Write one file with inline CSS and JavaScript, then call html exactly once. The sandboxed srcdoc has an opaque origin: localStorage, sessionStorage, IndexedDB, relative fetches, and relative MEMFS assets are unavailable. Keep state in JavaScript memory and embed every required asset, including Wasm bytes, in the HTML.
 
 Environment and memory constraints:
 - Pyodide, Python objects, loaded packages, and MEMFS files all consume the page's WebAssembly memory. It can grow toward a hard wasm32 ceiling of about 4 GB and cannot be safely recovered after exhaustion.
@@ -111,7 +112,7 @@ C/WASI toolchain:
 - cc and ld are host-routed Slop pseudo-commands, not WASI files in /bin. cc compiles exactly one .c source to one .o object; invoke it once per translation unit, then pass objects to ld in link order.
 - The first toolchain use downloads and compiles roughly 52 MB of Clang 8, wasm-ld, and sysroot assets. Reuse the cache and avoid speculative compiles. Compilation runs in a disposable worker when cross-origin isolation is available and may take materially longer than Python or the small /bin commands.
 - Defaults are C11 and -O2. This is a legacy WASI libc/toolchain: C11 and C17 are supported, direct errno access is compatibility-patched, and relative file paths start at the supplied cwd. chdir/getcwd, native subprocesses, threads, sockets, dynamic loading, and host OS access are unavailable. Generated modules currently use the legacy wasi_unstable namespace, which this runtime supports alongside wasi_snapshot_preview1.
-- Keep sources and outputs small. A serial, practical Make subset and a basic ar utility are installed, but there is no package manager or native executable output. The host linker still consumes explicit .o inputs rather than ar archives. A linked executable runs only through run_wasi, ./path inside slop, Python's wasi.run_wasi, or an exact-name command installed in /bin.
+- Keep sources and outputs small. A serial, practical Make subset and a basic ar utility are installed, but there is no package manager or native executable output. The host linker still consumes explicit .o inputs rather than ar archives. Use run_wasi as the default way to execute and verify a linked module. Use ./path inside slop only when execution belongs in a shell workflow. Python's wasi.run_wasi bridge exists for explicit Python/WASI integration, but its async boundary is awkward and unnecessary for normal execution.
 
 Extending the shell (self-hosting):
 - You can add commands: write a small C program with the write tool, compile it with cc -c file.c -o file.o, then link it with ld file.o -o /bin/name (or use compile_c + link_wasi). It runs immediately by exact name through slop. Relative paths automatically start at the cwd supplied by slop.
@@ -119,9 +120,9 @@ Extending the shell (self-hosting):
 To show an image, save it as a file and then call the image tool exactly once. A fetch,
 python, or reasoning result does not display the file. Do not print binary image bytes or
 base64 into the terminal, and do not call image again for the same display request.
-To show an interactive page, write a self-contained .html file and call the html tool exactly
-once. Keep its CSS and JavaScript inline. Never add allow-same-origin or depend on browser
-storage in the preview.
+To show an interactive page, write a self-contained .html file, run html_debug until it passes,
+then call the html tool exactly once. Keep its CSS and JavaScript inline. Never add
+allow-same-origin or depend on browser storage in the preview.
 
 Be concise and pragmatic. Prefer running code over long prose. Use python for math, data, and exploration. Use write/edit to change files, then confirm briefly.`;
 
@@ -137,9 +138,9 @@ Tools:
 - read, write, and edit operate on text files in /home/web. edit requires an exact unique oldText match.
 - slop runs one bounded command in the Slop build shell, with pipes, redirects, variables, substitution, globbing, Make, sed, file utilities, and host-routed cc/ld. Each tool call has a fresh cwd and shell state; pass cwd when needed. It is not Bash and cannot access host commands.
 - python runs focused, valid CPython 3 in the long-lived Pyodide runtime. Never use notebook ! commands, pip, os.system, or subprocess. Pure-Python packages can be installed with micropip when necessary.
-- compile_c compiles one C11/C17 source to a wasm32-wasi object. link_wasi links objects with WASI libc. run_wasi executes the resulting module. The first compile downloads about 52 MB; avoid speculative builds.
+- compile_c compiles one C11/C17 source to a wasm32-wasi object. link_wasi links objects with WASI libc. run_wasi directly executes the resulting module and is the default way to verify it. Do not run WASI through Python unless the user specifically asks for Python/WASI integration. The first compile downloads about 52 MB; avoid speculative builds.
 - git manages the browser-local Dulwich repository. GitHub network operations require credentials registered separately by the user.
-- fetch is browser fetch and is CORS-limited. download exports a file only when the user asks. image displays an image exactly once. html opens one self-contained HTML file. Its sandboxed srcdoc has an opaque origin, so browser storage and relative MEMFS fetches do not work; inline every dependency and keep runtime state in JavaScript memory.
+- fetch is browser fetch and is CORS-limited. download exports a file only when the user asks. image displays an image exactly once. html_debug invisibly checks one self-contained HTML file for startup errors; use it before html. html opens that file only after the check passes. The sandboxed srcdoc has an opaque origin, so browser storage and relative MEMFS fetches do not work; inline every dependency and keep runtime state in JavaScript memory.
 
 Constraints:
 - Pyodide objects and /home/web files consume a wasm32 heap with a hard ceiling near 4 GB. Avoid unbounded work, large copies, and speculative package installs.
@@ -275,8 +276,15 @@ const yellow = (s: string) => `\x1b[33m${s}\x1b[0m`;
 let viewportSyncFrame = 0;
 
 function syncVisualViewport() {
-  const height = window.visualViewport?.height ?? window.innerHeight;
+  const viewport = window.visualViewport;
+  const height = viewport?.height ?? window.innerHeight;
+  const width = viewport?.width ?? window.innerWidth;
   document.documentElement.style.setProperty("--app-height", `${Math.round(height)}px`);
+  document.documentElement.style.setProperty("--app-width", `${Math.round(width)}px`);
+  // The app owns all scrolling inside its terminal/menu surfaces. Some mobile
+  // browsers leave the layout viewport slightly panned after dismissing the
+  // keyboard; pin it back so the fixed shell cannot reopen clipped at an edge.
+  if (window.scrollX !== 0 || window.scrollY !== 0) window.scrollTo(0, 0);
   window.cancelAnimationFrame(viewportSyncFrame);
   viewportSyncFrame = window.requestAnimationFrame(() => {
     const terminal = activeView === "slop" ? slopHandle : handle;
@@ -384,7 +392,7 @@ function demoRequest(): string {
 
 The current client is a ${phone ? "phone/touch device" : "desktop/laptop"} at ${window.innerWidth}×${window.innerHeight} CSS pixels. ${controls}
 
-Implement the game simulation, rules, and scoring in C under /home/web, include a trivial main for the WASI linker, compile it to WebAssembly with compile_c and link_wasi, and export the small pure functions the browser needs. Verify the C/Wasm before presenting it. Then create one self-contained HTML file with polished inline CSS and JavaScript and open it with the html tool exactly once at the end.
+Implement the game simulation, rules, and scoring in C under /home/web, include a trivial main for the WASI linker, compile it to WebAssembly with compile_c and link_wasi, and export the small pure functions the browser needs. Verify the linked module directly with run_wasi; do not execute it through Python. Then create one self-contained HTML file with polished inline CSS and JavaScript, run html_debug and fix every reported error, and open it with the html tool exactly once at the end.
 
 The preview is a sandboxed srcdoc with an opaque origin. It cannot fetch relative /home/web files and cannot use localStorage, sessionStorage, or IndexedDB. Embed the Wasm bytes directly in the HTML (for example as base64 or a byte array), keep state in memory, provide any required WASI imports, and do not invoke a WASI _start function from the page. Do the work with tools; do not merely describe what you would build.`;
 }
@@ -1792,22 +1800,34 @@ function printSlopCall(args: unknown) {
   const cwd = typeof values.cwd === "string" ? values.cwd : "/home/web";
   const valueWidth = Math.max(32, writer.cols - 15);
 
-  writer.writeln(dim("  ⏺ slop"));
-  writer.writeln(dim(`    cwd    ${exactStringPreview(cwd, valueWidth)}`));
-  writer.writeln(dim(`    input  ${exactStringPreview(command, valueWidth)}`));
+  writer.writeln(`  ${cyan("⏺ slop")}`);
+  writer.writeln(`    ${dim("cwd  ")} ${exactStringPreview(cwd, valueWidth)}`);
+  writer.writeln(`    ${dim("input")} ${cyan(exactStringPreview(command, valueWidth))}`);
 }
 
-function slopOutputText(result: any, exitCode: unknown): string {
+function legacySlopOutputText(result: any, exitCode: unknown): string {
   const text = toolResultText(result);
   const marker = `[exit ${exitCode ?? "?"}]\n`;
   return text.endsWith(marker) ? text.slice(0, -marker.length) : text;
 }
 
-function printSlopOutput(result: any, exitCode: unknown) {
-  const output = slopOutputText(result, exitCode);
-  writer.writeln(dim("    output"));
+function slopOutputChannels(result: any, exitCode: unknown) {
+  const details = result?.details;
+  if (typeof details?.stdout === "string" && typeof details?.stderr === "string") {
+    return { stdout: details.stdout, stderr: details.stderr };
+  }
+  return { stdout: legacySlopOutputText(result, exitCode), stderr: "" };
+}
+
+function printSlopChannel(
+  name: "stdout" | "stderr",
+  output: string,
+) {
+  const headerColor = name === "stdout" ? cyan : red;
+  const textColor = name === "stdout" ? ((value: string) => value) : yellow;
+  writer.writeln(`    ${headerColor(name)}`);
   if (!output) {
-    writer.writeln(dim("    │ (no output)"));
+    writer.writeln(`    ${headerColor("│")} ${dim("(empty)")}`);
     return;
   }
 
@@ -1820,7 +1840,9 @@ function printSlopOutput(result: any, exitCode: unknown) {
   const maxLineLength = Math.max(24, writer.cols - 8);
   const printLine = (line: string) => {
     const safe = line.replaceAll("\x1b", "\\x1b");
-    writer.writeln(dim(`    │ ${truncateLine(safe, maxLineLength)}`));
+    writer.writeln(
+      `    ${headerColor("│")} ${textColor(truncateLine(safe, maxLineLength))}`,
+    );
   };
 
   if (lines.length <= headCount + tailCount + 1) {
@@ -1828,8 +1850,19 @@ function printSlopOutput(result: any, exitCode: unknown) {
     return;
   }
   for (const line of lines.slice(0, headCount)) printLine(line);
-  writer.writeln(dim(`    │ … ${lines.length - headCount - tailCount} lines omitted`));
+  writer.writeln(
+    `    ${headerColor("│")} ${dim(`… ${lines.length - headCount - tailCount} lines omitted`)}`,
+  );
   for (const line of lines.slice(-tailCount)) printLine(line);
+}
+
+function printSlopOutput(result: any, exitCode: unknown) {
+  const channels = slopOutputChannels(result, exitCode);
+  printSlopChannel("stdout", channels.stdout);
+  printSlopChannel("stderr", channels.stderr);
+  if (result?.details?.truncated) {
+    writer.writeln(yellow("    … slop output truncated"));
+  }
 }
 
 function printPythonPreview(code: string) {
@@ -1964,6 +1997,7 @@ async function renderEvent(event: AgentEvent) {
           case "git": footer = `  ↳ git ${d.operation ?? "done"}${d.cwd ? ` · ${d.cwd}` : ""}`; break;
           case "fetch": footer = `  ↳ fetch · HTTP ${d.status ?? "?"} · ${d.bytes ?? 0} bytes`; break;
           case "image": footer = `  ↳ image · ${d.bytes ?? 0} bytes${d.path ? ` · ${d.path}` : ""}`; break;
+          case "html_debug": footer = `  ↳ html debug · ${d.bytes ?? 0} bytes · ${((d.durationMs ?? 0) / 1000).toFixed(1)}s${d.path ? ` · ${d.path}` : ""}`; break;
           case "html": footer = `  ↳ html · ${d.bytes ?? 0} bytes${d.path ? ` · ${d.path}` : ""}`; break;
           default: footer = `  ↳ ${event.toolName} done`;
         }

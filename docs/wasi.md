@@ -44,7 +44,9 @@ import wasi
 result = await wasi.run_wasi("/home/web/app.wasm", args=["arg1"])
 ```
 
-The agent uses `run_wasi`; Slop runs a module by command name or `./path`.
+The agent verifies modules directly with `run_wasi`. Slop runs one by command
+name or `./path` when execution belongs in a shell workflow. The Python bridge
+is for explicit Python/WASI integration.
 
 ## Host surface
 

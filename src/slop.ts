@@ -118,6 +118,7 @@ interface SpawnResult {
 interface SlopSpawnerDeps {
   py: Pyodide;
   writeOut: (text: string) => void;
+  writeError: (text: string) => void;
   note: (text: string) => void;
   /** Interactive stdin for children (the session's tty buffer; EOF otherwise). */
   childStdin: () => Promise<Uint8Array | null> | Uint8Array | null;
@@ -148,7 +149,7 @@ export class SlopSpawner {
     }
 
     if (this.activeChildren >= MAX_CHILDREN) {
-      this.deps.writeOut(`slop: too many nested programs\r\n`);
+      this.deps.writeError(`slop: too many nested programs\r\n`);
       return { exitCode: 126 };
     }
     this.activeChildren++;
@@ -167,7 +168,7 @@ export class SlopSpawner {
       }
     }
     if (fileError) {
-      this.deps.writeOut(`slop: ${outFile}: ${fileError}\r\n`);
+      this.deps.writeError(`slop: ${outFile}: ${fileError}\r\n`);
       this.activeChildren--;
       return { exitCode: 1 };
     }
@@ -211,7 +212,7 @@ export class SlopSpawner {
         spawnHandler: (nested) => this.onSpawn(nested),
         onStdoutBytes: capture || outFile ? writeChunk : undefined,
         onStdout: capture || outFile ? undefined : this.deps.writeOut,
-        onStderr: this.deps.writeOut,
+        onStderr: this.deps.writeError,
       },
       this.deps.signal,
     );
@@ -241,7 +242,7 @@ export class SlopSpawner {
 
   private async python(request: SpawnRequest): Promise<SpawnResult> {
     if (this.activeChildren >= MAX_CHILDREN) {
-      this.deps.writeOut("slop: too many nested programs\r\n");
+      this.deps.writeError("slop: too many nested programs\r\n");
       return { exitCode: 126 };
     }
     this.activeChildren++;
@@ -272,13 +273,13 @@ export class SlopSpawner {
         env: request.env,
         stdin: request.stdinText,
         stdout,
-        stderr: this.deps.writeOut,
+        stderr: this.deps.writeError,
       });
       return request.capture
         ? { exitCode, stdout: concatChunks(captured, capturedBytes) }
         : { exitCode };
     } catch (error) {
-      this.deps.writeOut(
+      this.deps.writeError(
         "python: " + (error instanceof Error ? error.message : String(error)) + "\r\n",
       );
       return { exitCode: 1 };
@@ -319,7 +320,7 @@ export class SlopSpawner {
       if (arg === "-c") continue;
       if (arg === "-o") {
         if (i + 1 >= args.length) {
-          this.deps.writeOut(`${command}: -o requires a path\r\n`);
+          this.deps.writeError(`${command}: -o requires a path\r\n`);
           return 2;
         }
         output = args[++i];
@@ -348,7 +349,7 @@ export class SlopSpawner {
       if (arg === "-D" || arg.startsWith("-D")) {
         const define = arg === "-D" ? args[++i] : arg.slice(2);
         if (!define || !/^[A-Za-z_][A-Za-z0-9_]*(?:=.*)?$/.test(define)) {
-          this.deps.writeOut(`${command}: invalid -D definition\r\n`);
+          this.deps.writeError(`${command}: invalid -D definition\r\n`);
           return 2;
         }
         defines.push(define);
@@ -357,42 +358,42 @@ export class SlopSpawner {
       if (arg === "-I" || arg.startsWith("-I")) {
         const include = arg === "-I" ? args[++i] : arg.slice(2);
         if (!include) {
-          this.deps.writeOut(`${command}: -I requires a directory\r\n`);
+          this.deps.writeError(`${command}: -I requires a directory\r\n`);
           return 2;
         }
         const resolved = this.resolveInCwd(include, cwd);
         if (!fsExists(this.deps.py, resolved) || !fsIsDir(this.deps.py, resolved)) {
-          this.deps.writeOut(`${command}: include directory not found: ${resolved}\r\n`);
+          this.deps.writeError(`${command}: include directory not found: ${resolved}\r\n`);
           return 2;
         }
         includePaths.push(resolved);
         continue;
       }
       if (arg.startsWith("-")) {
-        this.deps.writeOut(`${command}: unsupported option: ${arg}\r\n`);
+        this.deps.writeError(`${command}: unsupported option: ${arg}\r\n`);
         return 2;
       }
       positional.push(arg);
     }
     if (positional.length !== 1) {
-      this.deps.writeOut(this.compileUsage(command));
+      this.deps.writeError(this.compileUsage(command));
       return 2;
     }
     if (defines.length > MAX_TOOLCHAIN_INPUTS || includePaths.length > MAX_TOOLCHAIN_INPUTS) {
-      this.deps.writeOut(`${command}: too many -D or -I options\r\n`);
+      this.deps.writeError(`${command}: too many -D or -I options\r\n`);
       return 2;
     }
     const sourcePath = this.resolveInCwd(positional[0], cwd);
     if (!sourcePath.toLowerCase().endsWith(".c")) {
-      this.deps.writeOut(`${command}: source file must end in .c\r\n`);
+      this.deps.writeError(`${command}: source file must end in .c\r\n`);
       return 2;
     }
     if (!fsExists(this.deps.py, sourcePath) || fsIsDir(this.deps.py, sourcePath)) {
-      this.deps.writeOut(`${command}: source file not found: ${sourcePath}\r\n`);
+      this.deps.writeError(`${command}: source file not found: ${sourcePath}\r\n`);
       return 2;
     }
     if (this.deps.py.FS.stat(sourcePath).size > MAX_C_SOURCE_BYTES) {
-      this.deps.writeOut(`${command}: source exceeds the 512 KiB limit\r\n`);
+      this.deps.writeError(`${command}: source exceeds the 512 KiB limit\r\n`);
       return 2;
     }
     const defaultOut = sourcePath.toLowerCase().endsWith(".c")
@@ -400,11 +401,11 @@ export class SlopSpawner {
       : `${sourcePath}.o`;
     const outputPath = output ? this.resolveInCwd(output, cwd) : defaultOut;
     if (!outputPath.toLowerCase().endsWith(".o")) {
-      this.deps.writeOut(`${command}: compiler output must end in .o\r\n`);
+      this.deps.writeError(`${command}: compiler output must end in .o\r\n`);
       return 2;
     }
     if (outputPath === sourcePath) {
-      this.deps.writeOut(`${command}: output cannot overwrite the source file\r\n`);
+      this.deps.writeError(`${command}: output cannot overwrite the source file\r\n`);
       return 2;
     }
     options.defines = defines;
@@ -416,10 +417,10 @@ export class SlopSpawner {
         { operation: "compile", sourcePath, outputPath, options },
         this.deps.signal,
       );
-      if (result.diagnostics) this.deps.writeOut(result.diagnostics.replaceAll("\n", "\r\n"));
+      if (result.diagnostics) this.deps.writeError(result.diagnostics.replaceAll("\n", "\r\n"));
       return 0;
     } catch (error) {
-      this.deps.writeOut(
+      this.deps.writeError(
         `${command}: ${error instanceof Error ? error.message : String(error)}\r\n`.replaceAll("\n", "\r\n"),
       );
       return 1;
@@ -444,7 +445,7 @@ export class SlopSpawner {
       }
       if (arg === "-o") {
         if (i + 1 >= args.length) {
-          this.deps.writeOut(`${command}: -o requires a path\r\n`);
+          this.deps.writeError(`${command}: -o requires a path\r\n`);
           return 2;
         }
         output = args[++i];
@@ -457,24 +458,24 @@ export class SlopSpawner {
       if (arg === "--export" || arg.startsWith("--export=")) {
         const symbol = arg === "--export" ? args[++i] : arg.slice("--export=".length);
         if (!symbol || !/^[A-Za-z_.$][A-Za-z0-9_.$]*$/.test(symbol)) {
-          this.deps.writeOut(`${command}: invalid exported symbol\r\n`);
+          this.deps.writeError(`${command}: invalid exported symbol\r\n`);
           return 2;
         }
         exports.push(symbol);
         continue;
       }
       if (arg.startsWith("-")) {
-        this.deps.writeOut(`${command}: unsupported option: ${arg}\r\n`);
+        this.deps.writeError(`${command}: unsupported option: ${arg}\r\n`);
         return 2;
       }
       objects.push(arg);
     }
     if (objects.length === 0 || !output) {
-      this.deps.writeOut(this.linkUsage(command));
+      this.deps.writeError(this.linkUsage(command));
       return 2;
     }
     if (objects.length > MAX_TOOLCHAIN_INPUTS || exports.length > MAX_TOOLCHAIN_INPUTS) {
-      this.deps.writeOut(`${command}: too many object files or exports\r\n`);
+      this.deps.writeError(`${command}: too many object files or exports\r\n`);
       return 2;
     }
     const objectPaths = objects.map((object) => this.resolveInCwd(object, cwd));
@@ -485,12 +486,12 @@ export class SlopSpawner {
         !fsExists(this.deps.py, objectPath) ||
         fsIsDir(this.deps.py, objectPath)
       ) {
-        this.deps.writeOut(`${command}: object file not found: ${objectPath}\r\n`);
+        this.deps.writeError(`${command}: object file not found: ${objectPath}\r\n`);
         return 2;
       }
     }
     if (!outputPath.toLowerCase().endsWith(".wasm") && !outputPath.startsWith("/bin/")) {
-      this.deps.writeOut(`${command}: output must end in .wasm or be inside /bin\r\n`);
+      this.deps.writeError(`${command}: output must end in .wasm or be inside /bin\r\n`);
       return 2;
     }
     options.exports = exports;
@@ -501,10 +502,10 @@ export class SlopSpawner {
         { operation: "link", objectPaths, outputPath, options },
         this.deps.signal,
       );
-      if (result.diagnostics) this.deps.writeOut(result.diagnostics.replaceAll("\n", "\r\n"));
+      if (result.diagnostics) this.deps.writeError(result.diagnostics.replaceAll("\n", "\r\n"));
       return 0;
     } catch (error) {
-      this.deps.writeOut(
+      this.deps.writeError(
         `${command}: ${error instanceof Error ? error.message : String(error)}\r\n`.replaceAll("\n", "\r\n"),
       );
       return 1;
@@ -529,6 +530,7 @@ export interface SlopCommandOptions {
   /** Working directory for the fresh shell (default /home/web). */
   cwd?: string;
   onStdout?: (text: string) => void;
+  onStderr?: (text: string) => void;
   note?: (text: string) => void;
   /** Worker mode only; 0 disables (default 30s). */
   timeoutMs?: number;
@@ -549,6 +551,7 @@ export async function runSlopCommand(
   const spawner = new SlopSpawner({
     py,
     writeOut: options.onStdout ?? (() => {}),
+    writeError: options.onStderr ?? options.onStdout ?? (() => {}),
     note: options.note ?? (() => {}),
     childStdin: () => null, // deterministic EOF for interactive reads
     signal: options.signal,
@@ -565,7 +568,7 @@ export async function runSlopCommand(
       timeoutMs: options.timeoutMs ?? 30_000,
       spawnHandler: (request) => spawner.onSpawn(request),
       onStdout: options.onStdout,
-      onStderr: options.onStdout,
+      onStderr: options.onStderr ?? options.onStdout,
     },
     options.signal,
   );
@@ -616,6 +619,7 @@ export class SlopSession {
     this.spawner = new SlopSpawner({
       py: deps.py,
       writeOut: deps.writeOut,
+      writeError: deps.writeOut,
       note: deps.note,
       childStdin: () => this.input.next(),
     });

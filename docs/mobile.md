@@ -14,8 +14,10 @@ Tap the floating `/` button or swipe left from the right edge.
 4. Choose `/thinking` to set the model's supported effort level.
 5. Try `/demo` to generate a touch-first C/WebAssembly game.
 
-The drawer is limited to these five commands. Terminal swipes scroll history;
-the keyboard's Done button submits the current line. API keys stay in page memory
+The drawer is limited to these five commands. Terminal swipes scroll history
+with frame-batched, fractional movement;
+the keyboard's Done button submits the current line. The status footer stacks its
+model and usage rows on narrow screens. API keys stay in page memory
 and are cleared on refresh. General GLM keys are checked without running a
 completion. Coding Plan keys are validated by the first real request because
 the Coding endpoint has no compatible non-billable key check. A GLM value
