@@ -130,6 +130,8 @@ export class MobileCommandUi implements MobilePromptSurface {
     });
     this.widthQuery.addEventListener("change", () => this.syncAvailability());
     this.coarsePointerQuery.addEventListener("change", () => this.syncAvailability());
+    window.addEventListener("resize", () => this.syncAvailability());
+    window.visualViewport?.addEventListener("resize", () => this.syncAvailability());
     this.syncAvailability();
   }
 
@@ -283,7 +285,10 @@ export class MobileCommandUi implements MobilePromptSurface {
           try {
             input.value = await readMobileClipboard(navigator.clipboard);
             input.dispatchEvent(new Event("input"));
-            message.textContent = "Pasted. The key stays in this browser tab.";
+            const suffix = input.value.slice(-4);
+            message.textContent = `Pasted ${input.value.length} characters${
+              suffix ? `, ending ${suffix}` : ""
+            }. The key stays in this browser tab.`;
           } catch (error) {
             const prefix =
               error instanceof Error && /contain text/i.test(error.message)

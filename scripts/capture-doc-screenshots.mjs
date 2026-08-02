@@ -290,6 +290,9 @@ async function main() {
       deviceScaleFactor: 1,
       mobile: true,
     });
+    // Do not let the readiness poll observe the old execution context while
+    // Page.reload is still navigating.
+    await client.send("Runtime.evaluate", { expression: `delete window.__pi` });
     await client.send("Page.reload", { ignoreCache: true });
     await waitForPython(client);
     const { result: mobileEnvironment } = await client.send("Runtime.evaluate", {
@@ -412,14 +415,18 @@ async function main() {
             window.__piodideGlmResponses.push({
               url,
               status: response.status,
-              body: await response.clone().text()
+              body: await response.clone().text(),
+              requestBody: typeof args[1]?.body === "string" ? args[1].body : ""
             });
           }
           return response;
         };
       })()`,
     });
-    const loginTestKey = glmApiKey || "docs-mobile-paste-test";
+    const cleanLoginTestKey = glmApiKey || "docs.mobile-paste-test";
+    // Mobile rich-text clipboards can surround an otherwise valid token with
+    // invisible bidirectional format marks. Exercise that exact cleanup path.
+    const loginTestKey = `\u202A${cleanLoginTestKey}\u2069`;
     const { result: pasteHandle } = await client.send("Runtime.evaluate", {
       expression: `[...document.querySelectorAll("button")]
         .find((button) => button.textContent === "Paste")`,
@@ -441,7 +448,10 @@ async function main() {
       objectId: pasteHandle.objectId,
       functionDeclaration: `function(expected) {
         const input = document.querySelector(".mobile-command-input");
-        const pasted = input?.value === expected;
+        const message = document.querySelector(".mobile-command-form-message")?.textContent ?? "";
+        const pasted = input?.value === expected
+          && message.includes("Pasted " + expected.length + " characters")
+          && message.includes("ending " + expected.slice(-4));
         if (pasted) input.form.requestSubmit();
         return pasted;
       }`,
@@ -465,6 +475,49 @@ async function main() {
     if (keyCheckResult.value !== false) {
       throw new Error("Coding Plan login made an incompatible /models request");
     }
+
+    const loginDeadline = Date.now() + 15_000;
+    let loginResponse = null;
+    while (Date.now() < loginDeadline) {
+      const { result } = await client.send("Runtime.evaluate", {
+        expression: `window.__piodideGlmResponses
+          .find((response) => response.url.endsWith("/chat/completions")) ?? null`,
+        returnByValue: true,
+      });
+      if (result.value) {
+        loginResponse = result.value;
+        break;
+      }
+      await sleep(200);
+    }
+    const loginVerified =
+      (loginResponse?.status === 200 && loginResponse.body.includes('"model":"glm-5.2"')) ||
+      (loginResponse?.status === 429 &&
+        loginResponse.body.includes('"code":"1310"') &&
+        loginResponse.body.includes("Weekly/Monthly Limit Exhausted"));
+    if (!loginVerified) {
+      throw new Error(`Unexpected GLM login verification: ${JSON.stringify(loginResponse)}`);
+    }
+    const loginBody = JSON.parse(loginResponse.requestBody);
+    if (
+      loginBody.model !== "glm-5.2" ||
+      loginBody.max_tokens !== 1 ||
+      loginBody.stream !== false
+    ) {
+      throw new Error(`Unexpected GLM login request: ${loginResponse.requestBody}`);
+    }
+    const promptDeadline = Date.now() + 5_000;
+    while (Date.now() < promptDeadline) {
+      const { result } = await client.send("Runtime.evaluate", {
+        expression: `!window.__pi.prompt.isOccupied()`,
+        returnByValue: true,
+      });
+      if (result.value) break;
+      await sleep(100);
+    }
+    await client.send("Runtime.evaluate", {
+      expression: `window.__piodideGlmResponses = []`,
+    });
 
     await focusTerminal(client);
     await submit(client, "Reply with OK.");
