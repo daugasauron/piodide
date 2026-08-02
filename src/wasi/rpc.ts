@@ -130,7 +130,7 @@ export class RpcFsClient implements WasiFs {
    * Ask the main thread to run another program (the "piodide" spawn API).
    * Blocks the worker until the child exits. `stdinText` is fed as the
    * child's stdin instead of the session input; `capture` asks for the
-   * child's stdout back; `outFile`/`append` streams stdout to a file.
+   * child's stdout back; file options stream stdout/stderr to files.
    */
   spawnRpc(request: {
     path: string;
@@ -140,6 +140,9 @@ export class RpcFsClient implements WasiFs {
     capture?: boolean;
     outFile?: string;
     append?: boolean;
+    errFile?: string;
+    errAppend?: boolean;
+    stderrToStdout?: boolean;
     env?: Record<string, string>;
   }): { exitCode: number; stdout?: Uint8Array } {
     const { response, blob } = this.request(
@@ -151,6 +154,9 @@ export class RpcFsClient implements WasiFs {
         capture: request.capture ?? false,
         outFile: request.outFile ?? null,
         append: request.append ?? false,
+        errFile: request.errFile ?? null,
+        errAppend: request.errAppend ?? false,
+        stderrToStdout: request.stderrToStdout ?? false,
         env: request.env ?? null,
       },
       request.stdinText,
@@ -290,6 +296,9 @@ export interface RpcFsServerOptions {
     capture?: boolean;
     outFile?: string;
     append?: boolean;
+    errFile?: string;
+    errAppend?: boolean;
+    stderrToStdout?: boolean;
     env?: Record<string, string>;
   }) => Promise<{ exitCode: number; stdout?: Uint8Array }>;
   signal?: AbortSignal;
@@ -450,6 +459,9 @@ export function serveWasiFsRpc(options: RpcFsServerOptions): RpcFsServer {
             capture: args.capture === true,
             outFile: (args.outFile as string) ?? undefined,
             append: args.append === true,
+            errFile: (args.errFile as string) ?? undefined,
+            errAppend: args.errAppend === true,
+            stderrToStdout: args.stderrToStdout === true,
             env: (args.env as Record<string, string>) ?? undefined,
           });
           respond({ errno: 0, exitCode: result.exitCode }, result.stdout);

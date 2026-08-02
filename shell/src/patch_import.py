@@ -130,6 +130,7 @@ def parse_sections(module):
 
 
 def patch(src, dst):
+    import_name = "spawn_v4" if Path(src).name.startswith("slop.") else "spawn_v3"
     sections = parse_sections(Path(src).read_bytes())
     import_funcs = 0
     stub_index = stub_type = stub_position = None
@@ -192,7 +193,7 @@ def patch(src, dst):
     for sid, payload in sections:
         if sid == 2:
             n, p = read_u(payload, 0)
-            entry = enc_str("piodide") + enc_str("spawn_v3") + b"\x00" + enc_u(stub_type)
+            entry = enc_str("piodide") + enc_str(import_name) + b"\x00" + enc_u(stub_type)
             payload = enc_u(n + 1) + payload[p:] + entry
         elif sid == 3:
             n, p = read_u(payload, 0); items = []
@@ -246,7 +247,7 @@ def patch(src, dst):
     for sid, payload in rewritten:
         out.append(sid); out += enc_u(len(payload)); out += payload
     Path(dst).write_bytes(out)
-    print(f"patched {src} -> {dst}: piodide.spawn_v3 is function import {import_funcs}")
+    print(f"patched {src} -> {dst}: piodide.{import_name} is function import {import_funcs}")
 
 
 if __name__ == "__main__":

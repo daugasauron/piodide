@@ -560,9 +560,9 @@ export function createSlopTool(
     label: "Slop shell",
     description:
       "Run one command line in the slop shell against the live Pyodide filesystem. " +
-      "Supports pipes (|), redirects (> and >>), &&/|| short-circuit lists, ; sequences, " +
-      "$VAR/${VAR}/$? expansion, and quotes. " +
-      "$PATH is exactly /bin: ls, cat, grep, echo, env, fd-find. Host-routed cc/ld " +
+      "Supports pipes (|), stdout/stderr redirects, &&/|| short-circuit lists, ; sequences, " +
+      "$VAR/${VAR}/$?/$(command)/$((arithmetic)) expansion, globbing, and quotes. " +
+      "$PATH is exactly /bin and includes bounded file utilities, uniq, and xargs. Host-routed cc/ld " +
       "commands compile C and link WASI objects without placing the large toolchain in /bin. " +
       "Each call is a fresh " +
       "shell: cwd does not persist between calls (pass cwd instead), but every file " +

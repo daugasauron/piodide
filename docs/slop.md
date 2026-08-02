@@ -28,8 +28,11 @@ flowchart LR
 | Conditions | `first && second \|\| fallback` |
 | Expansion | `$VAR`, `${VAR:-default}`, `$?`, `$1`, `$*` |
 | Command substitution | `name=$(basename "$path")` |
+| Arithmetic | `next=$((count + 1))` |
 | Globbing | `echo src/*.c` |
-| Blocks | line-oriented `if`/`elif`/`else`, `for`, and `while` |
+| Stderr | `command 2> errors.txt`, `command 2>&1` |
+| Blocks | line-oriented `if`, `for`, `while`, and `case` |
+| Functions | `build() { cc -c main.c -o main.o; }` |
 | Scripts | `sh script.sh`, `slop script.sh`, or an executable text path |
 
 Slop supports `-c`, `-s`, script arguments, general backslash escaping,
@@ -45,7 +48,7 @@ The shell installs the original `ls`, `cat`, `grep`, `echo`, `env`, and
 ```text
 make sh python python3 sed ar
 rm cp mv mkdir rmdir touch ln head tail wc sort cut tr tee
-basename dirname seq cmp install readlink find mktemp
+basename dirname seq cmp install readlink find mktemp chmod uniq xargs
 ```
 
 These are bounded browser-oriented implementations. `sed` and `ar` provide
@@ -98,8 +101,11 @@ available; use `-c`, `-m`, a script, or `-`.
 - `Ctrl+C`: stop the foreground program or clear the line.
 - `Ctrl+D`: send EOF or exit an empty shell.
 - Pipelines execute sequentially and buffer at most 1 MiB per stage.
-- Background jobs, process groups, streaming pipelines, and child stderr
-  redirection are not available through the current spawn ABI.
-- Compound syntax is intentionally line-oriented; shell functions, `case`, and
-  heredocs are not implemented.
+- Background jobs, process groups, streaming pipelines, and heredocs are not
+  implemented.
+- Compound syntax is line-oriented. Functions cannot be piped, redirected, or
+  used in command substitution.
+- `xargs` splits bounded input on whitespace and supports `-n`; it is not the
+  complete GNU utility. WASI `chmod` validates paths and modes but permissions
+  remain host-managed.
 - WASI programs still have no sockets, `fork`, or general host OS access.

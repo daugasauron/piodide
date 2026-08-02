@@ -24,6 +24,7 @@ const SHELL_BINARIES = ["slop", "make", "sed", "ar", "ls", "cat", "fd-find", "ec
 const COREUTILS = [
   "rm", "cp", "mv", "mkdir", "rmdir", "touch", "ln", "head", "tail", "wc", "sort",
   "cut", "tr", "tee", "basename", "dirname", "seq", "cmp", "install", "readlink", "find", "mktemp",
+  "chmod", "uniq", "xargs",
 ];
 const SHELL_SOURCES = [
   "slop.c", "make.c", "coreutils.c", "sed.c", "ar.c", "spawn_stub.c", "patch_import.py",
@@ -106,6 +107,9 @@ interface SpawnRequest {
   capture?: boolean;
   outFile?: string;
   append?: boolean;
+  errFile?: string;
+  errAppend?: boolean;
+  stderrToStdout?: boolean;
   /** Exported environment supplied by the spawning shell (spawn ABI v3). */
   env?: Record<string, string>;
 }
@@ -137,15 +141,18 @@ export class SlopSpawner {
   }
 
   async onSpawn(request: SpawnRequest): Promise<SpawnResult> {
-    const { path, args, cwd, stdinText, capture, outFile, append, env } = request;
+    const {
+      path, args, cwd, stdinText, capture, outFile, append,
+      errFile, errAppend, stderrToStdout, env,
+    } = request;
     if (["python", "python3"].includes(path.split("/").pop() ?? path)) {
       return this.python(request);
     }
     if (path === "compile" || path === "cc") {
-      return { exitCode: await this.toolchainCompile(args.slice(1), cwd, path) };
+      return this.toolchain(request, "compile");
     }
     if (path === "link" || path === "ld") {
-      return { exitCode: await this.toolchainLink(args.slice(1), cwd, path) };
+      return this.toolchain(request, "link");
     }
 
     if (this.activeChildren >= MAX_CHILDREN) {
@@ -159,6 +166,7 @@ export class SlopSpawner {
     const captured: Uint8Array[] = [];
     let capturedBytes = 0;
     let fileStream: unknown = null;
+    let errorStream: unknown = null;
     let fileError: string | null = null;
     if (outFile) {
       try {
@@ -167,8 +175,16 @@ export class SlopSpawner {
         fileError = error instanceof Error ? error.message : String(error);
       }
     }
+    if (!fileError && errFile) {
+      try {
+        errorStream = this.deps.py.FS.open(errFile, errAppend ? "a" : "w");
+      } catch (error) {
+        fileError = error instanceof Error ? error.message : String(error);
+      }
+    }
     if (fileError) {
-      this.deps.writeError(`slop: ${outFile}: ${fileError}\r\n`);
+      if (fileStream !== null) this.deps.py.FS.close(fileStream);
+      this.deps.writeError(`slop: ${errFile ?? outFile}: ${fileError}\r\n`);
       this.activeChildren--;
       return { exitCode: 1 };
     }
@@ -185,6 +201,18 @@ export class SlopSpawner {
       }
       const py = this.deps.py;
       py.FS.write(fileStream, chunk, 0, chunk.byteLength);
+    };
+
+    const writeError = (text: string) => {
+      if (stderrToStdout) {
+        if (capture || outFile) writeChunk(new TextEncoder().encode(text));
+        else this.deps.writeOut(text);
+      } else if (errorStream !== null) {
+        const chunk = new TextEncoder().encode(text);
+        this.deps.py.FS.write(errorStream, chunk, 0, chunk.byteLength);
+      } else {
+        this.deps.writeError(text);
+      }
     };
 
     // Piped stdin replaces the session input for this child.
@@ -212,7 +240,7 @@ export class SlopSpawner {
         spawnHandler: (nested) => this.onSpawn(nested),
         onStdoutBytes: capture || outFile ? writeChunk : undefined,
         onStdout: capture || outFile ? undefined : this.deps.writeOut,
-        onStderr: this.deps.writeError,
+        onStderr: writeError,
       },
       this.deps.signal,
     );
@@ -220,12 +248,14 @@ export class SlopSpawner {
     try {
       const result = await handle.result;
       if (fileStream !== null) this.deps.py.FS.close(fileStream);
+      if (errorStream !== null) this.deps.py.FS.close(errorStream);
       if (capture) {
         return { exitCode: result.exitCode, stdout: concatChunks(captured, capturedBytes) };
       }
       return { exitCode: result.exitCode };
     } catch {
       if (fileStream !== null) this.deps.py.FS.close(fileStream);
+      if (errorStream !== null) this.deps.py.FS.close(errorStream);
       return { exitCode: 130 }; // SIGINT-style: killed (Ctrl+C) or crashed
     } finally {
       this.foreground = null;
@@ -249,9 +279,13 @@ export class SlopSpawner {
     const captured: Uint8Array[] = [];
     let capturedBytes = 0;
     let fileStream: unknown = null;
+    let errorStream: unknown = null;
     try {
       if (request.outFile) {
         fileStream = this.deps.py.FS.open(request.outFile, request.append ? "a" : "w");
+      }
+      if (request.errFile) {
+        errorStream = this.deps.py.FS.open(request.errFile, request.errAppend ? "a" : "w");
       }
       const stdout = (text: string) => {
         const chunk = new TextEncoder().encode(text);
@@ -267,13 +301,23 @@ export class SlopSpawner {
           this.deps.writeOut(text);
         }
       };
+      const stderr = (text: string) => {
+        if (request.stderrToStdout) {
+          stdout(text);
+        } else if (errorStream !== null) {
+          const chunk = new TextEncoder().encode(text);
+          this.deps.py.FS.write(errorStream, chunk, 0, chunk.byteLength);
+        } else {
+          this.deps.writeError(text);
+        }
+      };
       const exitCode = await runPythonEntrypoint(this.deps.py, {
         args: request.args,
         cwd: request.cwd,
         env: request.env,
         stdin: request.stdinText,
         stdout,
-        stderr: this.deps.writeError,
+        stderr,
       });
       return request.capture
         ? { exitCode, stdout: concatChunks(captured, capturedBytes) }
@@ -285,6 +329,7 @@ export class SlopSpawner {
       return { exitCode: 1 };
     } finally {
       if (fileStream !== null) this.deps.py.FS.close(fileStream);
+      if (errorStream !== null) this.deps.py.FS.close(errorStream);
       this.activeChildren--;
     }
   }
@@ -300,10 +345,57 @@ export class SlopSpawner {
     return `usage: ${command} [-s] [--export=symbol] <a.o b.o ...> -o <out.wasm>\r\n`;
   }
 
+  private async toolchain(
+    request: SpawnRequest,
+    operation: "compile" | "link",
+  ): Promise<SpawnResult> {
+    let stdout = "";
+    let stderr = "";
+    const writeOut = (text: string) => { stdout += text; };
+    const writeError = (text: string) => { stderr += text; };
+    const command = request.path;
+    const args = request.args.slice(1);
+    const exitCode = operation === "compile"
+      ? await this.toolchainCompile(args, request.cwd, command, writeOut, writeError)
+      : await this.toolchainLink(args, request.cwd, command, writeOut, writeError);
+
+    if (request.stderrToStdout) {
+      stdout += stderr;
+      stderr = "";
+    }
+    const writeFile = (path: string, append: boolean | undefined, value: string) => {
+      const stream = this.deps.py.FS.open(path, append ? "a" : "w");
+      try {
+        const bytes = new TextEncoder().encode(value);
+        this.deps.py.FS.write(stream, bytes, 0, bytes.byteLength);
+      } finally {
+        this.deps.py.FS.close(stream);
+      }
+    };
+    try {
+      if (request.outFile) writeFile(request.outFile, request.append, stdout);
+      else if (!request.capture && stdout) this.deps.writeOut(stdout);
+      if (request.errFile) writeFile(request.errFile, request.errAppend, stderr);
+      else if (stderr) this.deps.writeError(stderr);
+    } catch (error) {
+      this.deps.writeError(
+        `${command}: ${error instanceof Error ? error.message : String(error)}\r\n`,
+      );
+      return { exitCode: 1 };
+    }
+    if (request.capture) {
+      const bytes = new TextEncoder().encode(stdout);
+      return { exitCode, stdout: bytes.slice(0, MAX_CAPTURE_BYTES) };
+    }
+    return { exitCode };
+  }
+
   private async toolchainCompile(
     args: string[],
     cwd: string,
     command: string,
+    writeOut: (text: string) => void,
+    writeError: (text: string) => void,
   ): Promise<number> {
     const positional: string[] = [];
     let output: string | null = null;
@@ -314,13 +406,13 @@ export class SlopSpawner {
     for (let i = 0; i < args.length; i++) {
       const arg = args[i];
       if (arg === "--help") {
-        this.deps.writeOut(this.compileUsage(command));
+        writeOut(this.compileUsage(command));
         return 0;
       }
       if (arg === "-c") continue;
       if (arg === "-o") {
         if (i + 1 >= args.length) {
-          this.deps.writeError(`${command}: -o requires a path\r\n`);
+          writeError(`${command}: -o requires a path\r\n`);
           return 2;
         }
         output = args[++i];
@@ -349,7 +441,7 @@ export class SlopSpawner {
       if (arg === "-D" || arg.startsWith("-D")) {
         const define = arg === "-D" ? args[++i] : arg.slice(2);
         if (!define || !/^[A-Za-z_][A-Za-z0-9_]*(?:=.*)?$/.test(define)) {
-          this.deps.writeError(`${command}: invalid -D definition\r\n`);
+          writeError(`${command}: invalid -D definition\r\n`);
           return 2;
         }
         defines.push(define);
@@ -358,42 +450,42 @@ export class SlopSpawner {
       if (arg === "-I" || arg.startsWith("-I")) {
         const include = arg === "-I" ? args[++i] : arg.slice(2);
         if (!include) {
-          this.deps.writeError(`${command}: -I requires a directory\r\n`);
+          writeError(`${command}: -I requires a directory\r\n`);
           return 2;
         }
         const resolved = this.resolveInCwd(include, cwd);
         if (!fsExists(this.deps.py, resolved) || !fsIsDir(this.deps.py, resolved)) {
-          this.deps.writeError(`${command}: include directory not found: ${resolved}\r\n`);
+          writeError(`${command}: include directory not found: ${resolved}\r\n`);
           return 2;
         }
         includePaths.push(resolved);
         continue;
       }
       if (arg.startsWith("-")) {
-        this.deps.writeError(`${command}: unsupported option: ${arg}\r\n`);
+        writeError(`${command}: unsupported option: ${arg}\r\n`);
         return 2;
       }
       positional.push(arg);
     }
     if (positional.length !== 1) {
-      this.deps.writeError(this.compileUsage(command));
+      writeError(this.compileUsage(command));
       return 2;
     }
     if (defines.length > MAX_TOOLCHAIN_INPUTS || includePaths.length > MAX_TOOLCHAIN_INPUTS) {
-      this.deps.writeError(`${command}: too many -D or -I options\r\n`);
+      writeError(`${command}: too many -D or -I options\r\n`);
       return 2;
     }
     const sourcePath = this.resolveInCwd(positional[0], cwd);
     if (!sourcePath.toLowerCase().endsWith(".c")) {
-      this.deps.writeError(`${command}: source file must end in .c\r\n`);
+      writeError(`${command}: source file must end in .c\r\n`);
       return 2;
     }
     if (!fsExists(this.deps.py, sourcePath) || fsIsDir(this.deps.py, sourcePath)) {
-      this.deps.writeError(`${command}: source file not found: ${sourcePath}\r\n`);
+      writeError(`${command}: source file not found: ${sourcePath}\r\n`);
       return 2;
     }
     if (this.deps.py.FS.stat(sourcePath).size > MAX_C_SOURCE_BYTES) {
-      this.deps.writeError(`${command}: source exceeds the 512 KiB limit\r\n`);
+      writeError(`${command}: source exceeds the 512 KiB limit\r\n`);
       return 2;
     }
     const defaultOut = sourcePath.toLowerCase().endsWith(".c")
@@ -401,11 +493,11 @@ export class SlopSpawner {
       : `${sourcePath}.o`;
     const outputPath = output ? this.resolveInCwd(output, cwd) : defaultOut;
     if (!outputPath.toLowerCase().endsWith(".o")) {
-      this.deps.writeError(`${command}: compiler output must end in .o\r\n`);
+      writeError(`${command}: compiler output must end in .o\r\n`);
       return 2;
     }
     if (outputPath === sourcePath) {
-      this.deps.writeError(`${command}: output cannot overwrite the source file\r\n`);
+      writeError(`${command}: output cannot overwrite the source file\r\n`);
       return 2;
     }
     options.defines = defines;
@@ -417,10 +509,10 @@ export class SlopSpawner {
         { operation: "compile", sourcePath, outputPath, options },
         this.deps.signal,
       );
-      if (result.diagnostics) this.deps.writeError(result.diagnostics.replaceAll("\n", "\r\n"));
+      if (result.diagnostics) writeError(result.diagnostics.replaceAll("\n", "\r\n"));
       return 0;
     } catch (error) {
-      this.deps.writeError(
+      writeError(
         `${command}: ${error instanceof Error ? error.message : String(error)}\r\n`.replaceAll("\n", "\r\n"),
       );
       return 1;
@@ -431,6 +523,8 @@ export class SlopSpawner {
     args: string[],
     cwd: string,
     command: string,
+    writeOut: (text: string) => void,
+    writeError: (text: string) => void,
   ): Promise<number> {
     const objects: string[] = [];
     let output: string | null = null;
@@ -440,12 +534,12 @@ export class SlopSpawner {
     for (let i = 0; i < args.length; i++) {
       const arg = args[i];
       if (arg === "--help") {
-        this.deps.writeOut(this.linkUsage(command));
+        writeOut(this.linkUsage(command));
         return 0;
       }
       if (arg === "-o") {
         if (i + 1 >= args.length) {
-          this.deps.writeError(`${command}: -o requires a path\r\n`);
+          writeError(`${command}: -o requires a path\r\n`);
           return 2;
         }
         output = args[++i];
@@ -458,24 +552,24 @@ export class SlopSpawner {
       if (arg === "--export" || arg.startsWith("--export=")) {
         const symbol = arg === "--export" ? args[++i] : arg.slice("--export=".length);
         if (!symbol || !/^[A-Za-z_.$][A-Za-z0-9_.$]*$/.test(symbol)) {
-          this.deps.writeError(`${command}: invalid exported symbol\r\n`);
+          writeError(`${command}: invalid exported symbol\r\n`);
           return 2;
         }
         exports.push(symbol);
         continue;
       }
       if (arg.startsWith("-")) {
-        this.deps.writeError(`${command}: unsupported option: ${arg}\r\n`);
+        writeError(`${command}: unsupported option: ${arg}\r\n`);
         return 2;
       }
       objects.push(arg);
     }
     if (objects.length === 0 || !output) {
-      this.deps.writeError(this.linkUsage(command));
+      writeError(this.linkUsage(command));
       return 2;
     }
     if (objects.length > MAX_TOOLCHAIN_INPUTS || exports.length > MAX_TOOLCHAIN_INPUTS) {
-      this.deps.writeError(`${command}: too many object files or exports\r\n`);
+      writeError(`${command}: too many object files or exports\r\n`);
       return 2;
     }
     const objectPaths = objects.map((object) => this.resolveInCwd(object, cwd));
@@ -486,12 +580,12 @@ export class SlopSpawner {
         !fsExists(this.deps.py, objectPath) ||
         fsIsDir(this.deps.py, objectPath)
       ) {
-        this.deps.writeError(`${command}: object file not found: ${objectPath}\r\n`);
+        writeError(`${command}: object file not found: ${objectPath}\r\n`);
         return 2;
       }
     }
     if (!outputPath.toLowerCase().endsWith(".wasm") && !outputPath.startsWith("/bin/")) {
-      this.deps.writeError(`${command}: output must end in .wasm or be inside /bin\r\n`);
+      writeError(`${command}: output must end in .wasm or be inside /bin\r\n`);
       return 2;
     }
     options.exports = exports;
@@ -502,10 +596,10 @@ export class SlopSpawner {
         { operation: "link", objectPaths, outputPath, options },
         this.deps.signal,
       );
-      if (result.diagnostics) this.deps.writeError(result.diagnostics.replaceAll("\n", "\r\n"));
+      if (result.diagnostics) writeError(result.diagnostics.replaceAll("\n", "\r\n"));
       return 0;
     } catch (error) {
-      this.deps.writeError(
+      writeError(
         `${command}: ${error instanceof Error ? error.message : String(error)}\r\n`.replaceAll("\n", "\r\n"),
       );
       return 1;

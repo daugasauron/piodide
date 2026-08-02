@@ -66,6 +66,9 @@ export interface WasiProgramRequest {
     capture?: boolean;
     outFile?: string;
     append?: boolean;
+    errFile?: string;
+    errAppend?: boolean;
+    stderrToStdout?: boolean;
     env?: Record<string, string>;
   }) => Promise<{ exitCode: number; stdout?: Uint8Array }>;
   /** Internal: current spawn nesting depth. */
@@ -226,6 +229,9 @@ function startInWorker(
       capture?: boolean;
       outFile?: string;
       append?: boolean;
+      errFile?: string;
+      errAppend?: boolean;
+      stderrToStdout?: boolean;
       env?: Record<string, string>;
     }): Promise<{ exitCode: number; stdout?: Uint8Array }> => {
       if (spawnDepth >= MAX_SPAWN_DEPTH) return { exitCode: 126 };

@@ -41,7 +41,12 @@ function parseEnvironment(bytes: Uint8Array): Record<string, string> {
   return env;
 }
 
-function createSpawnImport(host: WasiHost, fs: RpcFsClient, withEnvironment: boolean) {
+function createSpawnImport(
+  host: WasiHost,
+  fs: RpcFsClient,
+  withEnvironment: boolean,
+  withStderr: boolean,
+) {
   return (pathPtr: number, argvPtr: number, cwdPtr: number, ioPtr: number): number => {
     const path = host.readCString(pathPtr);
     const args = host.readCStringArray(argvPtr);
@@ -51,6 +56,9 @@ function createSpawnImport(host: WasiHost, fs: RpcFsClient, withEnvironment: boo
     let capture = false;
     let outFile: string | undefined;
     let append = false;
+    let errFile: string | undefined;
+    let errAppend = false;
+    let stderrToStdout = false;
     let capturePtr = 0;
     let captureCap = 0;
     let captureLenPtr = 0;
@@ -72,9 +80,18 @@ function createSpawnImport(host: WasiHost, fs: RpcFsClient, withEnvironment: boo
         const envLen = host.readUint32(ioPtr + 32);
         if (envPtr !== 0 && envLen > 0) env = parseEnvironment(host.readBytes(envPtr, envLen));
       }
+      if (withStderr) {
+        const errFilePtr = host.readUint32(ioPtr + 36);
+        errAppend = host.readUint32(ioPtr + 40) !== 0;
+        stderrToStdout = host.readUint32(ioPtr + 44) !== 0;
+        if (errFilePtr !== 0) errFile = host.readCString(errFilePtr);
+      }
     }
 
-    const result = fs.spawnRpc({ path, args, cwd, stdinText, capture, outFile, append, env });
+    const result = fs.spawnRpc({
+      path, args, cwd, stdinText, capture, outFile, append,
+      errFile, errAppend, stderrToStdout, env,
+    });
     if (capture && result.stdout) {
       const copied = Math.min(captureCap, result.stdout.byteLength);
       host.writeBytes(capturePtr, result.stdout.subarray(0, copied));
@@ -105,8 +122,9 @@ export function startWasiWorker(port: WorkerPort): void {
                 piodide: {
                   // v2 remains available to older shell binaries. v3 appends
                   // a NUL-separated exported-environment blob to slop_io.
-                  spawn: createSpawnImport(host, fs, false),
-                  spawn_v3: createSpawnImport(host, fs, true),
+                  spawn: createSpawnImport(host, fs, false, false),
+                  spawn_v3: createSpawnImport(host, fs, true, false),
+                  spawn_v4: createSpawnImport(host, fs, true, true),
                 },
               })
             : undefined,

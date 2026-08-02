@@ -3,7 +3,7 @@ LD := ld
 CFLAGS := -O2 -Wall -Wextra
 
 .PHONY: all clean
-all: slop.unpatched.wasm make.unpatched.wasm coreutils.wasm sed.wasm ar.wasm
+all: slop.unpatched.wasm make.unpatched.wasm coreutils.unpatched.wasm sed.wasm ar.wasm
 
 spawn_stub.o: spawn_stub.c
 	$(CC) -std=c17 $(CFLAGS) -c $< -o $@
@@ -20,8 +20,8 @@ make.unpatched.wasm: spawn_stub.o make.o
 
 coreutils.o: coreutils.c
 	$(CC) -std=c17 $(CFLAGS) -c $< -o $@
-coreutils.wasm: coreutils.o
-	$(LD) -s $< -o $@
+coreutils.unpatched.wasm: spawn_stub.o coreutils.o
+	$(LD) -s --export=piodide_spawn $^ -o $@
 
 sed.o: sed.c
 	$(CC) -std=c17 $(CFLAGS) -c $< -o $@
@@ -35,6 +35,6 @@ ar.wasm: ar.o
 
 # The browser linker validates custom imports by first linking spawn_stub.o.
 # Run patch_import.py under Python to replace that placeholder with the real
-# piodide.spawn import before installing slop or make.
+# piodide.spawn import before installing slop, make, or coreutils.
 clean:
 	rm -f *.o *.wasm

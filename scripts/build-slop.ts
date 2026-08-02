@@ -21,7 +21,7 @@ const publicBinDir = join(root, "public", "slop", "bin");
 const assetsDir = join(root, "test", "toolchain-assets");
 const check = process.argv.includes("--check");
 const programs = ["slop", "make", "coreutils", "sed", "ar"] as const;
-const spawnPrograms = new Set(["slop", "make"]);
+const spawnPrograms = new Set(["slop", "make", "coreutils"]);
 
 function bytes(path: string): ArrayBuffer {
   const data = readFileSync(path);

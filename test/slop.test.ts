@@ -19,6 +19,7 @@ const shellBin = (name: string) =>
 const COREUTILS = [
   "rm", "cp", "mv", "mkdir", "rmdir", "touch", "ln", "head", "tail", "wc", "sort",
   "cut", "tr", "tee", "basename", "dirname", "seq", "cmp", "install", "readlink", "find", "mktemp",
+  "chmod", "uniq", "xargs",
 ];
 
 interface SlopRun {
@@ -65,6 +66,9 @@ async function runSlop(
     capture?: { ptr: number; cap: number; lenPtr: number };
     outFile?: string;
     append?: boolean;
+    errFile?: string;
+    errAppend?: boolean;
+    stderrToStdout?: boolean;
     env?: Record<string, string>;
   }
 
@@ -80,6 +84,12 @@ async function runSlop(
     let stdinSent = io.stdinText === undefined;
     const captured: Uint8Array[] = [];
     const fileChunks: Uint8Array[] = [];
+    const errorChunks: Uint8Array[] = [];
+    const writeStdout = (chunk: Uint8Array) => {
+      if (io.capture) captured.push(chunk.slice());
+      else if (io.outFile) fileChunks.push(chunk.slice());
+      else stdout += decoder.decode(chunk, { stream: true });
+    };
     const host = new WasiHost({
       args,
       env: { PATH: "/bin", PWD: cwd, TERM: "ghostty", ...(io.env ?? {}) },
@@ -90,24 +100,20 @@ async function runSlop(
         stdinSent = true;
         return io.stdinText ?? null;
       },
-      stdout: (chunk) => {
-        if (io.capture) {
-          captured.push(chunk.slice());
-        } else if (io.outFile) {
-          fileChunks.push(chunk.slice());
-        } else {
-          stdout += decoder.decode(chunk, { stream: true });
-        }
-      },
+      stdout: writeStdout,
       stderr: (chunk) => {
-        stdout += decoder.decode(chunk, { stream: true });
+        if (io.stderrToStdout) writeStdout(chunk);
+        else if (io.errFile) errorChunks.push(chunk.slice());
+        else stdout += decoder.decode(chunk, { stream: true });
       },
       extendImports: (childHost) => ({
         piodide: {
           spawn: (pathPtr: number, argvPtr: number, cwdPtr: number, ioPtr: number): number =>
-            handleSpawn(childHost, pathPtr, argvPtr, cwdPtr, ioPtr, false),
+            handleSpawn(childHost, pathPtr, argvPtr, cwdPtr, ioPtr, false, false),
           spawn_v3: (pathPtr: number, argvPtr: number, cwdPtr: number, ioPtr: number): number =>
-            handleSpawn(childHost, pathPtr, argvPtr, cwdPtr, ioPtr, true),
+            handleSpawn(childHost, pathPtr, argvPtr, cwdPtr, ioPtr, true, false),
+          spawn_v4: (pathPtr: number, argvPtr: number, cwdPtr: number, ioPtr: number): number =>
+            handleSpawn(childHost, pathPtr, argvPtr, cwdPtr, ioPtr, true, true),
         },
       }),
     });
@@ -126,6 +132,19 @@ async function runSlop(
         fileOffset += chunk.byteLength;
       }
       fs.writeFile(io.outFile, combined);
+    }
+    if (io.errFile) {
+      const existing =
+        io.errAppend && fs.exists(io.errFile) ? fs.readFile(io.errFile) : new Uint8Array();
+      const total = existing.byteLength + errorChunks.reduce((sum, chunk) => sum + chunk.byteLength, 0);
+      const combined = new Uint8Array(total);
+      combined.set(existing, 0);
+      let fileOffset = existing.byteLength;
+      for (const chunk of errorChunks) {
+        combined.set(chunk, fileOffset);
+        fileOffset += chunk.byteLength;
+      }
+      fs.writeFile(io.errFile, combined);
     }
 
     if (io.capture && callerHost) {
@@ -150,6 +169,7 @@ async function runSlop(
     cwdPtr: number,
     ioPtr: number,
     withEnvironment: boolean,
+    withStderr: boolean,
   ): number => {
     const path = callerHost.readCString(pathPtr);
     const childArgs = callerHost.readCStringArray(argvPtr);
@@ -190,6 +210,12 @@ async function runSlop(
           }
         }
       }
+      if (withStderr) {
+        const errFilePtr = callerHost.readUint32(ioPtr + 36);
+        io.errAppend = callerHost.readUint32(ioPtr + 40) !== 0;
+        io.stderrToStdout = callerHost.readUint32(ioPtr + 44) !== 0;
+        if (errFilePtr !== 0) io.errFile = callerHost.readCString(errFilePtr);
+      }
     }
     return runProgram(childName, childArgs, childCwd, io, callerHost);
   };
@@ -219,9 +245,11 @@ async function runSlop(
     extendImports: (host) => ({
       piodide: {
         spawn: (pathPtr: number, argvPtr: number, cwdPtr: number, ioPtr: number): number =>
-          handleSpawn(host, pathPtr, argvPtr, cwdPtr, ioPtr, false),
+          handleSpawn(host, pathPtr, argvPtr, cwdPtr, ioPtr, false, false),
         spawn_v3: (pathPtr: number, argvPtr: number, cwdPtr: number, ioPtr: number): number =>
-          handleSpawn(host, pathPtr, argvPtr, cwdPtr, ioPtr, true),
+          handleSpawn(host, pathPtr, argvPtr, cwdPtr, ioPtr, true, false),
+        spawn_v4: (pathPtr: number, argvPtr: number, cwdPtr: number, ioPtr: number): number =>
+          handleSpawn(host, pathPtr, argvPtr, cwdPtr, ioPtr, true, true),
       },
     }),
   });
@@ -293,6 +321,110 @@ test("slop: scripts, control flow, utilities, substitution, and exported env", a
   assert.match(run.stdout, /control-ok\n/);
   assert.match(run.stdout, /one\.txt/);
   assert.doesNotMatch(run.stdout, /control-failed/);
+});
+
+test("slop: arithmetic, case blocks, and functions", async () => {
+  const fs = new MemoryFs();
+  fs.mkdirTree("/home/web");
+  installShell(fs);
+
+  const run = await runSlop(
+    fs,
+    [
+      "COUNT=4",
+      "echo ARITH-$((COUNT * 3 + 2))-$((1 << 3))",
+      "echo ASSIGN-$((COUNT += 2))-$COUNT",
+      "KIND=beta",
+      'case "$KIND" in',
+      "  alpha)",
+      "    echo CASE-WRONG",
+      "    ;;",
+      "  beta|gamma)",
+      "    echo CASE-beta",
+      "    ;;",
+      "  *)",
+      "    echo CASE-DEFAULT",
+      "    ;;",
+      "esac",
+      "greet() {",
+      '  echo "HELLO-$1-$2"',
+      "  return 7",
+      "  echo FUNCTION-WRONG",
+      "}",
+      "greet one two || echo RETURN-$?",
+      "type greet",
+      "return 3",
+      "echo OUTSIDE-RETURN-$?",
+    ],
+    { quiet: true },
+  );
+
+  assert.equal(run.exitCode, 0);
+  assert.match(run.stdout, /ARITH-14-8\n/);
+  assert.match(run.stdout, /ASSIGN-6-6\n/);
+  assert.match(run.stdout, /CASE-beta\n/);
+  assert.doesNotMatch(run.stdout, /CASE-WRONG|CASE-DEFAULT/);
+  assert.match(run.stdout, /HELLO-one-two\n/);
+  assert.match(run.stdout, /RETURN-7\n/);
+  assert.match(run.stdout, /greet is a function\n/);
+  assert.doesNotMatch(run.stdout, /FUNCTION-WRONG/);
+  assert.match(run.stdout, /return: not in a function\n/);
+  assert.match(run.stdout, /OUTSIDE-RETURN-2\n/);
+});
+
+test("slop: stderr redirects apply to builtins and spawned programs", async () => {
+  const fs = new MemoryFs();
+  fs.mkdirTree("/home/web");
+  installShell(fs);
+
+  const run = await runSlop(
+    fs,
+    [
+      "cd /missing 2> builtin.err",
+      "cat /missing-one 2> child.err",
+      "cat /missing-two 2>> child.err",
+      "cat /missing-three 2>&1 | grep missing-three",
+      "cat /missing-four &> both.txt",
+      "cat builtin.err",
+      "cat child.err",
+      "cat both.txt",
+    ],
+    { quiet: true },
+  );
+
+  assert.equal(run.exitCode, 0);
+  const builtinError = new TextDecoder().decode(fs.readFile("/home/web/builtin.err"));
+  const childError = new TextDecoder().decode(fs.readFile("/home/web/child.err"));
+  const both = new TextDecoder().decode(fs.readFile("/home/web/both.txt"));
+  assert.match(builtinError, /cd: \/missing/);
+  assert.match(childError, /missing-one/);
+  assert.match(childError, /missing-two/);
+  assert.match(run.stdout, /missing-three/);
+  assert.match(both, /missing-four/);
+});
+
+test("slop: chmod, uniq, and xargs provide bounded useful subsets", async () => {
+  const fs = new MemoryFs();
+  fs.mkdirTree("/home/web");
+  installShell(fs);
+  fs.writeFile("/home/web/present.txt", "ok\n");
+
+  const run = await runSlop(
+    fs,
+    [
+      "printf 'a\\na\\nb\\n' | uniq -c",
+      "printf 'a b c' | xargs -n 2 echo ITEM",
+      "chmod 755 present.txt",
+      "chmod 755 missing.txt || echo CHMOD-$?",
+    ],
+    { quiet: true },
+  );
+
+  assert.equal(run.exitCode, 0);
+  assert.match(run.stdout, /\s+2 a\n\s+1 b\n/);
+  assert.match(run.stdout, /ITEM a b\nITEM c\n/);
+  assert.match(run.stdout, /chmod: missing\.txt:/);
+  assert.match(run.stdout, /CHMOD-1\n/);
 });
 
 test("slop: command-prefixed assignments are temporary", async () => {

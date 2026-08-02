@@ -8,12 +8,31 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
+#include <sys/types.h>
 #include <time.h>
 #include <unistd.h>
+
+/* WASI libc may not declare chmod */
+#ifdef __wasi__
+/* WASI doesn't expose chmod; treat as no-op success since permissions are host-managed */
+static int chmod(const char *path, mode_t mode) { (void)path; (void)mode; return 0; }
+#else
+int chmod(const char *, mode_t);
+#endif
 
 #define COPY_BUF 65536
 #define DATA_LIMIT (16 * 1024 * 1024)
 #define SORT_LINES 100000
+#define XARGS_MAX 128
+#define XARGS_BLOB 16384
+
+typedef struct {
+  const char *stdin_data; int stdin_len; char *capture; int capture_cap;
+  int *capture_len; const char *out_file; int out_append;
+  const char *env_data; int env_len;
+} slop_io;
+extern int piodide_spawn(const char *path, const char *argv_blob, const char *cwd,
+                         slop_io *io);
 
 static const char *prog;
 static int errorf(const char *path) { fprintf(stderr, "%s: %s: %s\n", prog, path, strerror(errno)); return 1; }
@@ -385,6 +404,142 @@ static int cmd_install(int ac, char **av) {
   for (; i < ac - 1; i++) if (copy_path(av[i], dst, 0, 0)) rc = 1; return rc;
 }
 
+static int cmd_chmod(int ac, char **av) {
+  if (ac < 3) { fprintf(stderr, "usage: chmod MODE FILE...\n"); return 1; }
+  char *end = NULL; long parsed = strtol(av[1], &end, 8);
+  if (!*av[1] || *end || parsed < 0 || parsed > 07777) {
+    fprintf(stderr, "chmod: invalid mode: %s\n", av[1]); return 1;
+  }
+  mode_t mode = (mode_t)parsed;
+  int rc = 0;
+  for (int i = 2; i < ac; i++) {
+    struct stat st;
+    if (stat(av[i], &st) != 0) { fprintf(stderr, "chmod: %s: %s\n", av[i], strerror(errno)); rc = 1; continue; }
+    if (chmod(av[i], mode) != 0) { fprintf(stderr, "chmod: %s: %s\n", av[i], strerror(errno)); rc = 1; }
+  }
+  return rc;
+}
+
+static int cmd_uniq(int ac, char **av) {
+  FILE *in = stdin;
+  int show_count = 0;
+  int arg_start = 1;
+  for (int i = 1; i < ac; i++) {
+    if (!strcmp(av[i], "-c")) { show_count = 1; arg_start++; }
+    else if (!strcmp(av[i], "--")) { arg_start = i + 1; break; }
+    else { arg_start = i; break; }
+  }
+  if (ac - arg_start > 1) { fprintf(stderr, "uniq: only one input file is supported\n"); return 1; }
+  if (arg_start < ac) { in = fopen(av[arg_start], "r"); if (!in) { fprintf(stderr, "uniq: %s: %s\n", av[arg_start], strerror(errno)); return 1; } }
+  char prev[65536] = ""; int have_prev = 0, count = 0;
+  char line[65536];
+  while (fgets(line, sizeof line, in)) {
+    size_t len = strlen(line);
+    if (len == sizeof line - 1 && line[len - 1] != '\n') {
+      fprintf(stderr, "uniq: input line exceeds 65534 bytes\n");
+      if (in != stdin) fclose(in); return 1;
+    }
+    if (len > 0 && line[len-1] == '\n') line[--len] = 0;
+    if (have_prev && !strcmp(line, prev)) { count++; continue; }
+    if (have_prev) { if (show_count) printf("%7d %s\n", count, prev); else printf("%s\n", prev); }
+    strcpy(prev, line); have_prev = 1; count = 1;
+  }
+  if (have_prev) { if (show_count) printf("%7d %s\n", count, prev); else printf("%s\n", prev); }
+  if (in != stdin) fclose(in);
+  return 0;
+}
+
+static int xargs_append(char *blob, size_t *used, const char *value) {
+  size_t n = strlen(value) + 1;
+  if (*used + n + 1 > XARGS_BLOB) return 0;
+  memcpy(blob + *used, value, n); *used += n; return 1;
+}
+
+static int xargs_run(const char *cmd, char **fixed, int fixed_count,
+                     char **items, int item_count) {
+  static char blob[XARGS_BLOB], captured[COPY_BUF];
+  char path[4096];
+  if (strchr(cmd, '/')) {
+    if (*cmd == '/') snprintf(path, sizeof path, "%s", cmd);
+    else snprintf(path, sizeof path, "%s/%s", getenv("PWD") ? getenv("PWD") : "/home/web", cmd);
+  } else if (!strcmp(cmd, "cc") || !strcmp(cmd, "ld") ||
+             !strcmp(cmd, "compile") || !strcmp(cmd, "link")) {
+    snprintf(path, sizeof path, "%s", cmd);
+  } else {
+    snprintf(path, sizeof path, "/bin/%s", cmd);
+  }
+  size_t used = 0;
+  if (!xargs_append(blob, &used, path)) return 1;
+  for (int i = 0; i < fixed_count; i++) if (!xargs_append(blob, &used, fixed[i])) return 1;
+  for (int i = 0; i < item_count; i++) if (!xargs_append(blob, &used, items[i])) return 1;
+  blob[used] = 0;
+  int captured_len = 0;
+  slop_io io; memset(&io, 0, sizeof io);
+  io.capture = captured; io.capture_cap = COPY_BUF; io.capture_len = &captured_len;
+  int rc = piodide_spawn(path, blob, getenv("PWD") ? getenv("PWD") : "/home/web", &io);
+  int shown = captured_len > COPY_BUF ? COPY_BUF : captured_len;
+  if (shown > 0) fwrite(captured, 1, (size_t)shown, stdout);
+  if (captured_len > COPY_BUF) { fprintf(stderr, "xargs: command output exceeds %d bytes\n", COPY_BUF); return 1; }
+  return rc;
+}
+
+static int cmd_xargs(int ac, char **av) {
+  const char *cmd = "echo";
+  int n_cmd_args = 0;
+  int max_args = 0;
+  static char *cmd_args[XARGS_MAX];
+  int i = 1;
+  while (i < ac && av[i][0] == '-') {
+    if (!strcmp(av[i], "-n") && i + 1 < ac) {
+      max_args = atoi(av[i+1]);
+      if (max_args <= 0) { fprintf(stderr, "xargs: -n requires a positive number\n"); return 1; }
+      i += 2;
+    }
+    else if (!strcmp(av[i], "--")) { i++; break; }
+    else { fprintf(stderr, "xargs: unsupported option: %s\n", av[i]); return 1; }
+  }
+  if (i < ac) cmd = av[i++];
+  for (; i < ac; i++) {
+    if (n_cmd_args >= XARGS_MAX - 1) { fprintf(stderr, "xargs: too many command arguments\n"); return 1; }
+    cmd_args[n_cmd_args++] = av[i];
+  }
+
+  /* Read all of stdin into a buffer */
+  static char buf[COPY_BUF];
+  size_t total = 0;
+  char chunk[4096];
+  size_t nrd;
+  while ((nrd = fread(chunk, 1, sizeof chunk, stdin)) > 0) {
+    if (total + nrd >= sizeof buf) { fprintf(stderr, "xargs: input exceeds %d bytes\n", COPY_BUF - 1); return 1; }
+    memcpy(buf + total, chunk, nrd); total += nrd;
+  }
+  buf[total] = 0;
+
+  char *p = buf;
+  char *items[XARGS_MAX]; int batch_count = 0, ran = 0, rc = 0;
+  int batch_limit = max_args > 0 ? max_args : XARGS_MAX - n_cmd_args - 1;
+  if (batch_limit > XARGS_MAX - n_cmd_args - 1) batch_limit = XARGS_MAX - n_cmd_args - 1;
+  if (batch_limit < 1) { fprintf(stderr, "xargs: too many fixed command arguments\n"); return 1; }
+  while (*p) {
+    while (*p && isspace((unsigned char)*p)) p++;
+    if (!*p) break;
+    char *start = p;
+    while (*p && !isspace((unsigned char)*p)) p++;
+    if (*p) { *p = 0; p++; }
+    items[batch_count++] = start;
+    if (batch_count >= batch_limit) {
+      int status = xargs_run(cmd, cmd_args, n_cmd_args, items, batch_count);
+      if (status) rc = status;
+      batch_count = 0; ran = 1;
+    }
+  }
+  if (batch_count > 0 || !ran) {
+    int status = xargs_run(cmd, cmd_args, n_cmd_args, items, batch_count);
+    if (status) rc = status;
+  }
+  return rc;
+}
+
 int main(int argc, char **argv) {
   prog = base(argv[0]);
   if (!strcmp(prog, "rm")) return cmd_rm(argc, argv);
@@ -409,5 +564,8 @@ int main(int argc, char **argv) {
   if (!strcmp(prog, "readlink")) return cmd_readlink(argc, argv);
   if (!strcmp(prog, "find")) return cmd_find(argc, argv);
   if (!strcmp(prog, "mktemp")) return cmd_mktemp(argc, argv);
+  if (!strcmp(prog, "chmod")) return cmd_chmod(argc, argv);
+  if (!strcmp(prog, "uniq")) return cmd_uniq(argc, argv);
+  if (!strcmp(prog, "xargs")) return cmd_xargs(argc, argv);
   fprintf(stderr, "coreutils: unknown applet '%s'\n", prog); return 127;
 }

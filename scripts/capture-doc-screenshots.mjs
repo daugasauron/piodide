@@ -294,12 +294,22 @@ async function exerciseSlopChannels(client) {
         "e2e-slop-channels",
         { command: "echo shell-out; python -c \\\"import sys; print('python-out'); print('python-err', file=sys.stderr)\\\"; nosuchcmd" }
       );
+      const redirected = await tool.execute(
+        "e2e-slop-redirects",
+        { command: "python -c \\\"import sys; print('redirected-python', file=sys.stderr)\\\" 2> python.err; cat /missing-e2e 2> cat.err; cc --not-real 2> cc.err; printf 'a b c' | xargs -n 2 echo ITEM" }
+      );
+      const decode = (path) => new TextDecoder().decode(window.__pi.py.FS.readFile(path));
       return {
         stdout: result.details?.stdout ?? "",
         stderr: result.details?.stderr ?? "",
         stdoutBytes: result.details?.stdoutBytes ?? -1,
         stderrBytes: result.details?.stderrBytes ?? -1,
         content: result.content?.[0]?.text ?? "",
+        redirectedStdout: redirected.details?.stdout ?? "",
+        redirectedStderr: redirected.details?.stderr ?? "",
+        pythonErrorFile: decode("/home/web/python.err"),
+        catErrorFile: decode("/home/web/cat.err"),
+        ccErrorFile: decode("/home/web/cc.err"),
         promptUsesDirectWasi:
           systemPrompt.includes("run_wasi")
           && (
@@ -327,6 +337,11 @@ async function exerciseSlopChannels(client) {
     state.stderrBytes <= 0 ||
     !state.content.includes("stdout:\n") ||
     !state.content.includes("stderr:\n") ||
+    !state.redirectedStdout.includes("ITEM a b\nITEM c\n") ||
+    state.redirectedStderr !== "" ||
+    !state.pythonErrorFile.includes("redirected-python") ||
+    !state.catErrorFile.includes("missing-e2e") ||
+    !state.ccErrorFile.includes("unsupported option: --not-real") ||
     !state.promptUsesDirectWasi
   ) {
     throw new Error(`Unexpected Slop channels: ${JSON.stringify(state)}`);
