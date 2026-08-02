@@ -12,6 +12,9 @@ that exported placeholder structurally with the real import.
 `sed.c` and `ar.c` implement practical, bounded subsets suitable for the
 browser workspace. Committed binaries live in `../bin/`.
 
+`/bin/python` and `/bin/python3` are marker entrypoints routed by Slop to the
+page's long-lived Pyodide CPython runtime; they are not separate WASI binaries.
+
 The spawn I/O structure uses ABI v3. Its last two fields carry the shell's
 NUL-separated environment so exported variables are inherited by child WASI
 programs. The first seven fields remain compatible with ABI v2.

@@ -71,7 +71,17 @@ export interface Pyodide {
 let pyodidePromise: Promise<Pyodide> | null = null;
 
 /** Per-call capture target for stdout/stderr. Set right before runPythonAsync. */
-let activeCapture: { push: (s: string) => void } | null = null;
+let activeCapture: {
+  stdout: (s: string) => void;
+  stderr: (s: string) => void;
+} | null = null;
+
+/** Route Pyodide's process-wide stdout/stderr callbacks to the active call. */
+export function attachPythonStreamCapture(py: Pyodide): void {
+  // Pyodide's batched callbacks contain one logical line without its newline.
+  py.setStdout({ batched: (s: string) => activeCapture?.stdout(`${s}\n`) });
+  py.setStderr({ batched: (s: string) => activeCapture?.stderr(`${s}\n`) });
+}
 
 /** Load the pyodide.js bootstrap script from the CDN (once). */
 function loadBootstrap(): Promise<void> {
@@ -107,9 +117,7 @@ export async function loadPyodideRuntime(onProgress?: (msg: string) => void): Pr
 
     // Route stdout/stderr through whatever capture is currently active.
     // Idle output (none, in practice) is dropped.
-    // Pyodide's batched callbacks contain one logical line without its newline.
-    py.setStdout({ batched: (s: string) => activeCapture?.push(`${s}\n`) });
-    py.setStderr({ batched: (s: string) => activeCapture?.push(`${s}\n`) });
+    attachPythonStreamCapture(py);
 
     // A project directory so paths feel natural.
     py.FS.mkdirTree("/home/web");
@@ -175,16 +183,28 @@ export async function runPythonCapture(
   onChunk?: (s: string) => void,
 ): Promise<RunResult> {
   const chunks: string[] = [];
-  const prev = activeCapture;
-  activeCapture = {
-    push: (s: string) => {
+  await runPythonWithStreams(py, code, {
+    stdout: (s) => {
       chunks.push(s);
       onChunk?.(s);
     },
-  };
+    stderr: (s) => {
+      chunks.push(s);
+      onChunk?.(s);
+    },
+  });
+  return { output: chunks.join("") };
+}
+
+export async function runPythonWithStreams(
+  py: Pyodide,
+  code: string,
+  streams: { stdout: (s: string) => void; stderr: (s: string) => void },
+): Promise<unknown> {
+  const prev = activeCapture;
+  activeCapture = streams;
   try {
-    await py.runPythonAsync(code);
-    return { output: chunks.join("") };
+    return await py.runPythonAsync(code);
   } finally {
     activeCapture = prev;
   }

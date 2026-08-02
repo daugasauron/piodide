@@ -77,6 +77,11 @@ static int copy_path(const char *src, const char *dst, int recursive, int depth)
     size_t n = strlen(dst) + strlen(base(src)) + 2; actual = malloc(n);
     if (!actual) return 1; snprintf(actual, n, "%s/%s", dst, base(src)); dst = actual;
   }
+  struct stat target;
+  if (stat(dst, &target) == 0 && target.st_dev == st.st_dev && target.st_ino == st.st_ino) {
+    fprintf(stderr, "%s: '%s' and '%s' are the same file\n", prog, src, dst);
+    free(actual); return 1;
+  }
   int rc = 0;
   if (S_ISDIR(st.st_mode)) {
     if (!recursive) { fprintf(stderr, "%s: omitting directory '%s'\n", prog, src); free(actual); return 1; }

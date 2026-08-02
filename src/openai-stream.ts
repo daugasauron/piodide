@@ -433,7 +433,7 @@ function applyThinking(
       ? compat.thinkingFormat
       : model.provider === "openrouter"
         ? "openrouter"
-        : model.provider === "zhipu" || model.provider === "zhipu-coding"
+        : ["zhipu", "zhipu-coding", "zhipu-coding-cn"].includes(model.provider)
           ? "zai"
           : "openai";
   const mapped = model.thinkingLevelMap?.[level];

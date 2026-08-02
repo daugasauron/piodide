@@ -43,7 +43,7 @@ The shell installs the original `ls`, `cat`, `grep`, `echo`, `env`, and
 `fd-find`, plus:
 
 ```text
-make sh sed ar
+make sh python python3 sed ar
 rm cp mv mkdir rmdir touch ln head tail wc sort cut tr tee
 basename dirname seq cmp install readlink find mktemp
 ```
@@ -77,6 +77,21 @@ ld hello.o -o hello.wasm
 
 The first compilation downloads about 52 MiB of pinned Clang 8, wasm-ld, and
 sysroot assets.
+
+## Python
+
+`python` and `/bin/python` run code in the same long-lived Pyodide CPython
+runtime used by the agent tools:
+
+```sh
+python -c 'print(6 * 7)'
+python script.py arg
+cat script.py | python -
+```
+
+Arguments, exported variables, the Slop working directory, piped stdin, exit
+status, pipes, and redirects are preserved. Interactive Python mode is not
+available; use `-c`, `-m`, a script, or `-`.
 
 ## Controls and limits
 

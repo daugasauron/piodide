@@ -16,6 +16,8 @@ import { fileURLToPath } from "node:url";
 const root = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const outputDir = join(root, "screens");
 const appUrl = process.env.DOCS_SCREENSHOT_URL || "http://localhost:5173/piodide/";
+const debugAppUrl = new URL(appUrl);
+debugAppUrl.searchParams.set("dbg", "1");
 const chromeBin = process.env.CHROME_BIN || "google-chrome-stable";
 const glmApiKey = process.env.DOCS_GLM_API_KEY?.trim() || "";
 const writeScreenshots = process.env.DOCS_SCREENSHOT_WRITE !== "0";
@@ -195,7 +197,7 @@ async function main() {
       `--user-data-dir=${profile}`,
       `--window-size=${viewport.width},${viewport.height}`,
       "--force-device-scale-factor=1",
-      appUrl,
+      debugAppUrl.toString(),
     ],
     { stdio: "ignore" },
   );
@@ -230,6 +232,17 @@ async function main() {
     await sleep(2_000);
     await submit(client, "pwd");
     await submit(client, "ls");
+    await submit(client, `/bin/python -c "print(6 * 7)" > python-output.txt`);
+    await sleep(800);
+    const { result: pythonResult } = await client.send("Runtime.evaluate", {
+      expression: `new TextDecoder().decode(
+        window.__pi.py.FS.readFile("/home/web/python-output.txt")
+      )`,
+      returnByValue: true,
+    });
+    if (pythonResult.value !== "42\n") {
+      throw new Error(`Unexpected /bin/python output: ${JSON.stringify(pythonResult.value)}`);
+    }
     await sleep(800);
     await screenshot(client, "slop-shell.png", 500);
 
@@ -353,44 +366,61 @@ async function main() {
     }
     await screenshot(client, "mobile-login.png", 844, 390);
 
-    if (glmApiKey) {
-      await client.send("Runtime.evaluate", {
-        expression: `(() => {
-          window.__piodideGlmResponses = [];
-          const originalFetch = window.fetch.bind(window);
-          window.fetch = async (...args) => {
-            const response = await originalFetch(...args);
-            const input = args[0];
-            const url = typeof input === "string" ? input : input.url;
-            if (url.includes("/api/coding/paas/v4/")) {
-              window.__piodideGlmResponses.push({
-                url,
-                status: response.status,
-                body: await response.clone().text()
-              });
-            }
-            return response;
-          };
-        })()`,
-      });
-      const { result: inputHandle } = await client.send("Runtime.evaluate", {
-        expression: `document.querySelector(".mobile-command-input")`,
-      });
-      if (!inputHandle.objectId) throw new Error("Mobile login input is unavailable");
-      await client.send("Runtime.callFunctionOn", {
-        objectId: inputHandle.objectId,
-        functionDeclaration: `function(value) {
-          this.value = value;
-          this.dispatchEvent(new Event("input", { bubbles: true }));
-          this.form.requestSubmit();
-        }`,
-        arguments: [{ value: glmApiKey }],
-      });
-    } else {
-      await client.send("Runtime.evaluate", {
-        expression: `document.querySelector("#mobile-command-close").click()`,
-      });
-    }
+    await client.send("Runtime.evaluate", {
+      expression: `(() => {
+        window.__piodideGlmResponses = [];
+        const live = ${glmApiKey ? "true" : "false"};
+        const originalFetch = window.fetch.bind(window);
+        window.fetch = async (...args) => {
+          const input = args[0];
+          const url = typeof input === "string" ? input : input.url;
+          const response = !live && url.endsWith("/chat/completions")
+            ? new Response(
+                '{"code":"1310","message":"Weekly/Monthly Limit Exhausted. Test response."}',
+                { status: 429, headers: { "Content-Type": "application/json" } }
+              )
+            : await originalFetch(...args);
+          if (url.includes("/api/coding/paas/v4/")) {
+            window.__piodideGlmResponses.push({
+              url,
+              status: response.status,
+              body: await response.clone().text()
+            });
+          }
+          return response;
+        };
+      })()`,
+    });
+    const loginTestKey = glmApiKey || "docs-mobile-paste-test";
+    const { result: pasteHandle } = await client.send("Runtime.evaluate", {
+      expression: `[...document.querySelectorAll("button")]
+        .find((button) => button.textContent === "Paste")`,
+    });
+    if (!pasteHandle.objectId) throw new Error("Mobile paste button is unavailable");
+    await client.send("Runtime.callFunctionOn", {
+      objectId: pasteHandle.objectId,
+      functionDeclaration: `function(value) {
+        Object.defineProperty(navigator, "clipboard", {
+          configurable: true,
+          value: { readText: async () => value }
+        });
+        this.click();
+      }`,
+      arguments: [{ value: loginTestKey }],
+    });
+    await sleep(200);
+    const { result: pastedResult } = await client.send("Runtime.callFunctionOn", {
+      objectId: pasteHandle.objectId,
+      functionDeclaration: `function(expected) {
+        const input = document.querySelector(".mobile-command-input");
+        const pasted = input?.value === expected;
+        if (pasted) input.form.requestSubmit();
+        return pasted;
+      }`,
+      arguments: [{ value: loginTestKey }],
+      returnByValue: true,
+    });
+    if (pastedResult.value !== true) throw new Error("Mobile paste button did not fill the API key");
     await sleep(300);
     const { result: connectedResult } = await client.send("Runtime.evaluate", {
       expression: `!document.querySelector("#mobile-command-layer").classList.contains("open")
@@ -399,55 +429,51 @@ async function main() {
     });
     if (connectedResult.value !== true) throw new Error("Mobile login did not complete");
 
-    if (glmApiKey) {
-      const keyCheckDeadline = Date.now() + 15_000;
-      let keyCheckResult = null;
-      while (Date.now() < keyCheckDeadline) {
-        const { result } = await client.send("Runtime.evaluate", {
-          expression: `window.__piodideGlmResponses
-            .find((response) => response.url.endsWith("/models")) ?? null`,
-          returnByValue: true,
-        });
-        if (result.value) {
-          keyCheckResult = result.value;
-          break;
-        }
-        await sleep(200);
-      }
-      if (keyCheckResult?.status !== 200) {
-        throw new Error(
-          `Unexpected GLM key-check response: ${JSON.stringify(keyCheckResult)}`,
-        );
-      }
-
-      await focusTerminal(client);
-      await submit(client, "Reply with OK.");
-
-      const deadline = Date.now() + 15_000;
-      let responseResult = null;
-      while (Date.now() < deadline) {
-        const { result } = await client.send("Runtime.evaluate", {
-          expression: `window.__piodideGlmResponses
-            .find((response) => response.url.endsWith("/chat/completions")) ?? null`,
-          returnByValue: true,
-        });
-        if (result.value) {
-          responseResult = result.value;
-          break;
-        }
-        await sleep(200);
-      }
-      if (
-        responseResult?.status !== 429 ||
-        !responseResult.body.includes('"code":"1310"') ||
-        !responseResult.body.includes("Weekly/Monthly Limit Exhausted")
-      ) {
-        throw new Error(
-          `Unexpected authenticated GLM response: ${JSON.stringify(responseResult)}`,
-        );
-      }
-      console.log("validated authenticated GLM request → HTTP 429 code 1310");
+    const { result: keyCheckResult } = await client.send("Runtime.evaluate", {
+      expression: `window.__piodideGlmResponses
+        .some((response) => response.url.endsWith("/models"))`,
+      returnByValue: true,
+    });
+    if (keyCheckResult.value !== false) {
+      throw new Error("Coding Plan login made an incompatible /models request");
     }
+
+    await focusTerminal(client);
+    await submit(client, "Reply with OK.");
+
+    const deadline = Date.now() + 15_000;
+    let responseResult = null;
+    while (Date.now() < deadline) {
+      const { result } = await client.send("Runtime.evaluate", {
+        expression: `window.__piodideGlmResponses
+          .find((response) => response.url.endsWith("/chat/completions")) ?? null`,
+        returnByValue: true,
+      });
+      if (result.value) {
+        responseResult = result.value;
+        break;
+      }
+      await sleep(200);
+    }
+    const successfulCompletion =
+      responseResult?.status === 200 &&
+      responseResult.body.includes('"model":"glm-5.2"') &&
+      responseResult.body.includes('"content":"OK"') &&
+      responseResult.body.includes("data: [DONE]");
+    const exhaustedQuota =
+      responseResult?.status === 429 &&
+      responseResult.body.includes('"code":"1310"') &&
+      responseResult.body.includes("Weekly/Monthly Limit Exhausted");
+    if (!successfulCompletion && !exhaustedQuota) {
+      throw new Error(
+        `Unexpected authenticated GLM response: ${JSON.stringify(responseResult)}`,
+      );
+    }
+    console.log(
+      successfulCompletion
+        ? "validated authenticated GLM-5.2 request → streamed HTTP 200 completion"
+        : "validated authenticated GLM request → HTTP 429 code 1310",
+    );
     console.log("validated mobile GLM Coding → GLM-5.2 → login flow");
   } finally {
     client?.close();

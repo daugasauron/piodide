@@ -7,11 +7,7 @@ type FetchLike = (
 
 export type ApiKeyVerification = "verified" | "not-supported";
 
-const GLM_PROVIDERS = new Set([
-  "zhipu",
-  "zhipu-coding",
-  "zhipu-coding-cn",
-]);
+const GLM_GENERAL_PROVIDERS = new Set(["zhipu"]);
 
 export function normalizeApiKey(value: string): string {
   let normalized = value.trim().replace(/^Bearer\s+/i, "").trim();
@@ -43,7 +39,10 @@ export async function verifyApiKey(
   apiKey: string,
   fetchImpl: FetchLike = fetch,
 ): Promise<ApiKeyVerification> {
-  if (!GLM_PROVIDERS.has(provider.name)) return "not-supported";
+  // Coding Plan credentials are scoped to chat-completions. The dedicated
+  // Coding endpoints can reject a valid plan key at /models, so there is no
+  // non-billable verification request we can safely make during login.
+  if (!GLM_GENERAL_PROVIDERS.has(provider.name)) return "not-supported";
 
   let response: Response;
   try {

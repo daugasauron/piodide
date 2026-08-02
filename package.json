@@ -12,6 +12,8 @@
     "chrome:webgpu": "scripts/chrome-webgpu.sh",
     "codex-proxy": "node scripts/local-codex-proxy.mjs",
     "docs:screenshots": "node scripts/capture-doc-screenshots.mjs",
+    "build:slop": "node --experimental-strip-types scripts/build-slop.ts",
+    "check:slop": "node --experimental-strip-types scripts/build-slop.ts --check",
     "test": "node --experimental-strip-types --test \"test/*.test.ts\"",
     "test:fetch-toolchain": "node scripts/fetch-toolchain-assets.mjs"
   },

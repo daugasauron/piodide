@@ -16,7 +16,7 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
-/* Spawn ABI v2, implemented by the browser host. */
+/* Spawn ABI v3, implemented by the browser host. */
 typedef struct {
   const char *stdin_data;
   int stdin_len;
@@ -46,6 +46,8 @@ extern int piodide_spawn(const char *path, const char *argv_blob, const char *cw
 
 typedef struct { char *s; size_t len, cap; } Buf;
 typedef struct { char *text; int quoted; } Token;
+typedef struct { char *name, *value; int was_set; } SavedAssignment;
+typedef struct { SavedAssignment items[MAX_ARGS]; int count; } AssignmentScope;
 typedef struct {
   char *argv[MAX_ARGS];
   int argc;
@@ -680,8 +682,10 @@ static int serialize_environment(void) {
   return (int)used;
 }
 
-static int toolchain_command(const char *s) {
-  return !strcmp(s, "cc") || !strcmp(s, "compile") || !strcmp(s, "ld") || !strcmp(s, "link");
+static int host_command(const char *s) {
+  const char *base = strrchr(s, '/'); base = base ? base + 1 : s;
+  return !strcmp(s, "cc") || !strcmp(s, "compile") || !strcmp(s, "ld") ||
+    !strcmp(s, "link") || !strcmp(base, "python") || !strcmp(base, "python3");
 }
 
 static int append_spawn_arg(char *blob, size_t cap, size_t *off, const char *s) {
@@ -690,14 +694,36 @@ static int append_spawn_arg(char *blob, size_t cap, size_t *off, const char *s) 
   memcpy(blob + *off, s, n); *off += n; return 1;
 }
 
-static int apply_assignments(Command *c) {
+static void restore_assignments(AssignmentScope *scope) {
+  for (int i = scope->count - 1; i >= 0; i--) {
+    SavedAssignment *saved = &scope->items[i];
+    if (saved->was_set) setenv(saved->name, saved->value, 1);
+    else unsetenv(saved->name);
+    free(saved->name); free(saved->value);
+  }
+  scope->count = 0;
+}
+
+static int apply_assignments(Command *c, AssignmentScope *scope) {
   int first = 0;
   while (first < c->argc) {
     const char *eq;
     if (!assignment_word(c->argv[first], &eq)) break;
-    size_t n = (size_t)(eq - c->argv[first]); char name[128];
-    if (n >= sizeof name) return -1;
-    memcpy(name, c->argv[first], n); name[n] = 0; setenv(name, eq + 1, 1); first++;
+    first++;
+  }
+  int persistent = first == c->argc;
+  for (int i = 0; i < first; i++) {
+    const char *eq = strchr(c->argv[i], '=');
+    size_t n = (size_t)(eq - c->argv[i]); char name[128];
+    if (n >= sizeof name) { restore_assignments(scope); return -1; }
+    memcpy(name, c->argv[i], n); name[n] = 0;
+    if (!persistent) {
+      const char *old = getenv(name);
+      SavedAssignment *saved = &scope->items[scope->count++];
+      saved->name = xstrdup(name); saved->value = old ? xstrdup(old) : NULL;
+      saved->was_set = old != NULL;
+    }
+    if (setenv(name, eq + 1, 1)) { restore_assignments(scope); return -1; }
   }
   if (first) {
     for (int i = first; i < c->argc; i++) c->argv[i - first] = c->argv[i];
@@ -722,18 +748,19 @@ static int run_pipeline(Command *cmds, int ncmd) {
   const char *previous = NULL; int previous_len = 0, code = 0;
   for (int i = 0; i < ncmd; i++) {
     Command *c = &cmds[i]; int last = i + 1 == ncmd;
-    if (apply_assignments(c) < 0) return 2;
+    AssignmentScope assignments; memset(&assignments, 0, sizeof assignments);
+    if (apply_assignments(c, &assignments) < 0) return 2;
     if (!c->argc) { code = 0; continue; }
 
     const char *input = previous; int input_len = previous_len;
     if (c->in_file) {
       input_len = load_redirect(c->in_file);
-      if (input_len < 0) return 1;
+      if (input_len < 0) { restore_assignments(&assignments); return 1; }
       input = redirect_input;
     }
     const char *out_file = NULL;
     if (c->out_file) {
-      if (!resolve_path(c->out_file, out_path)) { fprintf(stderr, "slop: output path too long\n"); return 1; }
+      if (!resolve_path(c->out_file, out_path)) { fprintf(stderr, "slop: output path too long\n"); restore_assignments(&assignments); return 1; }
       out_file = out_path;
     }
 
@@ -741,10 +768,10 @@ static int run_pipeline(Command *cmds, int ncmd) {
       FILE *out = stdout; int capture = 0;
       if (out_file) {
         out = fopen(out_file, c->append ? "a" : "w");
-        if (!out) { fprintf(stderr, "slop: %s: %s\n", c->out_file, strerror(errno)); return 1; }
+        if (!out) { fprintf(stderr, "slop: %s: %s\n", c->out_file, strerror(errno)); restore_assignments(&assignments); return 1; }
       } else if (!last || capture_active) {
         out = fmemopen(cur, PIPE_CAP, "w"); capture = 1;
-        if (!out) return 1;
+        if (!out) { restore_assignments(&assignments); return 1; }
       }
       code = run_builtin(c, out, input, input_len);
       if (capture) {
@@ -755,29 +782,29 @@ static int run_pipeline(Command *cmds, int ncmd) {
         } else previous = cur;
       } else { if (out_file) fclose(out); previous = NULL; previous_len = 0; }
     } else {
-      int pseudo = toolchain_command(c->argv[0]);
+      int pseudo = host_command(c->argv[0]);
       if (!pseudo && !find_command(c->argv[0], resolved)) {
-        fprintf(stderr, "slop: command not found: %s\n", c->argv[0]); return 127;
+        fprintf(stderr, "slop: command not found: %s\n", c->argv[0]); restore_assignments(&assignments); return 127;
       }
       int script = !pseudo && !wasm_program(resolved);
       const char *spawn_path = pseudo ? c->argv[0] : script ? "/bin/slop" : resolved;
       size_t off = 0;
-      if (!append_spawn_arg(blob, sizeof blob, &off, spawn_path)) return 2;
-      if (script && !append_spawn_arg(blob, sizeof blob, &off, resolved)) return 2;
+      if (!append_spawn_arg(blob, sizeof blob, &off, spawn_path)) { restore_assignments(&assignments); return 2; }
+      if (script && !append_spawn_arg(blob, sizeof blob, &off, resolved)) { restore_assignments(&assignments); return 2; }
       for (int a = 1; a < c->argc; a++)
-        if (!append_spawn_arg(blob, sizeof blob, &off, c->argv[a])) { fprintf(stderr, "slop: argument list too long\n"); return 2; }
+        if (!append_spawn_arg(blob, sizeof blob, &off, c->argv[a])) { fprintf(stderr, "slop: argument list too long\n"); restore_assignments(&assignments); return 2; }
       blob[off] = 0;
       int captured = 0;
       slop_io io; memset(&io, 0, sizeof io);
       io.stdin_data = input; io.stdin_len = input_len;
-      int env_len = serialize_environment(); if (env_len < 0) return 2;
+      int env_len = serialize_environment(); if (env_len < 0) { restore_assignments(&assignments); return 2; }
       io.env_data = spawn_env; io.env_len = env_len;
       if (out_file || !last || capture_active) { io.capture = cur; io.capture_cap = PIPE_CAP; io.capture_len = &captured; }
       code = piodide_spawn(spawn_path, blob, cwd, &io);
       if (captured > PIPE_CAP) { fprintf(stderr, "slop: output truncated at %d bytes\n", PIPE_CAP); captured = PIPE_CAP; }
       if (out_file) {
         FILE *f = fopen(out_file, c->append ? "ab" : "wb");
-        if (!f) { fprintf(stderr, "slop: %s: %s\n", c->out_file, strerror(errno)); return 1; }
+        if (!f) { fprintf(stderr, "slop: %s: %s\n", c->out_file, strerror(errno)); restore_assignments(&assignments); return 1; }
         if (captured && fwrite(cur, 1, (size_t)captured, f) != (size_t)captured) code = 1;
         fclose(f); previous = NULL; previous_len = 0;
       } else if (!last) {
@@ -787,6 +814,7 @@ static int run_pipeline(Command *cmds, int ncmd) {
         previous = NULL; previous_len = 0;
       } else { previous = NULL; previous_len = 0; }
     }
+    restore_assignments(&assignments);
     char *swap = cur; cur = next; next = swap;
   }
   return code;
@@ -795,7 +823,7 @@ static int run_pipeline(Command *cmds, int ncmd) {
 static int execute_command_list(char *line) {
   ListItem items[MAX_LISTS];
   int n = parse_list(line, items);
-  if (n < 0) { fprintf(stderr, "slop: %s\n", parse_error); return 2; }
+  if (n < 0) { fprintf(stderr, "slop: %s\n", parse_error); return last_status = 2; }
   for (int i = 0; i < n && !exit_requested && !flow_signal; i++) {
     int run = items[i].condition == COND_ALWAYS ||
       (items[i].condition == COND_AND && last_status == 0) ||

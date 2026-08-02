@@ -16,6 +16,7 @@ import {
   type WasiProgramHandle,
 } from "./wasi/browser-runner.ts";
 import { runToolchainInBrowser } from "./c-compiler.ts";
+import { runPythonEntrypoint } from "./python-entrypoint.ts";
 import { normalizePath } from "./wasi/abi.ts";
 import type { CompileOptions, LinkOptions } from "./wasi/toolchain.ts";
 
@@ -32,6 +33,7 @@ const SHELL_SOURCES = [
 const MAX_CHILDREN = 32;
 const MAX_C_SOURCE_BYTES = 512 * 1024;
 const MAX_TOOLCHAIN_INPUTS = 32;
+const PYTHON_ENTRYPOINT_MARKER = "piodide host-backed Python entrypoint\n";
 /** Pipe captures are bounded so a runaway producer can't eat the page. */
 const MAX_CAPTURE_BYTES = 1024 * 1024;
 
@@ -47,7 +49,10 @@ let installPromise: Promise<void> | null = null;
 export function ensureSlopInstalled(py: Pyodide, note?: (text: string) => void): Promise<void> {
   if (!installPromise) {
     installPromise = (async () => {
-      if (fsExists(py, "/bin/slop")) return;
+      if (fsExists(py, "/bin/slop")) {
+        installPythonEntrypoints(py);
+        return;
+      }
       note?.("  installing slop into /bin …");
       const base = import.meta.env.BASE_URL;
       py.FS.mkdirTree("/bin");
@@ -65,6 +70,7 @@ export function ensureSlopInstalled(py: Pyodide, note?: (text: string) => void):
       }
       const coreutils = new Uint8Array(await coreutilsResponse.arrayBuffer());
       for (const name of COREUTILS) py.FS.writeFile(`/bin/${name}`, coreutils);
+      installPythonEntrypoints(py);
       try {
         for (const name of SHELL_SOURCES) {
           const response = await fetch(`${base}slop/src/${name}`);
@@ -80,6 +86,14 @@ export function ensureSlopInstalled(py: Pyodide, note?: (text: string) => void):
     });
   }
   return installPromise;
+}
+
+function installPythonEntrypoints(py: Pyodide): void {
+  for (const name of ["python", "python3"]) {
+    const path = `/bin/${name}`;
+    if (!fsExists(py, path)) py.FS.writeFile(path, PYTHON_ENTRYPOINT_MARKER);
+    py.FS.chmod(path, 0o755);
+  }
 }
 
 /* ------------------------------- spawner -------------------------------- */
@@ -123,6 +137,9 @@ export class SlopSpawner {
 
   async onSpawn(request: SpawnRequest): Promise<SpawnResult> {
     const { path, args, cwd, stdinText, capture, outFile, append, env } = request;
+    if (["python", "python3"].includes(path.split("/").pop() ?? path)) {
+      return this.python(request);
+    }
     if (path === "compile" || path === "cc") {
       return { exitCode: await this.toolchainCompile(args.slice(1), cwd, path) };
     }
@@ -220,6 +237,55 @@ export class SlopSpawner {
   private resolveInCwd(path: string, cwd: string): string {
     if (path.startsWith("/")) return normalizePath(path);
     return normalizePath(`${cwd}/${path}`);
+  }
+
+  private async python(request: SpawnRequest): Promise<SpawnResult> {
+    if (this.activeChildren >= MAX_CHILDREN) {
+      this.deps.writeOut("slop: too many nested programs\r\n");
+      return { exitCode: 126 };
+    }
+    this.activeChildren++;
+    const captured: Uint8Array[] = [];
+    let capturedBytes = 0;
+    let fileStream: unknown = null;
+    try {
+      if (request.outFile) {
+        fileStream = this.deps.py.FS.open(request.outFile, request.append ? "a" : "w");
+      }
+      const stdout = (text: string) => {
+        const chunk = new TextEncoder().encode(text);
+        if (request.capture) {
+          if (capturedBytes + chunk.byteLength <= MAX_CAPTURE_BYTES) captured.push(chunk);
+          else if (capturedBytes < MAX_CAPTURE_BYTES) {
+            captured.push(chunk.slice(0, MAX_CAPTURE_BYTES - capturedBytes));
+          }
+          capturedBytes += chunk.byteLength;
+        } else if (fileStream !== null) {
+          this.deps.py.FS.write(fileStream, chunk, 0, chunk.byteLength);
+        } else {
+          this.deps.writeOut(text);
+        }
+      };
+      const exitCode = await runPythonEntrypoint(this.deps.py, {
+        args: request.args,
+        cwd: request.cwd,
+        env: request.env,
+        stdin: request.stdinText,
+        stdout,
+        stderr: this.deps.writeOut,
+      });
+      return request.capture
+        ? { exitCode, stdout: concatChunks(captured, capturedBytes) }
+        : { exitCode };
+    } catch (error) {
+      this.deps.writeOut(
+        "python: " + (error instanceof Error ? error.message : String(error)) + "\r\n",
+      );
+      return { exitCode: 1 };
+    } finally {
+      if (fileStream !== null) this.deps.py.FS.close(fileStream);
+      this.activeChildren--;
+    }
   }
 
   private compileUsage(command: string): string {

@@ -10,6 +10,8 @@
 | `npm run build` | Type-check and production build |
 | `npm test` | Node test suite |
 | `npm run test:fetch-toolchain` | Fetch and verify WASI test assets |
+| `npm run build:slop` | Rebuild mirrored Slop sources and WASM binaries |
+| `npm run check:slop` | Verify committed Slop binaries match their C sources |
 | `npm run chrome:webgpu` | Launch Linux Chrome with NVIDIA WebGPU flags |
 | `npm run codex-proxy` | Start the optional loopback Codex bridge |
 | `npm run docs:screenshots` | Capture current UI screenshots with Chrome |

@@ -32,6 +32,8 @@ jobs:
         run: npm ci
       - name: Fetch pinned toolchain test assets
         run: npm run test:fetch-toolchain
+      - name: Verify generated Slop binaries
+        run: npm run check:slop
       - name: Test
         run: npm test
       - name: Build

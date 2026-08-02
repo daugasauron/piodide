@@ -33,6 +33,38 @@ export function shouldUseMobileCommands(
   return hasCoarsePointer && width <= MOBILE_COMMAND_MAX_WIDTH;
 }
 
+interface ClipboardReader {
+  readText?: () => Promise<string>;
+  read?: () => Promise<Array<{ types: readonly string[]; getType(type: string): Promise<Blob> }>>;
+}
+
+export async function readMobileClipboard(clipboard: ClipboardReader | undefined): Promise<string> {
+  if (!clipboard) throw new Error("Clipboard access is unavailable in this browser.");
+  let firstError: unknown;
+  if (clipboard.readText) {
+    try {
+      const text = await clipboard.readText();
+      if (text) return text;
+    } catch (error) {
+      firstError = error;
+    }
+  }
+  if (clipboard.read) {
+    try {
+      const items = await clipboard.read();
+      const item = items.find(({ types }) => types.includes("text/plain"));
+      if (item) {
+        const text = await (await item.getType("text/plain")).text();
+        if (text) return text;
+      }
+    } catch (error) {
+      firstError ??= error;
+    }
+  }
+  if (firstError instanceof Error) throw firstError;
+  throw new Error("The clipboard does not contain text.");
+}
+
 interface MobileCommandUiOptions {
   layer: HTMLElement;
   drawer: HTMLElement;
@@ -244,14 +276,22 @@ export class MobileCommandUi implements MobilePromptSurface {
         paste.className = "mobile-command-secondary";
         paste.textContent = "Paste";
         paste.addEventListener("click", async () => {
+          // Some mobile browsers require the destination document and field to
+          // be focused before honoring a clipboard read from a user gesture.
+          input.focus({ preventScroll: true });
+          paste.disabled = true;
           try {
-            input.value = await navigator.clipboard.readText();
+            input.value = await readMobileClipboard(navigator.clipboard);
             input.dispatchEvent(new Event("input"));
-            input.focus();
             message.textContent = "Pasted. The key stays in this browser tab.";
-          } catch {
-            input.focus();
-            message.textContent = "Clipboard access was blocked. Long-press the field to paste.";
+          } catch (error) {
+            const prefix =
+              error instanceof Error && /contain text/i.test(error.message)
+                ? "The clipboard is empty."
+                : "Clipboard access was blocked.";
+            message.textContent = prefix + " Long-press the focused field and choose Paste.";
+          } finally {
+            paste.disabled = false;
           }
         });
         actions.append(paste);

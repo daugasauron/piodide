@@ -25,6 +25,7 @@ interface SlopRun {
   stdout: string;
   exitCode: number;
   toolchainCommands: string[][];
+  pythonCommands: string[][];
 }
 
 function installShell(fs: MemoryFs): void {
@@ -32,6 +33,8 @@ function installShell(fs: MemoryFs): void {
     fs.writeFile(`/bin/${name}`, shellBin(`${name}.wasm`));
   }
   fs.writeFile("/bin/sh", shellBin("slop.wasm"));
+  fs.writeFile("/bin/python", "piodide host-backed Python entrypoint\n");
+  fs.writeFile("/bin/python3", "piodide host-backed Python entrypoint\n");
   const coreutils = shellBin("coreutils.wasm");
   for (const name of COREUTILS) fs.writeFile(`/bin/${name}`, coreutils);
 }
@@ -55,6 +58,7 @@ async function runSlop(
   const lines = [...script];
   const encoder = new TextEncoder();
   const toolchainCommands: string[][] = [];
+  const pythonCommands: string[][] = [];
 
   interface SpawnIo {
     stdinText?: Uint8Array;
@@ -155,6 +159,10 @@ async function runSlop(
       toolchainCommands.push(childArgs);
       return 0;
     }
+    if (["python", "python3"].includes(childName)) {
+      pythonCommands.push(childArgs);
+      return 0;
+    }
 
     const io: SpawnIo = {};
     if (ioPtr !== 0) {
@@ -219,7 +227,7 @@ async function runSlop(
   });
   const slopModule = modules.get("slop")!;
   const exitCode = slopHost.start(new WebAssembly.Instance(slopModule, slopHost.getImportObject()));
-  return { stdout, exitCode, toolchainCommands };
+  return { stdout, exitCode, toolchainCommands, pythonCommands };
 }
 
 test("slop: quiet one-shot mode emits only command output", async () => {
@@ -231,6 +239,26 @@ test("slop: quiet one-shot mode emits only command output", async () => {
 
   assert.equal(run.exitCode, 0);
   assert.equal(run.stdout, "exact output\n");
+});
+
+test("slop: python and /bin/python route to the Pyodide host entrypoint", async () => {
+  const fs = new MemoryFs();
+  fs.mkdirTree("/home/web");
+  installShell(fs);
+
+  const run = await runSlop(
+    fs,
+    ["type python", "python -c 'print(1)'", "/bin/python script.py arg", "python3 -V"],
+    { quiet: true },
+  );
+
+  assert.equal(run.exitCode, 0);
+  assert.match(run.stdout, /python is \/bin\/python/);
+  assert.deepEqual(run.pythonCommands, [
+    ["python", "-c", "print(1)"],
+    ["/bin/python", "script.py", "arg"],
+    ["python3", "-V"],
+  ]);
 });
 
 test("slop: scripts, control flow, utilities, substitution, and exported env", async () => {
@@ -265,6 +293,42 @@ test("slop: scripts, control flow, utilities, substitution, and exported env", a
   assert.match(run.stdout, /control-ok\n/);
   assert.match(run.stdout, /one\.txt/);
   assert.doesNotMatch(run.stdout, /control-failed/);
+});
+
+test("slop: command-prefixed assignments are temporary", async () => {
+  const fs = new MemoryFs();
+  fs.mkdirTree("/home/web");
+  installShell(fs);
+
+  const run = await runSlop(
+    fs,
+    [
+      "PERSISTED=outer",
+      "PERSISTED=inner env | grep PERSISTED",
+      "TEMP_ONLY=yes env | grep TEMP_ONLY",
+      "echo AFTER-$PERSISTED-${TEMP_ONLY-unset}",
+    ],
+    { quiet: true },
+  );
+
+  assert.equal(run.exitCode, 0);
+  assert.match(run.stdout, /PERSISTED=inner\n/);
+  assert.match(run.stdout, /TEMP_ONLY=yes\n/);
+  assert.match(run.stdout, /AFTER-outer-unset\n/);
+});
+
+test("slop: cp refuses to truncate the same file", async () => {
+  const fs = new MemoryFs();
+  fs.mkdirTree("/home/web");
+  installShell(fs);
+  fs.writeFile("/home/web/same.txt", "keep\n");
+
+  const run = await runSlop(fs, ["cp same.txt same.txt", "echo COPY-STATUS-$?"], { quiet: true });
+
+  assert.equal(run.exitCode, 0);
+  assert.match(run.stdout, /same file\n/);
+  assert.match(run.stdout, /COPY-STATUS-1\n/);
+  assert.equal(new TextDecoder().decode(fs.readFile("/home/web/same.txt")), "keep\n");
 });
 
 test("slop: builtins, PATH lookup, spawning, and cwd", async () => {
