@@ -90,22 +90,47 @@ class CdpClient {
   }
 }
 
-async function waitForPython(client, timeout = 30_000) {
+async function waitForPython(client, timeout = 60_000) {
   const deadline = Date.now() + timeout;
   while (Date.now() < deadline) {
     const { result } = await client.send("Runtime.evaluate", {
-      expression: `document.querySelector("#terminal canvas") !== null`,
+      expression: `Boolean(window.__pi?.py?.FS && window.__pi?.prompt)`,
       returnByValue: true,
     });
-    if (result.value) {
-      // Pyodide readiness is rendered inside the terminal canvas. Allow the
-      // network-backed runtime to finish after the terminal surface appears.
-      await sleep(6_000);
-      return;
-    }
+    if (result.value) return;
     await sleep(200);
   }
-  throw new Error("Timed out waiting for the Piodide terminal");
+  throw new Error("Timed out waiting for the Piodide Python runtime");
+}
+
+async function waitForSlop(client, timeout = 30_000) {
+  const deadline = Date.now() + timeout;
+  while (Date.now() < deadline) {
+    const { result } = await client.send("Runtime.evaluate", {
+      expression: `Boolean(
+        window.__pi?.view === "slop"
+        && window.__pi?.slop?.alive
+        && window.__pi?.slopTerminal?.term
+      )`,
+      returnByValue: true,
+    });
+    if (result.value) return;
+    await sleep(200);
+  }
+  throw new Error("Timed out waiting for the Slop shell");
+}
+
+async function waitForPyodideFile(client, path, timeout = 10_000) {
+  const deadline = Date.now() + timeout;
+  while (Date.now() < deadline) {
+    const { result } = await client.send("Runtime.evaluate", {
+      expression: `Boolean(window.__pi?.py?.FS.analyzePath(${JSON.stringify(path)}).exists)`,
+      returnByValue: true,
+    });
+    if (result.value) return;
+    await sleep(100);
+  }
+  throw new Error(`Timed out waiting for ${path}`);
 }
 
 async function press(client, key, code, modifiers = 0) {
@@ -229,11 +254,14 @@ async function main() {
 
     await press(client, "Escape", "Escape");
     await shortcut(client, "s", "KeyS");
-    await sleep(2_000);
+    await waitForSlop(client);
+    await client.send("Runtime.evaluate", {
+      expression: `window.__pi.slopTerminal.term.focus()`,
+    });
     await submit(client, "pwd");
     await submit(client, "ls");
     await submit(client, `/bin/python -c "print(6 * 7)" > python-output.txt`);
-    await sleep(800);
+    await waitForPyodideFile(client, "/home/web/python-output.txt");
     const { result: pythonResult } = await client.send("Runtime.evaluate", {
       expression: `new TextDecoder().decode(
         window.__pi.py.FS.readFile("/home/web/python-output.txt")
