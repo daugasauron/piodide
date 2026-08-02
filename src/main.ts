@@ -270,6 +270,7 @@ const sessions = new BrowserSessions();
 const dim = (s: string) => `\x1b[2m${s}\x1b[0m`;
 const red = (s: string) => `\x1b[31m${s}\x1b[0m`;
 const green = (s: string) => `\x1b[32m${s}\x1b[0m`;
+const magenta = (s: string) => `\x1b[35m${s}\x1b[0m`;
 const cyan = (s: string) => `\x1b[36m${s}\x1b[0m`;
 const yellow = (s: string) => `\x1b[33m${s}\x1b[0m`;
 
@@ -1793,6 +1794,39 @@ function exactStringPreview(value: string, maxLength: number): string {
   return `${JSON.stringify(value.slice(0, low))}${suffix}`;
 }
 
+function slopCommandPreview(value: string, maxLength: number): string {
+  const safe = value
+    .replaceAll("\x1b", "\\x1b")
+    .replaceAll("\r", "\\r")
+    .replaceAll("\n", "\\n")
+    .replaceAll("\t", "\\t");
+  const preview = truncateLine(safe, maxLength);
+  const tokens = preview.match(
+    /"(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*'|\$\{[^}]*\}|\$[A-Za-z_?][A-Za-z0-9_?]*|&&|\|\||[|;&<>]+|\s+|[^\s'"$|;&<>]+|./g,
+  ) ?? [];
+  let expectsCommand = true;
+
+  return tokens.map((token) => {
+    if (/^\s+$/.test(token)) return token;
+    if (/^(?:&&|\|\||[|;&]+)$/.test(token)) {
+      expectsCommand = true;
+      return magenta(token);
+    }
+    if (/^[<>]+$/.test(token)) return magenta(token);
+    if (token.startsWith("\"") || token.startsWith("'")) return green(token);
+    if (token.startsWith("$")) return magenta(token);
+    if (expectsCommand && /^[A-Za-z_][A-Za-z0-9_]*=/.test(token)) {
+      return magenta(token);
+    }
+    if (expectsCommand) {
+      expectsCommand = false;
+      return cyan(token);
+    }
+    if (token.startsWith("-")) return yellow(token);
+    return token;
+  }).join("");
+}
+
 function printSlopCall(args: unknown) {
   const values =
     typeof args === "object" && args !== null ? (args as Record<string, unknown>) : {};
@@ -1802,7 +1836,7 @@ function printSlopCall(args: unknown) {
 
   writer.writeln(`  ${cyan("⏺ slop")}`);
   writer.writeln(`    ${dim("cwd  ")} ${exactStringPreview(cwd, valueWidth)}`);
-  writer.writeln(`    ${dim("input")} ${cyan(exactStringPreview(command, valueWidth))}`);
+  writer.writeln(`    ${yellow("input")} ${slopCommandPreview(command, valueWidth)}`);
 }
 
 function legacySlopOutputText(result: any, exitCode: unknown): string {
@@ -1823,8 +1857,8 @@ function printSlopChannel(
   name: "stdout" | "stderr",
   output: string,
 ) {
-  const headerColor = name === "stdout" ? cyan : red;
-  const textColor = name === "stdout" ? ((value: string) => value) : yellow;
+  const headerColor = name === "stdout" ? green : red;
+  const textColor = name === "stdout" ? green : yellow;
   writer.writeln(`    ${headerColor(name)}`);
   if (!output) {
     writer.writeln(`    ${headerColor("│")} ${dim("(empty)")}`);
@@ -2001,7 +2035,11 @@ async function renderEvent(event: AgentEvent) {
           case "html": footer = `  ↳ html · ${d.bytes ?? 0} bytes${d.path ? ` · ${d.path}` : ""}`; break;
           default: footer = `  ↳ ${event.toolName} done`;
         }
-        writer.writeln(dim(footer));
+        if (event.toolName === "slop") {
+          writer.writeln((d.exitCode ?? 1) === 0 ? green(footer) : red(footer));
+        } else {
+          writer.writeln(dim(footer));
+        }
         for (const image of images) {
           try {
             await renderKittyImage(writer, image);
