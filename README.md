@@ -42,7 +42,7 @@ Open <http://localhost:5173/piodide/>, run `/provider`, then `/model`.
 
 | Guide | Contents |
 | --- | --- |
-| [Mobile controls](docs/mobile.md) | Swipe menu, provider, model, API key |
+| [Mobile controls](docs/mobile.md) | Swipe menu, setup, thinking, `/demo` |
 | [Workspace](docs/workspace.md) | Pyodide filesystem, Neovim, files, GitHub |
 | [Local models](docs/local-models.md) | WebLLM, Wllama, GPU setup, model cache |
 | [Agent tools](docs/agent-tools.md) | Python, files, Git, previews, C toolchain |

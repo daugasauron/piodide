@@ -688,9 +688,12 @@ export function createHtmlTool(py: Pyodide): AgentTool<typeof HtmlParams, HtmlDe
     name: "html",
     label: "HTML",
     description:
-      "Open a self-contained HTML file from the in-browser filesystem in a closeable " +
+      "Open a self-contained HTML file from the in-browser filesystem in a full-screen " +
       "browser preview. Write the file first, then call this tool exactly once. Put CSS " +
-      "and JavaScript inline; other MEMFS files are not directly addressable by the iframe.",
+      "and JavaScript inline; embed images, data, and Wasm bytes in that file because other " +
+      "MEMFS paths are not addressable by the iframe. The sandbox has an opaque origin, so " +
+      "localStorage, sessionStorage, IndexedDB, and relative fetches are unavailable; keep " +
+      "runtime state in JavaScript memory.",
     parameters: HtmlParams,
     async execute(_id, params) {
       const path = fsResolve(py, params.path);

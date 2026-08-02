@@ -148,6 +148,98 @@ function makeKittyImagesFollowScrollback(term: Terminal): void {
   };
 }
 
+/** Route the mobile keyboard's Done/Enter action through terminal input. */
+function configureMobileEnter(term: Terminal): void {
+  const textarea = term.textarea;
+  if (!textarea) return;
+  textarea.enterKeyHint = "send";
+  let lastSubmit = -Infinity;
+
+  const submit = (event: Event) => {
+    event.preventDefault();
+    event.stopImmediatePropagation();
+    const now = performance.now();
+    if (now - lastSubmit < 100) return;
+    lastSubmit = now;
+    term.input("\r", true);
+  };
+  textarea.addEventListener("keydown", (event) => {
+    if (event.key === "Enter" && !event.isComposing) submit(event);
+  }, true);
+  textarea.addEventListener("beforeinput", (event) => {
+    if (event.inputType === "insertLineBreak" || event.inputType === "insertParagraph") {
+      submit(event);
+    }
+  }, true);
+}
+
+/**
+ * ghostty-web currently handles mouse wheels but not finger scrolling. Convert
+ * a vertical drag into terminal scrollback while leaving horizontal edge
+ * gestures available to the mobile command drawer.
+ */
+function configureTouchScroll(term: Terminal, mount: HTMLElement): void {
+  let touchId: number | null = null;
+  let startX = 0;
+  let startY = 0;
+  let lastY = 0;
+  let rowCarry = 0;
+  let scrolling = false;
+
+  const reset = () => {
+    touchId = null;
+    rowCarry = 0;
+    scrolling = false;
+  };
+
+  mount.addEventListener("touchstart", (event) => {
+    if (event.touches.length !== 1) {
+      reset();
+      return;
+    }
+    const touch = event.touches[0];
+    touchId = touch.identifier;
+    startX = touch.clientX;
+    startY = touch.clientY;
+    lastY = touch.clientY;
+    rowCarry = 0;
+    scrolling = false;
+  }, { passive: true, capture: true });
+
+  mount.addEventListener("touchmove", (event) => {
+    if (touchId === null) return;
+    const touch = Array.from(event.touches).find(({ identifier }) => identifier === touchId);
+    if (!touch) return;
+    const totalX = touch.clientX - startX;
+    const totalY = touch.clientY - startY;
+    if (!scrolling) {
+      if (Math.abs(totalY) < 8 || Math.abs(totalY) <= Math.abs(totalX)) return;
+      scrolling = true;
+    }
+
+    event.preventDefault();
+    event.stopPropagation();
+    const rowHeight = Math.max(12, mount.clientHeight / Math.max(1, term.rows));
+    rowCarry += (touch.clientY - lastY) / rowHeight;
+    lastY = touch.clientY;
+    const rows = Math.trunc(rowCarry);
+    if (rows !== 0) {
+      term.scrollLines(-rows);
+      rowCarry -= rows;
+    }
+  }, { passive: false, capture: true });
+
+  const finish = (event: TouchEvent) => {
+    if (scrolling) {
+      event.preventDefault();
+      event.stopImmediatePropagation();
+    }
+    reset();
+  };
+  mount.addEventListener("touchend", finish, { passive: false, capture: true });
+  mount.addEventListener("touchcancel", finish, { passive: false, capture: true });
+}
+
 export async function createTerminal(mount: HTMLElement): Promise<TerminalHandle> {
   await document.fonts.load(`${FONT_SIZE}px ${FONT_FAMILY}`);
   if (!terminalInitPromise) {
@@ -167,6 +259,8 @@ export async function createTerminal(mount: HTMLElement): Promise<TerminalHandle
   term.open(mount);
   cacheViewportPerRender(term);
   makeKittyImagesFollowScrollback(term);
+  configureMobileEnter(term);
+  configureTouchScroll(term, mount);
   term.attachCustomKeyEventHandler((event) => {
     const terminalClipboardShortcut =
       event.ctrlKey && event.shiftKey && !event.altKey && !event.metaKey;

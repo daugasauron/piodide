@@ -1,7 +1,7 @@
 import type { MobilePromptSurface, SelectRequest } from "./termui.ts";
 
 export interface MobileCommandDefinition {
-  command: "/provider" | "/login" | "/model";
+  command: "/provider" | "/login" | "/model" | "/thinking" | "/demo";
   label: string;
   description: string;
 }
@@ -21,6 +21,16 @@ export const MOBILE_COMMANDS: readonly MobileCommandDefinition[] = [
     command: "/model",
     label: "Model",
     description: "Choose a model for the provider",
+  },
+  {
+    command: "/thinking",
+    label: "Thinking",
+    description: "Choose the model's effort level",
+  },
+  {
+    command: "/demo",
+    label: "Demo",
+    description: "Build a C/Wasm game for this device",
   },
 ];
 
@@ -148,7 +158,7 @@ export class MobileCommandUi implements MobilePromptSurface {
 
     const intro = document.createElement("p");
     intro.className = "mobile-command-intro";
-    intro.textContent = "Configure the active model";
+    intro.textContent = "Configure the agent or launch a demo";
     this.options.content.append(intro);
 
     const list = document.createElement("div");

@@ -53,7 +53,8 @@ uses an isolated temporary Chrome profile, validates the mobile GLM login flow,
 and writes to `screens/`.
 
 Set `DOCS_GLM_API_KEY` for the optional live GLM check. Set
-`DOCS_SCREENSHOT_WRITE=0` to validate without replacing screenshots.
+`DOCS_SCREENSHOT_WRITE=0` to validate without replacing screenshots, or
+`DOCS_SCREENSHOT_ONLY=mobile-commands.png` to replace one image.
 
 ## GitHub Pages
 

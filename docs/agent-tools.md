@@ -14,7 +14,7 @@ All tools operate inside the browser and share `/home/web`.
 | `fetch` | Browser fetch, subject to CORS |
 | `download` | Export a file after the user asks |
 | `image` | Render PNG, JPEG, GIF, or WebP in the terminal |
-| `html` | Open a sandboxed, closeable HTML preview |
+| `html` | Open a sandboxed, full-screen HTML preview |
 
 | Image output | HTML preview |
 | --- | --- |
@@ -35,6 +35,7 @@ Use `/upload` to import host files; it must be initiated by the user.
 
 - No host shell, subprocesses, sockets, or host filesystem access.
 - Browser `fetch` follows CORS.
+- HTML previews have no browser storage or relative `/home/web` URLs; inline assets and state.
 - The wasm32 heap has a hard ceiling near 4 GiB.
 - Prefer bounded reads, output, and allocations.
 

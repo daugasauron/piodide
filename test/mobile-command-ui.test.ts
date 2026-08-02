@@ -7,10 +7,10 @@ import {
   shouldUseMobileCommands,
 } from "../src/mobile-command-ui.ts";
 
-test("mobile command drawer exposes only provider, login, and model", () => {
+test("mobile command drawer exposes setup, thinking, and demo commands", () => {
   assert.deepEqual(
     MOBILE_COMMANDS.map(({ command }) => command),
-    ["/provider", "/login", "/model"],
+    ["/provider", "/login", "/model", "/thinking", "/demo"],
   );
 });
 

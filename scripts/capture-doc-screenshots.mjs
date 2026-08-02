@@ -21,6 +21,7 @@ debugAppUrl.searchParams.set("dbg", "1");
 const chromeBin = process.env.CHROME_BIN || "google-chrome-stable";
 const glmApiKey = process.env.DOCS_GLM_API_KEY?.trim() || "";
 const writeScreenshots = process.env.DOCS_SCREENSHOT_WRITE !== "0";
+const screenshotOnly = process.env.DOCS_SCREENSHOT_ONLY?.trim() || "";
 const viewport = { width: 1440, height: 900 };
 
 const sleep = (milliseconds) =>
@@ -175,6 +176,61 @@ async function focusTerminal(client) {
   await sleep(100);
 }
 
+async function exerciseHtmlPreview(client, expectedWidth, expectedHeight, expectMobile) {
+  const evaluation = await client.send("Runtime.evaluate", {
+    expression: `(async () => {
+      window.__pi.py.FS.writeFile(
+        "/home/web/e2e-preview.html",
+        "<!doctype html><title>Preview check</title><style>body{background:#123;color:white}</style><h1>Preview check</h1>"
+      );
+      await window.__pi.run("/html /home/web/e2e-preview.html");
+      const preview = document.querySelector("#html-preview");
+      const rect = preview.getBoundingClientRect();
+      const trigger = document.querySelector("#mobile-command-trigger");
+      return {
+        hidden: preview.hidden,
+        x: rect.x,
+        y: rect.y,
+        width: rect.width,
+        height: rect.height,
+        back: document.querySelector("#html-preview-close")?.textContent.trim(),
+        bodyClass: document.body.classList.contains("html-preview-open"),
+        triggerDisplay: getComputedStyle(trigger).display
+      };
+    })()`,
+    awaitPromise: true,
+    returnByValue: true,
+  });
+  if (evaluation.exceptionDetails) {
+    throw new Error(
+      `HTML preview check threw: ${evaluation.exceptionDetails.exception?.description ?? evaluation.exceptionDetails.text}`,
+    );
+  }
+  const opened = evaluation.result;
+  const state = opened.value;
+  if (
+    state.hidden ||
+    state.x !== 0 ||
+    state.y !== 0 ||
+    Math.abs(state.width - expectedWidth) > 1 ||
+    Math.abs(state.height - expectedHeight) > 1 ||
+    state.back !== "← Back to agent" ||
+    !state.bodyClass ||
+    (expectMobile && state.triggerDisplay !== "none")
+  ) {
+    throw new Error(`Unexpected HTML preview layout: ${JSON.stringify(opened.value)}`);
+  }
+  await client.send("Runtime.evaluate", {
+    expression: `document.querySelector("#html-preview-close").click()`,
+  });
+  const { result: closed } = await client.send("Runtime.evaluate", {
+    expression: `document.querySelector("#html-preview").hidden
+      && !document.body.classList.contains("html-preview-open")`,
+    returnByValue: true,
+  });
+  if (!closed.value) throw new Error("HTML preview did not return to the agent");
+}
+
 async function shortcut(client, key, code) {
   // DevTools modifier bits: Ctrl=2, Shift=8.
   await press(client, key, code, 10);
@@ -186,7 +242,7 @@ async function screenshot(
   height = viewport.height,
   width = viewport.width,
 ) {
-  if (!writeScreenshots) return;
+  if (!writeScreenshots || (screenshotOnly && screenshotOnly !== name)) return;
   const { data } = await client.send("Page.captureScreenshot", {
     format: "png",
     fromSurface: true,
@@ -240,6 +296,7 @@ async function main() {
       mobile: false,
     });
     await waitForPython(client);
+    await exerciseHtmlPreview(client, viewport.width, viewport.height, false);
     await focusTerminal(client);
 
     await submit(client, "/provider");
@@ -290,8 +347,11 @@ async function main() {
       deviceScaleFactor: 1,
       mobile: true,
     });
+    await client.send("Runtime.evaluate", { expression: `delete window.__pi` });
     await client.send("Page.reload", { ignoreCache: true });
     await waitForPython(client);
+    await exerciseHtmlPreview(client, 390, 844, true);
+
     const { result: mobileEnvironment } = await client.send("Runtime.evaluate", {
       expression: `JSON.stringify({
         width: innerWidth,
@@ -324,7 +384,7 @@ async function main() {
       )`,
       returnByValue: true,
     });
-    if (commandResult.value !== '["/provider","/login","/model"]') {
+    if (commandResult.value !== '["/provider","/login","/model","/thinking","/demo"]') {
       throw new Error(`Unexpected mobile command drawer: ${commandResult.value}`);
     }
     await screenshot(client, "mobile-commands.png", 844, 390);
@@ -378,6 +438,38 @@ async function main() {
       expression: `document.querySelector("#mobile-command-trigger").click()`,
     });
     await client.send("Runtime.evaluate", {
+      expression: `document.querySelector('[data-mobile-command="/thinking"]').click()`,
+    });
+    await sleep(300);
+    const { result: thinkingResult } = await client.send("Runtime.evaluate", {
+      expression: `JSON.stringify(
+        [...document.querySelectorAll(".mobile-option-label")]
+          .map((label) => label.textContent)
+      )`,
+      returnByValue: true,
+    });
+    if (thinkingResult.value !== '["off","low","medium","high","max"]') {
+      throw new Error(`Unexpected GLM thinking levels: ${thinkingResult.value}`);
+    }
+    await client.send("Runtime.evaluate", {
+      expression: `(
+        [...document.querySelectorAll(".mobile-option-button")]
+          .find((button) => button.textContent.trim().startsWith("high"))
+          ?.click()
+      )`,
+    });
+    await sleep(200);
+    const { result: selectedThinkingResult } = await client.send("Runtime.evaluate", {
+      expression: `document.querySelector("#footer-model")?.textContent.includes(" • high")`,
+      returnByValue: true,
+    });
+    if (selectedThinkingResult.value !== true) {
+      throw new Error("Mobile flow did not set GLM thinking effort to high");
+    }
+    await client.send("Runtime.evaluate", {
+      expression: `document.querySelector("#mobile-command-trigger").click()`,
+    });
+    await client.send("Runtime.evaluate", {
       expression: `document.querySelector('[data-mobile-command="/login"]').click()`,
     });
     await sleep(300);
@@ -419,7 +511,7 @@ async function main() {
         };
       })()`,
     });
-    const loginTestKey = glmApiKey || "docs-mobile-paste-test";
+    const loginTestKey = glmApiKey || "docs-mobile.paste-test";
     const { result: pasteHandle } = await client.send("Runtime.evaluate", {
       expression: `[...document.querySelectorAll("button")]
         .find((button) => button.textContent === "Paste")`,
@@ -493,8 +585,18 @@ async function main() {
       responseResult.body.includes('"code":"1310"') &&
       responseResult.body.includes("Weekly/Monthly Limit Exhausted");
     if (!successfulCompletion && !exhaustedQuota) {
+      const { result: debugResult } = await client.send("Runtime.evaluate", {
+        expression: `JSON.stringify({
+          history: window.__pi.prompt.history,
+          busy: window.__pi.prompt.busy,
+          config: window.__pi.config,
+          activeElement: document.activeElement?.tagName,
+          drawerOpen: document.querySelector("#mobile-command-layer").classList.contains("open")
+        })`,
+        returnByValue: true,
+      });
       throw new Error(
-        `Unexpected authenticated GLM response: ${JSON.stringify(responseResult)}`,
+        `Unexpected authenticated GLM response: ${JSON.stringify(responseResult)} · ${debugResult.value}`,
       );
     }
     console.log(
@@ -502,6 +604,77 @@ async function main() {
         ? "validated authenticated GLM-5.2 request → streamed HTTP 200 completion"
         : "validated authenticated GLM request → HTTP 429 code 1310",
     );
+
+    const { result: doneResult } = await client.send("Runtime.evaluate", {
+      expression: `(() => {
+        window.__pi.term.input("/status", true);
+        window.__pi.term.textarea.dispatchEvent(new InputEvent("beforeinput", {
+          inputType: "insertParagraph",
+          bubbles: true,
+          cancelable: true
+        }));
+        return window.__pi.prompt.history.at(-1);
+      })()`,
+      returnByValue: true,
+    });
+    if (doneResult.value !== "/status") {
+      throw new Error(`Mobile Done did not submit Enter: ${JSON.stringify(doneResult.value)}`);
+    }
+
+    await client.send("Runtime.evaluate", {
+      expression: `(() => {
+        for (let i = 0; i < 120; i++) window.__pi.writer.writeln("scrollback " + i);
+        window.__pi.term.scrollToBottom();
+      })()`,
+    });
+    await client.send("Input.dispatchTouchEvent", {
+      type: "touchStart",
+      touchPoints: [{ x: 180, y: 220 }],
+    });
+    await client.send("Input.dispatchTouchEvent", {
+      type: "touchMove",
+      touchPoints: [{ x: 180, y: 520 }],
+    });
+    await client.send("Input.dispatchTouchEvent", {
+      type: "touchEnd",
+      touchPoints: [],
+    });
+    await sleep(200);
+    const { result: scrollResult } = await client.send("Runtime.evaluate", {
+      expression: `window.__pi.term.viewportY`,
+      returnByValue: true,
+    });
+    if (!(scrollResult.value > 0)) {
+      throw new Error(`Touch drag did not move terminal scrollback: ${scrollResult.value}`);
+    }
+    await client.send("Runtime.evaluate", {
+      expression: `window.__pi.term.scrollToBottom()`,
+    });
+
+    await client.send("Emulation.setDeviceMetricsOverride", {
+      width: 390,
+      height: 500,
+      deviceScaleFactor: 1,
+      mobile: true,
+    });
+    await sleep(200);
+    const { result: viewportResult } = await client.send("Runtime.evaluate", {
+      expression: `JSON.stringify({
+        appHeight: getComputedStyle(document.documentElement).getPropertyValue("--app-height"),
+        visualHeight: Math.round(visualViewport.height),
+        bodyHeight: Math.round(document.body.getBoundingClientRect().height),
+        viewportAtBottom: window.__pi.term.viewportY
+      })`,
+      returnByValue: true,
+    });
+    const keyboardViewport = JSON.parse(viewportResult.value);
+    if (
+      keyboardViewport.appHeight !== `${keyboardViewport.visualHeight}px` ||
+      keyboardViewport.bodyHeight !== keyboardViewport.visualHeight ||
+      keyboardViewport.viewportAtBottom !== 0
+    ) {
+      throw new Error(`Terminal did not follow the visual viewport: ${viewportResult.value}`);
+    }
     console.log("validated mobile GLM Coding → GLM-5.2 → login flow");
   } finally {
     client?.close();

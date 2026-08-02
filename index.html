@@ -4,7 +4,7 @@
     <meta charset="UTF-8" />
     <meta
       name="viewport"
-      content="width=device-width, initial-scale=1.0, viewport-fit=cover"
+      content="width=device-width, initial-scale=1.0, viewport-fit=cover, interactive-widget=resizes-content"
     />
     <title>piodide</title>
   </head>
@@ -28,8 +28,10 @@
     <div id="html-preview" hidden>
       <section class="html-preview-window" role="dialog" aria-modal="true" aria-labelledby="html-preview-title">
         <header class="html-preview-header">
+          <button id="html-preview-close" type="button" aria-label="Back to agent">
+            ← Back to agent
+          </button>
           <span id="html-preview-title">HTML preview</span>
-          <button id="html-preview-close" type="button" aria-label="Close HTML preview">Close</button>
         </header>
         <iframe
           id="html-preview-frame"

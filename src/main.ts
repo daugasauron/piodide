@@ -90,7 +90,7 @@ Tools:
 - git: use a real Dulwich Git repository in /home/web for init/status/add/commit/log/diff. GitHub clone/pull/push use its browser-compatible API; private access is registered by the user with /github and is never visible to you. The remote adapter synchronizes committed snapshots, so commit before push and push before pull.
 - fetch: fetch a URL via the browser's native fetch (CORS-limited); set path to save a binary response in /home/web. Saving a file does not display it.
 - image: display a PNG, JPEG, GIF, or WebP file from /home/web directly in the terminal. This is the only display path; call it exactly once.
-- html: open a self-contained HTML file from /home/web in a closeable browser preview. Write one file with inline CSS and JavaScript, then call html exactly once; relative MEMFS assets are not available inside the preview.
+- html: open a self-contained HTML file from /home/web in a closeable browser preview. Write one file with inline CSS and JavaScript, then call html exactly once. The sandboxed srcdoc has an opaque origin: localStorage, sessionStorage, IndexedDB, relative fetches, and relative MEMFS assets are unavailable. Keep state in JavaScript memory and embed every required asset, including Wasm bytes, in the HTML.
 
 Environment and memory constraints:
 - Pyodide, Python objects, loaded packages, and MEMFS files all consume the page's WebAssembly memory. It can grow toward a hard wasm32 ceiling of about 4 GB and cannot be safely recovered after exhaustion.
@@ -120,7 +120,8 @@ To show an image, save it as a file and then call the image tool exactly once. A
 python, or reasoning result does not display the file. Do not print binary image bytes or
 base64 into the terminal, and do not call image again for the same display request.
 To show an interactive page, write a self-contained .html file and call the html tool exactly
-once. Keep its CSS and JavaScript inline.
+once. Keep its CSS and JavaScript inline. Never add allow-same-origin or depend on browser
+storage in the preview.
 
 Be concise and pragmatic. Prefer running code over long prose. Use python for math, data, and exploration. Use write/edit to change files, then confirm briefly.`;
 
@@ -138,7 +139,7 @@ Tools:
 - python runs focused, valid CPython 3 in the long-lived Pyodide runtime. Never use notebook ! commands, pip, os.system, or subprocess. Pure-Python packages can be installed with micropip when necessary.
 - compile_c compiles one C11/C17 source to a wasm32-wasi object. link_wasi links objects with WASI libc. run_wasi executes the resulting module. The first compile downloads about 52 MB; avoid speculative builds.
 - git manages the browser-local Dulwich repository. GitHub network operations require credentials registered separately by the user.
-- fetch is browser fetch and is CORS-limited. download exports a file only when the user asks. image displays an image exactly once. html opens one self-contained HTML file.
+- fetch is browser fetch and is CORS-limited. download exports a file only when the user asks. image displays an image exactly once. html opens one self-contained HTML file. Its sandboxed srcdoc has an opaque origin, so browser storage and relative MEMFS fetches do not work; inline every dependency and keep runtime state in JavaScript memory.
 
 Constraints:
 - Pyodide objects and /home/web files consume a wasm32 heap with a hard ceiling near 4 GB. Avoid unbounded work, large copies, and speculative package installs.
@@ -156,6 +157,7 @@ const BANNER = [
     ? "\x1b[2mViews:\x1b[0m     Ctrl+Shift+E toggles agent ↔ Neovim · Ctrl+Shift+S toggles slop shell"
     : "\x1b[2mView:\x1b[0m      Ctrl+Shift+S toggles the slop shell",
   "\x1b[2mStart with:\x1b[0m /provider  →  choose one  →  /login when required  →  type.",
+  "\x1b[2mTry:\x1b[0m        /demo  →  build a C → WebAssembly game for this device.",
   "",
 ].join("\r\n");
 
@@ -184,6 +186,7 @@ const COMMANDS: readonly CommandSuggestion[] = [
   { name: "/run", description: "run a WASI program from /home/web" },
   { name: "/image", description: "display an image file from /home/web" },
   { name: "/html", description: "open an HTML file from /home/web" },
+  { name: "/demo", description: "build a C/Wasm game for this device" },
   ...NEOVIM_COMMANDS,
   { name: "/hotkeys", description: "show keyboard shortcuts" },
   { name: "/settings", description: "show current browser settings" },
@@ -269,6 +272,20 @@ const green = (s: string) => `\x1b[32m${s}\x1b[0m`;
 const cyan = (s: string) => `\x1b[36m${s}\x1b[0m`;
 const yellow = (s: string) => `\x1b[33m${s}\x1b[0m`;
 
+let viewportSyncFrame = 0;
+
+function syncVisualViewport() {
+  const height = window.visualViewport?.height ?? window.innerHeight;
+  document.documentElement.style.setProperty("--app-height", `${Math.round(height)}px`);
+  window.cancelAnimationFrame(viewportSyncFrame);
+  viewportSyncFrame = window.requestAnimationFrame(() => {
+    const terminal = activeView === "slop" ? slopHandle : handle;
+    if (!terminal) return;
+    terminal.fit.fit();
+    terminal.term.scrollToBottom();
+  });
+}
+
 function say(line: string) {
   writer.ensureNewline();
   writer.writeln(line);
@@ -279,6 +296,7 @@ function openHtmlPreview(path: string) {
   htmlPreviewTitleEl.textContent = path;
   htmlPreviewFrameEl.srcdoc = fsReadText(py, path);
   htmlPreviewEl.hidden = false;
+  document.body.classList.add("html-preview-open");
   htmlPreviewCloseEl.focus();
 }
 
@@ -286,6 +304,7 @@ function closeHtmlPreview() {
   if (htmlPreviewEl.hidden) return;
   htmlPreviewEl.hidden = true;
   htmlPreviewFrameEl.srcdoc = "";
+  document.body.classList.remove("html-preview-open");
   handle.term.focus();
 }
 
@@ -338,9 +357,36 @@ function currentLocalProvider() {
 }
 
 function currentSystemPrompt() {
-  return provider?.transport === "browser"
+  const base = provider?.transport === "browser"
     ? LOCAL_SYSTEM_PROMPT
     : REMOTE_SYSTEM_PROMPT;
+  return `${base}\n\n${clientEnvironmentDescription()}`;
+}
+
+function isPhoneClient(): boolean {
+  return (
+    window.innerWidth <= 960 &&
+    (navigator.maxTouchPoints > 0 || matchMedia("(any-pointer: coarse)").matches)
+  );
+}
+
+function clientEnvironmentDescription(): string {
+  const kind = isPhoneClient() ? "phone with a touch screen" : "desktop/laptop";
+  return `Current client: ${kind}, ${window.innerWidth}×${window.innerHeight} CSS pixels. Adapt interactive HTML controls and layout to this device.`;
+}
+
+function demoRequest(): string {
+  const phone = isPhoneClient();
+  const controls = phone
+    ? "Use large touch controls, prevent unwanted page gestures, and fit portrait screens."
+    : "Use responsive keyboard and mouse controls and make good use of a landscape screen.";
+  return `Create and launch an original, polished mini-game that shows off this browser environment. You have creative freedom: choose a visually distinctive concept and make it genuinely fun for a short session.
+
+The current client is a ${phone ? "phone/touch device" : "desktop/laptop"} at ${window.innerWidth}×${window.innerHeight} CSS pixels. ${controls}
+
+Implement the game simulation, rules, and scoring in C under /home/web, include a trivial main for the WASI linker, compile it to WebAssembly with compile_c and link_wasi, and export the small pure functions the browser needs. Verify the C/Wasm before presenting it. Then create one self-contained HTML file with polished inline CSS and JavaScript and open it with the html tool exactly once at the end.
+
+The preview is a sandboxed srcdoc with an opaque origin. It cannot fetch relative /home/web files and cannot use localStorage, sessionStorage, or IndexedDB. Embed the Wasm bytes directly in the HTML (for example as base64 or a byte array), keep state in memory, provide any required WASI imports, and do not invoke a WASI _start function from the page. Do the work with tools; do not merely describe what you would build.`;
 }
 
 function consumeLocalCodexProxyToken(): string {
@@ -846,6 +892,7 @@ async function handleSubmit(text: string) {
 
   prompt.setBusy(true);
   try {
+    agent.state.systemPrompt = currentSystemPrompt();
     await agent.prompt(t);
   } catch (err) {
     say(red(`  agent error: ${err instanceof Error ? err.message : String(err)}`));
@@ -1250,11 +1297,17 @@ async function runSlash(input: string) {
       say(dim("  /download <path>  /upload [directory]      host file transfer"));
       say(dim("  /run <prog.wasm> [args]                    run a WASI program (live filesystem)"));
       say(dim("  /image <path>  /html <path>                browser previews"));
+      say(dim("  /demo                                      build a device-aware C/Wasm game"));
       if (NEOVIM_ENABLED) {
         say(dim("  /nvim                                      open Neovim editor"));
       }
       say(dim("  /status  /clear  /hotkeys                  terminal utilities"));
       break;
+
+    case "demo":
+      say(cyan(`  ◇ demo target: ${isPhoneClient() ? "phone · touch" : "desktop · keyboard/mouse"}`));
+      await handleSubmit(demoRequest());
+      return;
 
     case "provider": {
       if (!arg) {
@@ -2057,6 +2110,10 @@ async function main() {
   // token. A required reload must preserve the fragment for the stable page.
   if (await ensureCrossOriginIsolation()) return;
   const localCodexProxyToken = consumeLocalCodexProxyToken();
+  window.addEventListener("resize", syncVisualViewport);
+  window.visualViewport?.addEventListener("resize", syncVisualViewport);
+  window.visualViewport?.addEventListener("scroll", syncVisualViewport);
+  syncVisualViewport();
   handle = await createTerminal(mount);
   writer = handle.writer;
   markdown = new AssistantMarkdown(writer);
@@ -2107,7 +2164,7 @@ async function main() {
       installWasiPythonModule(p, makeJsRunner(p));
       agent = new Agent({
         initialState: {
-          systemPrompt: REMOTE_SYSTEM_PROMPT,
+          systemPrompt: currentSystemPrompt(),
           model: makeModel({ baseUrl: "", modelId: "", api: "openai-completions", provider: "none" }),
           thinkingLevel: "off",
           tools: createAllTools(p, () => gitHubCredentials),
