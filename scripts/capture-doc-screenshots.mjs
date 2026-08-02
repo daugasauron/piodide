@@ -21,6 +21,7 @@ debugAppUrl.searchParams.set("dbg", "1");
 const chromeBin = process.env.CHROME_BIN || "google-chrome-stable";
 const glmApiKey = process.env.DOCS_GLM_API_KEY?.trim() || "";
 const writeScreenshots = process.env.DOCS_SCREENSHOT_WRITE !== "0";
+const mobileOnly = process.env.DOCS_MOBILE_ONLY === "1";
 const viewport = { width: 1440, height: 900 };
 
 const sleep = (milliseconds) =>
@@ -242,43 +243,45 @@ async function main() {
     await waitForPython(client);
     await focusTerminal(client);
 
-    await submit(client, "/provider");
-    await sleep(800);
-    await screenshot(client, "providers.png", 540);
+    if (!mobileOnly) {
+      await submit(client, "/provider");
+      await sleep(800);
+      await screenshot(client, "providers.png", 540);
 
-    await press(client, "Enter", "Enter");
-    await sleep(800);
-    await submit(client, "/model");
-    await sleep(800);
-    await screenshot(client, "local-models.png", 500);
+      await press(client, "Enter", "Enter");
+      await sleep(800);
+      await submit(client, "/model");
+      await sleep(800);
+      await screenshot(client, "local-models.png", 500);
 
-    await press(client, "Escape", "Escape");
-    await shortcut(client, "s", "KeyS");
-    await waitForSlop(client);
-    await client.send("Runtime.evaluate", {
-      expression: `window.__pi.slopTerminal.term.focus()`,
-    });
-    await submit(client, "pwd");
-    await submit(client, "ls");
-    await submit(client, `/bin/python -c "print(6 * 7)" > python-output.txt`);
-    await waitForPyodideFile(client, "/home/web/python-output.txt");
-    const { result: pythonResult } = await client.send("Runtime.evaluate", {
-      expression: `new TextDecoder().decode(
-        window.__pi.py.FS.readFile("/home/web/python-output.txt")
-      )`,
-      returnByValue: true,
-    });
-    if (pythonResult.value !== "42\n") {
-      throw new Error(`Unexpected /bin/python output: ${JSON.stringify(pythonResult.value)}`);
+      await press(client, "Escape", "Escape");
+      await shortcut(client, "s", "KeyS");
+      await waitForSlop(client);
+      await client.send("Runtime.evaluate", {
+        expression: `window.__pi.slopTerminal.term.focus()`,
+      });
+      await submit(client, "pwd");
+      await submit(client, "ls");
+      await submit(client, `/bin/python -c "print(6 * 7)" > python-output.txt`);
+      await waitForPyodideFile(client, "/home/web/python-output.txt");
+      const { result: pythonResult } = await client.send("Runtime.evaluate", {
+        expression: `new TextDecoder().decode(
+          window.__pi.py.FS.readFile("/home/web/python-output.txt")
+        )`,
+        returnByValue: true,
+      });
+      if (pythonResult.value !== "42\n") {
+        throw new Error(`Unexpected /bin/python output: ${JSON.stringify(pythonResult.value)}`);
+      }
+      await sleep(800);
+      await screenshot(client, "slop-shell.png", 500);
+
+      await shortcut(client, "s", "KeyS");
+      await sleep(500);
+      await shortcut(client, "e", "KeyE");
+      await sleep(8_000);
+      await screenshot(client, "neovim.png");
     }
-    await sleep(800);
-    await screenshot(client, "slop-shell.png", 500);
-
-    await shortcut(client, "s", "KeyS");
-    await sleep(500);
-    await shortcut(client, "e", "KeyE");
-    await sleep(8_000);
-    await screenshot(client, "neovim.png");
 
     await client.send("Emulation.setTouchEmulationEnabled", {
       enabled: true,
