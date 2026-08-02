@@ -13,10 +13,7 @@ Tap the floating `/` button or swipe left from the right edge.
 3. Choose `/login`, paste the API key, and tap **Connect**.
 
 The drawer is limited to these three commands. API keys stay in page memory
-and are cleared on refresh. General GLM keys use the models endpoint for login
-validation. Coding Plan login sends a one-token completion because its models
-endpoint rejects valid plan keys. A quota-exhausted response still verifies the
-key, but the app reports that requests cannot run. Paste cleanup removes
-Unicode whitespace and invisible formatting marks while preserving the periods
-in Z.AI's `id.secret` key format. The confirmation shows the normalized key's
-length and first/last four characters.
+and are cleared on refresh. General GLM keys are checked without running a
+completion. Coding Plan keys are validated by the first real request because
+the Coding endpoint has no compatible non-billable key check. A GLM value
+without the dot in `id.secret` is rejected as an incomplete copy.

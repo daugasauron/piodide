@@ -67,7 +67,7 @@ import { makeJsRunner, startWasiProgram, supportsWorkerWasi } from "./wasi/brows
 import { installWasiPythonModule } from "./wasi/python-module.ts";
 import { SlopSession } from "./slop.ts";
 import { MobileCommandUi } from "./mobile-command-ui.ts";
-import { apiKeyHint, normalizeApiKey, verifyApiKey } from "./provider-auth.ts";
+import { normalizeApiKey, verifyApiKey } from "./provider-auth.ts";
 
 const NEOVIM_ENABLED = import.meta.env.VITE_ENABLE_NEOVIM !== "0";
 
@@ -1388,19 +1388,13 @@ async function runSlash(input: string) {
       if (normalized) {
         const verification = await verifyApiKey(provider, normalized);
         apiKeys.set(provider.name, normalized);
-        const hint = apiKeyHint(normalized);
-        if (verification === "quota-exhausted") {
-          say(green(`  ◆ key verified for ${provider.label} · ${hint}`));
-          say(yellow("    Coding Plan quota is exhausted; the key is valid but requests cannot run."));
-        } else {
-          say(
-            green(
-              `  ◆ key ${verification === "verified" ? "verified and " : ""}set for ${
-                provider.label
-              } · ${hint}`,
-            ),
-          );
-        }
+        say(
+          green(
+            `  ◆ key ${verification === "verified" ? "verified and " : ""}set for ${
+              provider.label
+            }`,
+          ),
+        );
       } else {
         say(yellow("  login cancelled"));
       }

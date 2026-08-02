@@ -21,7 +21,6 @@ debugAppUrl.searchParams.set("dbg", "1");
 const chromeBin = process.env.CHROME_BIN || "google-chrome-stable";
 const glmApiKey = process.env.DOCS_GLM_API_KEY?.trim() || "";
 const writeScreenshots = process.env.DOCS_SCREENSHOT_WRITE !== "0";
-const mobileOnly = process.env.DOCS_MOBILE_ONLY === "1";
 const viewport = { width: 1440, height: 900 };
 
 const sleep = (milliseconds) =>
@@ -243,45 +242,43 @@ async function main() {
     await waitForPython(client);
     await focusTerminal(client);
 
-    if (!mobileOnly) {
-      await submit(client, "/provider");
-      await sleep(800);
-      await screenshot(client, "providers.png", 540);
+    await submit(client, "/provider");
+    await sleep(800);
+    await screenshot(client, "providers.png", 540);
 
-      await press(client, "Enter", "Enter");
-      await sleep(800);
-      await submit(client, "/model");
-      await sleep(800);
-      await screenshot(client, "local-models.png", 500);
+    await press(client, "Enter", "Enter");
+    await sleep(800);
+    await submit(client, "/model");
+    await sleep(800);
+    await screenshot(client, "local-models.png", 500);
 
-      await press(client, "Escape", "Escape");
-      await shortcut(client, "s", "KeyS");
-      await waitForSlop(client);
-      await client.send("Runtime.evaluate", {
-        expression: `window.__pi.slopTerminal.term.focus()`,
-      });
-      await submit(client, "pwd");
-      await submit(client, "ls");
-      await submit(client, `/bin/python -c "print(6 * 7)" > python-output.txt`);
-      await waitForPyodideFile(client, "/home/web/python-output.txt");
-      const { result: pythonResult } = await client.send("Runtime.evaluate", {
-        expression: `new TextDecoder().decode(
-          window.__pi.py.FS.readFile("/home/web/python-output.txt")
-        )`,
-        returnByValue: true,
-      });
-      if (pythonResult.value !== "42\n") {
-        throw new Error(`Unexpected /bin/python output: ${JSON.stringify(pythonResult.value)}`);
-      }
-      await sleep(800);
-      await screenshot(client, "slop-shell.png", 500);
-
-      await shortcut(client, "s", "KeyS");
-      await sleep(500);
-      await shortcut(client, "e", "KeyE");
-      await sleep(8_000);
-      await screenshot(client, "neovim.png");
+    await press(client, "Escape", "Escape");
+    await shortcut(client, "s", "KeyS");
+    await waitForSlop(client);
+    await client.send("Runtime.evaluate", {
+      expression: `window.__pi.slopTerminal.term.focus()`,
+    });
+    await submit(client, "pwd");
+    await submit(client, "ls");
+    await submit(client, `/bin/python -c "print(6 * 7)" > python-output.txt`);
+    await waitForPyodideFile(client, "/home/web/python-output.txt");
+    const { result: pythonResult } = await client.send("Runtime.evaluate", {
+      expression: `new TextDecoder().decode(
+        window.__pi.py.FS.readFile("/home/web/python-output.txt")
+      )`,
+      returnByValue: true,
+    });
+    if (pythonResult.value !== "42\n") {
+      throw new Error(`Unexpected /bin/python output: ${JSON.stringify(pythonResult.value)}`);
     }
+    await sleep(800);
+    await screenshot(client, "slop-shell.png", 500);
+
+    await shortcut(client, "s", "KeyS");
+    await sleep(500);
+    await shortcut(client, "e", "KeyE");
+    await sleep(8_000);
+    await screenshot(client, "neovim.png");
 
     await client.send("Emulation.setTouchEmulationEnabled", {
       enabled: true,
@@ -293,9 +290,6 @@ async function main() {
       deviceScaleFactor: 1,
       mobile: true,
     });
-    // Do not let the readiness poll observe the old execution context while
-    // Page.reload is still navigating.
-    await client.send("Runtime.evaluate", { expression: `delete window.__pi` });
     await client.send("Page.reload", { ignoreCache: true });
     await waitForPython(client);
     const { result: mobileEnvironment } = await client.send("Runtime.evaluate", {
@@ -418,18 +412,14 @@ async function main() {
             window.__piodideGlmResponses.push({
               url,
               status: response.status,
-              body: await response.clone().text(),
-              requestBody: typeof args[1]?.body === "string" ? args[1].body : ""
+              body: await response.clone().text()
             });
           }
           return response;
         };
       })()`,
     });
-    const cleanLoginTestKey = glmApiKey || "docs.mobile-paste-test";
-    // Mobile rich-text clipboards can surround an otherwise valid token with
-    // invisible bidirectional format marks. Exercise that exact cleanup path.
-    const loginTestKey = `\u202A${cleanLoginTestKey}\u2069`;
+    const loginTestKey = glmApiKey || "docs-mobile-paste-test";
     const { result: pasteHandle } = await client.send("Runtime.evaluate", {
       expression: `[...document.querySelectorAll("button")]
         .find((button) => button.textContent === "Paste")`,
@@ -451,10 +441,7 @@ async function main() {
       objectId: pasteHandle.objectId,
       functionDeclaration: `function(expected) {
         const input = document.querySelector(".mobile-command-input");
-        const message = document.querySelector(".mobile-command-form-message")?.textContent ?? "";
-        const pasted = input?.value === expected
-          && message.includes("Pasted " + expected.length + " characters")
-          && message.includes("ending " + expected.slice(-4));
+        const pasted = input?.value === expected;
         if (pasted) input.form.requestSubmit();
         return pasted;
       }`,
@@ -478,49 +465,6 @@ async function main() {
     if (keyCheckResult.value !== false) {
       throw new Error("Coding Plan login made an incompatible /models request");
     }
-
-    const loginDeadline = Date.now() + 15_000;
-    let loginResponse = null;
-    while (Date.now() < loginDeadline) {
-      const { result } = await client.send("Runtime.evaluate", {
-        expression: `window.__piodideGlmResponses
-          .find((response) => response.url.endsWith("/chat/completions")) ?? null`,
-        returnByValue: true,
-      });
-      if (result.value) {
-        loginResponse = result.value;
-        break;
-      }
-      await sleep(200);
-    }
-    const loginVerified =
-      (loginResponse?.status === 200 && loginResponse.body.includes('"model":"glm-5.2"')) ||
-      (loginResponse?.status === 429 &&
-        loginResponse.body.includes('"code":"1310"') &&
-        loginResponse.body.includes("Weekly/Monthly Limit Exhausted"));
-    if (!loginVerified) {
-      throw new Error(`Unexpected GLM login verification: ${JSON.stringify(loginResponse)}`);
-    }
-    const loginBody = JSON.parse(loginResponse.requestBody);
-    if (
-      loginBody.model !== "glm-5.2" ||
-      loginBody.max_tokens !== 1 ||
-      loginBody.stream !== false
-    ) {
-      throw new Error(`Unexpected GLM login request: ${loginResponse.requestBody}`);
-    }
-    const promptDeadline = Date.now() + 5_000;
-    while (Date.now() < promptDeadline) {
-      const { result } = await client.send("Runtime.evaluate", {
-        expression: `!window.__pi.prompt.isOccupied()`,
-        returnByValue: true,
-      });
-      if (result.value) break;
-      await sleep(100);
-    }
-    await client.send("Runtime.evaluate", {
-      expression: `window.__piodideGlmResponses = []`,
-    });
 
     await focusTerminal(client);
     await submit(client, "Reply with OK.");
