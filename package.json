@@ -14,6 +14,8 @@
     "docs:screenshots": "node scripts/capture-doc-screenshots.mjs",
     "build:slop": "node --experimental-strip-types scripts/build-slop.ts",
     "check:slop": "node --experimental-strip-types scripts/build-slop.ts --check",
+    "build:raylib": "node --experimental-strip-types scripts/build-raylib.ts",
+    "check:raylib": "node --experimental-strip-types scripts/build-raylib.ts --check",
     "test": "node --experimental-strip-types --test \"test/*.test.ts\"",
     "test:fetch-toolchain": "node scripts/fetch-toolchain-assets.mjs"
   },

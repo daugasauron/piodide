@@ -18,6 +18,7 @@ flowchart LR
   Python <--> FS
   Neovim <--> FS
   Slop --> WASI["WASI host"] <--> FS
+  Raylib["raylib framebuffer"] --> WASI
 ```
 
 Everything reads and writes the same in-memory workspace. Refreshing the page
@@ -48,6 +49,7 @@ Open <http://localhost:5173/piodide/>, run `/provider`, then `/model`.
 | [Agent tools](docs/agent-tools.md) | Python, files, Git, previews, C toolchain |
 | [Slop build shell](docs/slop.md) | Scripts, Make, utilities, pipes, and compilation |
 | [WASI runtime](docs/wasi.md) | Host design, execution modes, Python bridge |
+| [Raylib framebuffer](docs/raylib.md) | C games, canvas output, browser input |
 | [Development](docs/development.md) | Scripts, tests, Pages, screenshots |
 | [Codex proxy](docs/codex-proxy.md) | Optional loopback subscription bridge |
 

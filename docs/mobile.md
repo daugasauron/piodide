@@ -12,7 +12,7 @@ Tap the floating `/` button or swipe left from the right edge.
 2. Choose `/model`.
 3. Choose `/login`, paste the API key, and tap **Connect**.
 4. Choose `/thinking` to set the model's supported effort level.
-5. Try `/demo` to generate a touch-first C/WebAssembly game.
+5. Try `/demo` to generate a touch-first raylib/Wasm performance showcase.
 
 The drawer is limited to these five commands. Terminal swipes scroll history
 with frame-batched, fractional movement;

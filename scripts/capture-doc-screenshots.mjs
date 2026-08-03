@@ -23,6 +23,22 @@ const glmApiKey = process.env.DOCS_GLM_API_KEY?.trim() || "";
 const writeScreenshots = process.env.DOCS_SCREENSHOT_WRITE !== "0";
 const screenshotOnly = process.env.DOCS_SCREENSHOT_ONLY?.trim() || "";
 const viewport = { width: 1440, height: 900 };
+const raylibE2eSource = `
+#include "raylib.h"
+void game_init(void) { SetTargetFPS(60); }
+void game_frame(float delta_seconds) {
+  (void)delta_seconds;
+  BeginDrawing();
+  ClearBackground(GetTouchPointCount() > 0 ? GREEN :
+    (IsMouseButtonDown(MOUSE_BUTTON_LEFT) ? RED : (Color){ 12, 34, 56, 255 }));
+  for (int i = 0; i < 9; i++) DrawCircle(10 + i*19, 78 - (i%3)*7, 2, (Color){ 122, 162, 247, 220 });
+  DrawCircleGradient((Vector2){ 80, 48 }, 25, (Color){ 187, 154, 247, 255 }, (Color){ 36, 40, 59, 255 });
+  DrawRing((Vector2){ 80, 48 }, 29, 31, 0, 360, 48, (Color){ 125, 207, 255, 255 });
+  DrawText("RAYLIB", 49, 40, 14, RAYWHITE);
+  DrawText("C  >  WASI  >  CANVAS", 10, 8, 10, (Color){ 192, 202, 245, 255 });
+  EndDrawing();
+}
+`;
 
 const sleep = (milliseconds) =>
   new Promise((resolveSleep) => setTimeout(resolveSleep, milliseconds));
@@ -348,6 +364,111 @@ async function exerciseSlopChannels(client) {
   }
 }
 
+async function exerciseRaylibPreview(client, expectedWidth, expectedHeight) {
+  const evaluation = await client.send("Runtime.evaluate", {
+    expression: `(async () => {
+      const compile = window.__pi.agent.state.tools.find(({ name }) => name === "compile_raylib");
+      const previewTool = window.__pi.agent.state.tools.find(({ name }) => name === "raylib");
+      if (!compile || !previewTool) throw new Error("raylib tools are missing");
+      window.__pi.py.FS.writeFile("/home/web/e2e-raylib.c", ${JSON.stringify(raylibE2eSource)});
+      const built = await compile.execute("e2e-raylib-compile", {
+        path: "/home/web/e2e-raylib.c",
+        output: "/home/web/e2e-raylib.wasm"
+      });
+      const ready = await previewTool.execute("e2e-raylib-preview", {
+        path: "/home/web/e2e-raylib.wasm",
+        width: 160,
+        height: 90,
+        title: "raylib e2e"
+      });
+      await window.__pi.openRaylib(ready.details.path, ready.details.width, ready.details.height, ready.details.title);
+      await new Promise((resolve) => requestAnimationFrame(() => requestAnimationFrame(resolve)));
+      const preview = document.querySelector("#raylib-preview");
+      const canvas = document.querySelector("#raylib-preview-canvas");
+      const rect = preview.getBoundingClientRect();
+      const canvasRect = canvas.getBoundingClientRect();
+      return {
+        bytes: built.details?.bytes ?? 0,
+        hidden: preview.hidden,
+        x: rect.x,
+        y: rect.y,
+        width: rect.width,
+        height: rect.height,
+        canvasWidth: canvas.width,
+        canvasHeight: canvas.height,
+        canvasRect: { x: canvasRect.x, y: canvasRect.y, width: canvasRect.width, height: canvasRect.height },
+        pixel: [...canvas.getContext("2d").getImageData(0, 0, 1, 1).data],
+        bodyClass: document.body.classList.contains("raylib-preview-open"),
+        status: document.querySelector("#raylib-preview-status").textContent
+      };
+    })()`,
+    awaitPromise: true,
+    returnByValue: true,
+  });
+  if (evaluation.exceptionDetails) {
+    throw new Error(
+      `Raylib preview check threw: ${evaluation.exceptionDetails.exception?.description ?? evaluation.exceptionDetails.text}`,
+    );
+  }
+  const state = evaluation.result.value;
+  if (
+    state.bytes <= 0 ||
+    state.hidden ||
+    state.x !== 0 ||
+    state.y !== 0 ||
+    Math.abs(state.width - expectedWidth) > 1 ||
+    Math.abs(state.height - expectedHeight) > 1 ||
+    state.canvasWidth !== 160 ||
+    state.canvasHeight !== 90 ||
+    state.pixel.join(",") !== "12,34,56,255" ||
+    !state.bodyClass ||
+    !state.status.includes("CPU framebuffer")
+  ) {
+    throw new Error(`Unexpected raylib preview: ${JSON.stringify(state)}`);
+  }
+  await screenshot(client, "raylib.png", expectedHeight, expectedWidth);
+
+  const point = {
+    x: state.canvasRect.x + state.canvasRect.width / 2,
+    y: state.canvasRect.y + state.canvasRect.height / 2,
+    button: "left",
+    clickCount: 1,
+  };
+  await client.send("Input.dispatchTouchEvent", {
+    type: "touchStart",
+    touchPoints: [{ x: point.x, y: point.y, id: 7 }],
+  });
+  await sleep(100);
+  const { result: touched } = await client.send("Runtime.evaluate", {
+    expression: `[...document.querySelector("#raylib-preview-canvas").getContext("2d").getImageData(0, 0, 1, 1).data].join(",")`,
+    returnByValue: true,
+  });
+  await client.send("Input.dispatchTouchEvent", { type: "touchEnd", touchPoints: [] });
+  if (touched.value !== "0,228,48,255") {
+    throw new Error(`Raylib touch input did not reach the game: ${touched.value}`);
+  }
+  await sleep(100);
+  await client.send("Input.dispatchMouseEvent", { type: "mousePressed", buttons: 1, ...point });
+  await sleep(100);
+  const { result: pressed } = await client.send("Runtime.evaluate", {
+    expression: `[...document.querySelector("#raylib-preview-canvas").getContext("2d").getImageData(0, 0, 1, 1).data].join(",")`,
+    returnByValue: true,
+  });
+  await client.send("Input.dispatchMouseEvent", { type: "mouseReleased", buttons: 0, ...point });
+  if (pressed.value !== "230,41,55,255") {
+    throw new Error(`Raylib mouse input did not reach the game: ${pressed.value}`);
+  }
+  await client.send("Runtime.evaluate", {
+    expression: `document.querySelector("#raylib-preview-close").click()`,
+  });
+  const { result: closed } = await client.send("Runtime.evaluate", {
+    expression: `document.querySelector("#raylib-preview").hidden
+      && !document.body.classList.contains("raylib-preview-open")`,
+    returnByValue: true,
+  });
+  if (!closed.value) throw new Error("Raylib preview did not return to the agent");
+}
+
 async function shortcut(client, key, code) {
   // DevTools modifier bits: Ctrl=2, Shift=8.
   await press(client, key, code, 10);
@@ -415,6 +536,7 @@ async function main() {
     await waitForPython(client);
     await exerciseHtmlDebug(client);
     await exerciseSlopChannels(client);
+    await exerciseRaylibPreview(client, viewport.width, viewport.height);
     await exerciseHtmlPreview(client, viewport.width, viewport.height, false);
     await focusTerminal(client);
 

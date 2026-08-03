@@ -13,6 +13,8 @@
  *   compile_c -> compile one C source file to a wasm32-wasi object
  *   link_wasi -> link object files into a WASI executable
  *   run_wasi -> run a WASI executable against the live Pyodide MEMFS
+ *   compile_raylib -> build one C source into a callable raylib module
+ *   raylib -> validate and open the module's software framebuffer
  *   slop    -> run one shell command line (pipes, redirects, expansion)
  *
  * `read`/`write`/`edit` deliberately use the *same* MEMFS that `python` sees,
@@ -40,6 +42,13 @@ import { downloadPyodideFile } from "./file-transfer.ts";
 import { runToolchainInBrowser } from "./c-compiler.ts";
 import { runWasiProgram } from "./wasi/browser-runner.ts";
 import { runSlopCommand } from "./slop.ts";
+import {
+  ensureRaylibInstalled,
+  raylibIncludePath,
+  RAYLIB_OBJECT_PATHS,
+  RAYLIB_WASM_EXPORTS,
+  validateRaylibModule,
+} from "./raylib.ts";
 
 const MAX_READ_LINES = 2000;
 const MAX_READ_BYTES = 50_000;
@@ -209,6 +218,26 @@ const RunWasiParams = Type.Object({
   ),
 });
 
+const CompileRaylibParams = Type.Object({
+  path: Type.String({ description: "C source defining game_init() and game_frame(float)." }),
+  output: Type.Optional(
+    Type.String({ description: "Destination .wasm file (defaults beside the source)." }),
+  ),
+  optimization: Type.Optional(
+    Type.Union(
+      [Type.Literal("0"), Type.Literal("1"), Type.Literal("2"), Type.Literal("3"), Type.Literal("s")],
+      { description: "Optimization level; defaults to size optimization (-Os)." },
+    ),
+  ),
+});
+
+const RaylibParams = Type.Object({
+  path: Type.String({ description: "Raylib .wasm game produced by compile_raylib." }),
+  width: Type.Integer({ minimum: 64, maximum: 1280, description: "Internal framebuffer width." }),
+  height: Type.Integer({ minimum: 64, maximum: 720, description: "Internal framebuffer height." }),
+  title: Type.Optional(Type.String({ maxLength: 120, description: "Preview title." })),
+});
+
 const SlopParams = Type.Object({
   command: Type.String({
     description:
@@ -274,6 +303,19 @@ export interface RunWasiDetails {
   exitCode: number;
   outputBytes: number;
   truncated: boolean;
+}
+export interface CompileRaylibDetails {
+  path: string;
+  output: string;
+  bytes: number;
+  durationMs: number;
+}
+export interface RaylibDetails {
+  path: string;
+  bytes: number;
+  width: number;
+  height: number;
+  title: string;
 }
 export interface SlopDetails {
   command: string;
@@ -545,6 +587,123 @@ export function createRunWasiTool(
           outputBytes: byteLength(output),
           truncated: outputTruncated,
         },
+      };
+    },
+  };
+}
+
+/* ------------------------------ raylib --------------------------------- */
+
+export function createCompileRaylibTool(
+  py: Pyodide,
+): AgentTool<typeof CompileRaylibParams, CompileRaylibDetails> {
+  return {
+    name: "compile_raylib",
+    label: "Compile raylib",
+    description:
+      "Compile and link one C source file into an interactive raylib 6 WASI framebuffer game. " +
+      "Include raylib.h and define exactly `void game_init(void)` plus " +
+      "`void game_frame(float delta_seconds)`. The browser supplies the frame loop and maps " +
+      "raylib keyboard, mouse, and touch input. The raylib preview automatically supplies the " +
+      "module's WASI imports; do not build an HTML or JavaScript host. SetTargetFPS is unnecessary. " +
+      "Audio and rmodels are not included. " +
+      "Use the raylib tool afterward to validate and display the game.",
+    parameters: CompileRaylibParams,
+    executionMode: "sequential",
+    async execute(_id, params, signal) {
+      const path = fsResolve(py, params.path);
+      requireWorkspaceFile(py, path, "Raylib source");
+      if (!path.toLowerCase().endsWith(".c")) throw new Error("Raylib source must end in .c.");
+      const sourceBytes = py.FS.stat(path).size;
+      if (sourceBytes > MAX_C_SOURCE_BYTES) {
+        throw new Error(`C source exceeds the ${MAX_C_SOURCE_BYTES / 1024} KiB limit.`);
+      }
+      const output = fsResolve(
+        py,
+        params.output ?? `${path.slice(0, -2)}.wasm`,
+      );
+      if (!isWasmWorkspacePath(output) || !output.toLowerCase().endsWith(".wasm")) {
+        throw new Error("Raylib output must be a .wasm file inside /home/web.");
+      }
+      if (output === path) throw new Error("Raylib output cannot overwrite its source.");
+
+      await ensureRaylibInstalled(py);
+      const object = `${output}.raylib.o`;
+      const startedAt = performance.now();
+      try {
+        const compiled = await runToolchainInBrowser(
+          py,
+          {
+            operation: "compile",
+            sourcePath: path,
+            outputPath: object,
+            options: {
+              standard: "c17",
+              optimization: params.optimization ?? "s",
+              warnings: true,
+              includePaths: [raylibIncludePath()],
+              functionSections: true,
+            },
+          },
+          signal,
+        );
+        const linked = await runToolchainInBrowser(
+          py,
+          {
+            operation: "link",
+            objectPaths: [object, ...RAYLIB_OBJECT_PATHS],
+            outputPath: output,
+            options: {
+              exports: [...RAYLIB_WASM_EXPORTS],
+              strip: true,
+              reactor: true,
+              systemLibraries: ["m"],
+            },
+          },
+          signal,
+        );
+        if (!fsExists(py, output)) throw new Error("Raylib linker produced no output file.");
+        const bytes = py.FS.stat(output).size;
+        const diagnostics = [compiled.diagnostics, linked.diagnostics].filter(Boolean).join("\n");
+        const summary = `Compiled raylib game ${path} -> ${output} (${bytes} bytes).`;
+        return {
+          content: [text(diagnostics ? `${summary}\n${diagnostics}` : `${summary}\n`)],
+          details: {
+            path,
+            output,
+            bytes,
+            durationMs: Math.round(performance.now() - startedAt),
+          },
+        };
+      } finally {
+        if (fsExists(py, object)) py.FS.unlink(object);
+      }
+    },
+  };
+}
+
+export function createRaylibTool(
+  py: Pyodide,
+): AgentTool<typeof RaylibParams, RaylibDetails> {
+  return {
+    name: "raylib",
+    label: "Raylib preview",
+    description:
+      "Validate and open a compile_raylib-produced game in the full-screen framebuffer preview. " +
+      "The canvas scales to the device while retaining the requested internal resolution. " +
+      "Call this exactly once, after compilation succeeds.",
+    parameters: RaylibParams,
+    executionMode: "sequential",
+    async execute(_id, params) {
+      const path = fsResolve(py, params.path);
+      requireWorkspaceFile(py, path, "Raylib game");
+      if (!path.toLowerCase().endsWith(".wasm")) throw new Error("Raylib game must end in .wasm.");
+      await validateRaylibModule(py, path, params.width, params.height);
+      const bytes = py.FS.stat(path).size;
+      const title = params.title?.trim() || path;
+      return {
+        content: [text(`Raylib framebuffer ready: ${path} (${params.width}×${params.height}, ${bytes} bytes)\n`)],
+        details: { path, bytes, width: params.width, height: params.height, title },
       };
     },
   };
@@ -1195,6 +1354,8 @@ export function createAllTools(
     createCompileCTool(py),
     createLinkWasiTool(py),
     createRunWasiTool(py),
+    createCompileRaylibTool(py),
+    createRaylibTool(py),
     createSlopTool(py),
     createReadTool(py),
     createWriteTool(py),

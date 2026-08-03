@@ -30,7 +30,7 @@ export const MOBILE_COMMANDS: readonly MobileCommandDefinition[] = [
   {
     command: "/demo",
     label: "Demo",
-    description: "Build a C/Wasm game for this device",
+    description: "Launch a raylib/Wasm showcase",
   },
 ];
 

@@ -1,0 +1,34 @@
+{
+  "version": "6.0",
+  "archiveSha256": "2b3ee1e2120c7a0796b33062c7e9a694dd8a8caa56a96319ac8c8ecf54a90d0b",
+  "files": {
+    "raylib.h": {
+      "bytes": 134582,
+      "sha256": "047e7255f93f8c34039cab906ad76136706b5c7b4c5b5b065d84141963ee9b6b"
+    },
+    "LICENSE": {
+      "bytes": 873,
+      "sha256": "7cad8d8c418d6e5f6064a8c2dd8afecf91b8e39faa6c32fd99fe42f024538a4c"
+    },
+    "rcore.o": {
+      "bytes": 272231,
+      "sha256": "37870fed42bc30c7d8f6f347dbdc90a1c75854319dd3d2a45686b32bade1f199"
+    },
+    "rshapes.o": {
+      "bytes": 29235,
+      "sha256": "e70b676232b451f066ed81ed362ca4e015b48956f50d0d2638f46250e3d7151c"
+    },
+    "rtextures.o": {
+      "bytes": 294901,
+      "sha256": "847db9cbb05d7af4d6f54f8bf26a65357bf02a7ed09a61d2e12b59ead5b9a02b"
+    },
+    "rtext.o": {
+      "bytes": 94079,
+      "sha256": "094fc9c39d5da2a957c92e6d468fe6961c6ee86745aeeef3ab143340f4a5a031"
+    },
+    "piodide-raylib.o": {
+      "bytes": 873,
+      "sha256": "b0c39425032a7d2d250d270b1601f355c063e458f306c7448aaa658897ab7e8e"
+    }
+  }
+}

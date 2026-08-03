@@ -34,6 +34,8 @@ jobs:
         run: npm run test:fetch-toolchain
       - name: Verify generated Slop binaries
         run: npm run check:slop
+      - name: Verify generated raylib assets
+        run: npm run check:raylib
       - name: Test
         run: npm test
       - name: Build

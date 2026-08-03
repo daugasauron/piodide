@@ -55,11 +55,16 @@ export interface CompileOptions {
   warningsAsErrors?: boolean;
   defines?: string[];
   includePaths?: string[];
+  /** Internal asset builds use per-function sections so wasm-ld can discard unused code. */
+  functionSections?: boolean;
 }
 
 export interface LinkOptions {
   exports?: string[];
   strip?: boolean;
+  /** Link a callable module without WASI's command-style _start entrypoint. */
+  reactor?: boolean;
+  systemLibraries?: ("m")[];
 }
 
 export type ToolchainOperation =
@@ -209,6 +214,7 @@ function compileCommand(
     ...(options.warningsAsErrors ? ["-Werror"] : []),
     ...(options.defines ?? []).map((define) => `-D${define}`),
     ...(options.includePaths ?? []).flatMap((path) => ["-I", path]),
+    ...(options.functionSections ? ["-ffunction-sections", "-fdata-sections"] : []),
     "-emit-obj",
     "-o",
     outputPath,
@@ -225,12 +231,14 @@ function linkCommand(
     "wasm-ld",
     "--no-threads",
     "--export-dynamic",
+    ...(options.reactor ? ["--no-entry"] : []),
     "-z",
     "stack-size=1048576",
     `-L${SYSROOT_PREFIX}/lib/wasm32-wasi`,
-    `${SYSROOT_PREFIX}/lib/wasm32-wasi/crt1.o`,
+    ...(options.reactor ? [] : [`${SYSROOT_PREFIX}/lib/wasm32-wasi/crt1.o`]),
     ...objectPaths,
     "-lc",
+    ...(options.systemLibraries ?? []).map((library) => `-l${library}`),
     `${SYSROOT_PREFIX}/lib/clang/${CLANG_VERSION}/lib/wasi/libclang_rt.builtins-wasm32.a`,
     ...(options.exports ?? []).map((symbol) => `--export=${symbol}`),
     ...(options.strip ? ["--strip-all"] : []),

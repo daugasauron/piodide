@@ -10,6 +10,7 @@ All tools operate inside the browser and share `/home/web`.
 | `read`, `write`, `edit` | Bounded text-file operations |
 | `slop` | One shell command or pipeline; separate stdout/stderr |
 | `compile_c`, `link_wasi`, `run_wasi` | Build and run wasm32-wasi programs |
+| `compile_raylib`, `raylib` | Build and open C games in a canvas framebuffer |
 | `git` | Local Dulwich repository and GitHub snapshots |
 | `fetch` | Browser fetch, subject to CORS |
 | `download` | Export a file after the user asks |
@@ -40,4 +41,5 @@ Use `/upload` to import host files; it must be initiated by the user.
 - The wasm32 heap has a hard ceiling near 4 GiB.
 - Prefer bounded reads, output, and allocations.
 
-See [WASI](wasi.md) for compiled programs and [Slop](slop.md) for shell syntax.
+See [WASI](wasi.md) for compiled programs, [raylib](raylib.md) for games, and
+[Slop](slop.md) for shell syntax.

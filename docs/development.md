@@ -12,6 +12,8 @@
 | `npm run test:fetch-toolchain` | Fetch and verify WASI test assets |
 | `npm run build:slop` | Rebuild mirrored Slop sources and WASM binaries |
 | `npm run check:slop` | Verify committed Slop binaries match their C sources |
+| `npm run build:raylib` | Rebuild pinned raylib 6 framebuffer objects |
+| `npm run check:raylib` | Verify committed raylib objects and hashes |
 | `npm run chrome:webgpu` | Launch Linux Chrome with NVIDIA WebGPU flags |
 | `npm run codex-proxy` | Start the optional loopback Codex bridge |
 | `npm run docs:screenshots` | Capture current UI screenshots with Chrome |
@@ -25,8 +27,8 @@ npm run build
 ```
 
 The test suite covers local providers, proxy boundaries, the service worker,
-Slop, WASI syscalls, the SAB bridge, Pyodide sharing, and a full
-compile-link-run cycle.
+Slop, WASI syscalls, the SAB bridge, Pyodide sharing, raylib framebuffer
+rendering, and full compile-link-run cycles.
 
 ## Cross-origin isolation
 

@@ -238,7 +238,8 @@ body {
   place-items: center;
 }
 
-.html-preview-open #mobile-command-trigger {
+.html-preview-open #mobile-command-trigger,
+.raylib-preview-open #mobile-command-trigger {
   display: none;
 }
 
@@ -474,7 +475,8 @@ body {
   }
 }
 
-#html-preview {
+#html-preview,
+#raylib-preview {
   position: fixed;
   z-index: 100;
   inset: 0;
@@ -484,7 +486,8 @@ body {
   background: #fff;
 }
 
-#html-preview[hidden] {
+#html-preview[hidden],
+#raylib-preview[hidden] {
   display: none;
 }
 
@@ -518,14 +521,16 @@ body {
   font: 13px/20px "IosevkaTerm Nerd Font", monospace;
 }
 
-#html-preview-title {
+#html-preview-title,
+#raylib-preview-title {
   min-width: 0;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
 
-#html-preview-close {
+#html-preview-close,
+#raylib-preview-close {
   padding: 2px 10px;
   border: 1px solid #565f89;
   border-radius: 4px;
@@ -536,7 +541,9 @@ body {
 }
 
 #html-preview-close:hover,
-#html-preview-close:focus-visible {
+#html-preview-close:focus-visible,
+#raylib-preview-close:hover,
+#raylib-preview-close:focus-visible {
   border-color: #7aa2f7;
   outline: none;
 }
@@ -547,4 +554,41 @@ body {
   flex: 1;
   border: 0;
   background: #fff;
+}
+
+#raylib-preview {
+  background: #090b10;
+}
+
+#raylib-preview-status {
+  min-width: 0;
+  margin-left: auto;
+  overflow: hidden;
+  color: #7aa2f7;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+#raylib-preview-stage {
+  display: grid;
+  min-height: 0;
+  flex: 1;
+  overflow: hidden;
+  place-items: center;
+  padding:
+    0
+    max(0px, env(safe-area-inset-right))
+    max(0px, env(safe-area-inset-bottom))
+    max(0px, env(safe-area-inset-left));
+  background: #090b10;
+}
+
+#raylib-preview-canvas {
+  display: block;
+  width: 100%;
+  height: 100%;
+  outline: none;
+  image-rendering: pixelated;
+  object-fit: contain;
+  touch-action: none;
 }

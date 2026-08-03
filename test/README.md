@@ -18,6 +18,9 @@ imported directly.
 - `wasi-toolchain.test.ts` — end-to-end: the real `clang.wasm` /
   `wasm-ld.wasm` compile and link a multi-file C project, then the result
   executes on the host. Skipped unless the assets exist.
+- `wasi-fs.test.ts` — routed mount identities stay distinct and stable.
+- `raylib.test.ts` — compiles, links, and renders through raylib's software
+  framebuffer. Skipped unless the toolchain and raylib assets exist.
 - `fixtures/*.wasm` — guests compiled from the sibling `.c` files with
   `zig cc -target wasm32-wasi -Oz -s` (committed, no toolchain needed).
 

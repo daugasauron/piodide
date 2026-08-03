@@ -68,6 +68,7 @@ import { installWasiPythonModule } from "./wasi/python-module.ts";
 import { SlopSession } from "./slop.ts";
 import { MobileCommandUi } from "./mobile-command-ui.ts";
 import { normalizeApiKey, verifyApiKey } from "./provider-auth.ts";
+import { RaylibCanvasSession } from "./raylib.ts";
 
 const NEOVIM_ENABLED = import.meta.env.VITE_ENABLE_NEOVIM !== "0";
 
@@ -82,6 +83,8 @@ Tools:
 - compile_c: compile one bounded C source file to a wasm32-wasi .o object. It supports C11/C17, -O0/-O1/-O2/-O3/-Os, DWARF debug info, warnings/-Werror, -D definitions, and additional /home/web include directories.
 - link_wasi: link one or more .o files into a WASI .wasm executable with wasm-ld and WASI libc. It can export selected symbols and optionally strip the result. The compiler, linker, and sysroot assets are lazily downloaded.
 - run_wasi: run a WASI .wasm file from /home/web with arguments, stdin, and environment variables. The program shares the live Pyodide filesystem (no copying): files it creates, edits, or deletes are immediately visible everywhere. Relative paths start at /home/web, and absolute /home/web paths also work. Use this tool directly to verify a linked executable; do not route ordinary WASI execution through Python.
+- compile_raylib: compile one C file into a raylib 6 game using the WASI software framebuffer. Include raylib.h and define game_init(void) and game_frame(float delta_seconds). The browser owns InitWindow and the frame loop, and the raylib tool supplies the WASI imports; never create an HTML/JavaScript host for it. 2D shapes, text, textures, keyboard, mouse, and touch are supported; audio and rmodels are not.
+- raylib: validate and open a compile_raylib-produced game in the full-screen canvas. Choose a bounded internal resolution and call it exactly once after compilation succeeds.
 - slop: run one command line in the Slop build shell. It supports buffered pipes, stdout/stderr redirects, &&/|| lists, variables, command and arithmetic expansion, globbing, functions, and line-oriented if/for/while/case blocks. /bin includes make, sh, sed, basic ar, bounded file utilities including uniq/xargs, ls/cat/grep/echo/env/fd-find, and host-routed cc/ld. Each tool call uses a fresh shell — filesystem changes persist, shell variables and cwd do not (pass cwd; default /home/web). Use slop for bounded shell-style jobs instead of Python file crunching.
 - read: read a text file with line numbers; offset (1-based) and limit paginate large files.
 - write: create or overwrite a file; parent directories are created automatically.
@@ -139,6 +142,7 @@ Tools:
 - slop runs one bounded command in the Slop build shell, with pipes, redirects, variables, substitution, globbing, Make, sed, file utilities, and host-routed cc/ld. Each tool call has a fresh cwd and shell state; pass cwd when needed. It is not Bash and cannot access host commands.
 - python runs focused, valid CPython 3 in the long-lived Pyodide runtime. Never use notebook ! commands, pip, os.system, or subprocess. Pure-Python packages can be installed with micropip when necessary.
 - compile_c compiles one C11/C17 source to a wasm32-wasi object. link_wasi links objects with WASI libc. run_wasi directly executes the resulting module and is the default way to verify it. Do not run WASI through Python unless the user specifically asks for Python/WASI integration. The first compile downloads about 52 MB; avoid speculative builds.
+- compile_raylib builds one C source containing game_init(void) and game_frame(float) against raylib 6's CPU framebuffer; raylib supplies the WASI imports, validates the module, and opens it with browser keyboard, mouse, and touch input. Never build an HTML/JavaScript host for it. Use BeginDrawing/EndDrawing inside game_frame. Do not call SetTargetFPS; the browser schedules frames. Audio and rmodels are unavailable. Call raylib exactly once at the end.
 - git manages the browser-local Dulwich repository. GitHub network operations require credentials registered separately by the user.
 - fetch is browser fetch and is CORS-limited. download exports a file only when the user asks. image displays an image exactly once. html_debug invisibly checks one self-contained HTML file for startup errors; use it before html. html opens that file only after the check passes. The sandboxed srcdoc has an opaque origin, so browser storage and relative MEMFS fetches do not work; inline every dependency and keep runtime state in JavaScript memory.
 
@@ -158,7 +162,7 @@ const BANNER = [
     ? "\x1b[2mViews:\x1b[0m     Ctrl+Shift+E toggles agent ↔ Neovim · Ctrl+Shift+S toggles slop shell"
     : "\x1b[2mView:\x1b[0m      Ctrl+Shift+S toggles the slop shell",
   "\x1b[2mStart with:\x1b[0m /provider  →  choose one  →  /login when required  →  type.",
-  "\x1b[2mTry:\x1b[0m        /demo  →  build a C → WebAssembly game for this device.",
+  "\x1b[2mTry:\x1b[0m        /demo  →  launch a raylib/Wasm performance showcase.",
   "",
 ].join("\r\n");
 
@@ -187,7 +191,7 @@ const COMMANDS: readonly CommandSuggestion[] = [
   { name: "/run", description: "run a WASI program from /home/web" },
   { name: "/image", description: "display an image file from /home/web" },
   { name: "/html", description: "open an HTML file from /home/web" },
-  { name: "/demo", description: "build a C/Wasm game for this device" },
+  { name: "/demo", description: "launch a raylib/Wasm performance showcase" },
   ...NEOVIM_COMMANDS,
   { name: "/hotkeys", description: "show keyboard shortcuts" },
   { name: "/settings", description: "show current browser settings" },
@@ -228,6 +232,11 @@ const htmlPreviewEl = document.getElementById("html-preview") as HTMLElement;
 const htmlPreviewTitleEl = document.getElementById("html-preview-title") as HTMLElement;
 const htmlPreviewFrameEl = document.getElementById("html-preview-frame") as HTMLIFrameElement;
 const htmlPreviewCloseEl = document.getElementById("html-preview-close") as HTMLButtonElement;
+const raylibPreviewEl = document.getElementById("raylib-preview") as HTMLElement;
+const raylibPreviewTitleEl = document.getElementById("raylib-preview-title") as HTMLElement;
+const raylibPreviewStatusEl = document.getElementById("raylib-preview-status") as HTMLElement;
+const raylibPreviewCanvasEl = document.getElementById("raylib-preview-canvas") as HTMLCanvasElement;
+const raylibPreviewCloseEl = document.getElementById("raylib-preview-close") as HTMLButtonElement;
 const footerLocationEl = document.getElementById("footer-location") as HTMLElement;
 const footerUsageEl = document.getElementById("footer-usage") as HTMLElement;
 const footerModelEl = document.getElementById("footer-model") as HTMLElement;
@@ -248,6 +257,8 @@ let pyReady = false;
 let activeView: "agent" | "nvim" | "slop" = "agent";
 let neovim: NeovimController | null = null;
 let slop: SlopSession | null = null;
+let raylibPreview: RaylibCanvasSession | null = null;
+let raylibLaunchCount = 0;
 let neovimStarting: Promise<NeovimController> | null = null;
 let viewToggleRunning = false;
 
@@ -302,11 +313,59 @@ function say(line: string) {
 
 function openHtmlPreview(path: string) {
   if (!py) throw new Error("Python filesystem is not ready.");
+  closeRaylibPreview();
   htmlPreviewTitleEl.textContent = path;
   htmlPreviewFrameEl.srcdoc = fsReadText(py, path);
   htmlPreviewEl.hidden = false;
   document.body.classList.add("html-preview-open");
   htmlPreviewCloseEl.focus();
+}
+
+async function openRaylibPreview(
+  path: string,
+  width: number,
+  height: number,
+  title: string,
+) {
+  if (!py) throw new Error("Python filesystem is not ready.");
+  closeHtmlPreview();
+  closeRaylibPreview();
+  raylibPreviewTitleEl.textContent = title;
+  raylibPreviewStatusEl.textContent = `${width}×${height} · starting…`;
+  raylibPreviewEl.hidden = false;
+  document.body.classList.add("raylib-preview-open");
+  const session = new RaylibCanvasSession({
+    py,
+    path,
+    width,
+    height,
+    canvas: raylibPreviewCanvasEl,
+    status: raylibPreviewStatusEl,
+    onError: (error) => {
+      closeRaylibPreview();
+      say(red(`  ↳ raylib preview failed: ${error instanceof Error ? error.message : String(error)}`));
+    },
+  });
+  raylibPreview = session;
+  try {
+    await session.start();
+    raylibLaunchCount++;
+    raylibPreviewStatusEl.textContent = `${width}×${height} · CPU framebuffer`;
+    raylibPreviewCanvasEl.focus();
+  } catch (error) {
+    closeRaylibPreview();
+    throw error;
+  }
+}
+
+function closeRaylibPreview() {
+  raylibPreview?.stop();
+  raylibPreview = null;
+  raylibPreviewEl.hidden = true;
+  raylibPreviewCanvasEl.width = 1;
+  raylibPreviewCanvasEl.height = 1;
+  document.body.classList.remove("raylib-preview-open");
+  if (handle) handle.term.focus();
 }
 
 function closeHtmlPreview() {
@@ -321,6 +380,7 @@ htmlPreviewCloseEl.addEventListener("click", closeHtmlPreview);
 htmlPreviewEl.addEventListener("click", (event) => {
   if (event.target === htmlPreviewEl) closeHtmlPreview();
 });
+raylibPreviewCloseEl.addEventListener("click", closeRaylibPreview);
 document.addEventListener("keydown", (event) => {
   if (event.key === "Escape" && !htmlPreviewEl.hidden) {
     event.preventDefault();
@@ -387,15 +447,29 @@ function clientEnvironmentDescription(): string {
 function demoRequest(): string {
   const phone = isPhoneClient();
   const controls = phone
-    ? "Use large touch controls, prevent unwanted page gestures, and fit portrait screens."
-    : "Use responsive keyboard and mouse controls and make good use of a landscape screen.";
-  return `Create and launch an original, polished mini-game that shows off this browser environment. You have creative freedom: choose a visually distinctive concept and make it genuinely fun for a short session.
+    ? "Make touch the primary control and keep every instruction readable in portrait."
+    : "Use keyboard and mouse interaction and make good use of the landscape screen.";
+  const framebuffer = phone ? "320×568 (width 320, height 568)" : "640×360 (width 640, height 360)";
+  const movingObjects = phone ? 500 : 1400;
+  return `Build and launch an original raylib performance showcase. This is an execution task: use the tools and finish with the running game, not a code listing or explanation. You have creative freedom over the concept, art direction, motion, and game rules.
 
 The current client is a ${phone ? "phone/touch device" : "desktop/laptop"} at ${window.innerWidth}×${window.innerHeight} CSS pixels. ${controls}
 
-Implement the game simulation, rules, and scoring in C under /home/web, include a trivial main for the WASI linker, compile it to WebAssembly with compile_c and link_wasi, and export the small pure functions the browser needs. Verify the linked module directly with run_wasi; do not execute it through Python. Then create one self-contained HTML file with polished inline CSS and JavaScript, run html_debug and fix every reported error, and open it with the html tool exactly once at the end.
+The result must visibly demonstrate browser Wasm performance: continuously simulate and draw at least ${movingObjects} independently moving particles, projectiles, boids, trail segments, or similarly meaningful objects every frame. Add layered procedural effects, interaction, and a small HUD showing the live object count and controls. It must be a playable, changing scene—not a static picture or mostly text. Use fixed-size bounded arrays and delta_seconds; avoid unbounded allocation.
 
-The preview is a sandboxed srcdoc with an opaque origin. It cannot fetch relative /home/web files and cannot use localStorage, sessionStorage, or IndexedDB. Embed the Wasm bytes directly in the HTML (for example as base64 or a byte array), keep state in memory, provide any required WASI imports, and do not invoke a WASI _start function from the page. Do the work with tools; do not merely describe what you would build.`;
+Use exactly this runtime contract:
+- Write one C17 source file to /home/web/raylib-demo.c. Include raylib.h and define void game_init(void) plus void game_frame(float delta_seconds).
+- Do not define main or call InitWindow, CloseWindow, SetTargetFPS, or create a frame loop. The browser owns those. Put BeginDrawing() and EndDrawing() inside game_frame.
+- Prefer dependable raylib 6 2D APIs such as DrawPixel, DrawRectangle, DrawLineV, DrawCircleV, DrawText, GetMousePosition, GetTouchPosition, and IsKeyDown. Audio and rmodels are unavailable.
+- The raylib preview already supplies every WASI import and instantiates the module. Do not create HTML, JavaScript, a WebAssembly.instantiate call, or a wasi_snapshot_preview1 import object. Do not use compile_c, link_wasi, run_wasi, Python, or slop for this demo.
+
+Required tool sequence:
+1. write /home/web/raylib-demo.c
+2. compile_raylib with path /home/web/raylib-demo.c, output /home/web/raylib-demo.wasm, and optimization "3"
+3. If compilation fails, read the diagnostics, edit the C source, and retry compile_raylib until it succeeds. Never launch a failed build.
+4. Call raylib exactly once with path /home/web/raylib-demo.wasm, framebuffer ${framebuffer}, and a short title.
+
+Do not stop before the raylib tool succeeds and opens the game.`;
 }
 
 function consumeLocalCodexProxyToken(): string {
@@ -1306,7 +1380,7 @@ async function runSlash(input: string) {
       say(dim("  /download <path>  /upload [directory]      host file transfer"));
       say(dim("  /run <prog.wasm> [args]                    run a WASI program (live filesystem)"));
       say(dim("  /image <path>  /html <path>                browser previews"));
-      say(dim("  /demo                                      build a device-aware C/Wasm game"));
+      say(dim("  /demo                                      raylib/Wasm performance showcase"));
       if (NEOVIM_ENABLED) {
         say(dim("  /nvim                                      open Neovim editor"));
       }
@@ -1315,7 +1389,31 @@ async function runSlash(input: string) {
 
     case "demo":
       say(cyan(`  ◇ demo target: ${isPhoneClient() ? "phone · touch" : "desktop · keyboard/mouse"}`));
-      await handleSubmit(demoRequest());
+      {
+        const messagesBefore = agent?.state.messages.length ?? 0;
+        const launchesBefore = raylibLaunchCount;
+        await handleSubmit(demoRequest());
+        const messages = agent?.state.messages ?? [];
+        let lastAssistant: AgentMessage | undefined;
+        for (let index = messages.length - 1; index >= 0; index--) {
+          if (messages[index].role === "assistant") {
+            lastAssistant = messages[index];
+            break;
+          }
+        }
+        const stopReason = (lastAssistant as { stopReason?: string } | undefined)?.stopReason;
+        if (
+          messages.length > messagesBefore &&
+          raylibLaunchCount === launchesBefore &&
+          stopReason !== "error" &&
+          stopReason !== "aborted"
+        ) {
+          say(yellow("  ◇ demo did not launch · requesting one repair pass"));
+          await handleSubmit(
+            "The raylib demo has not opened. Continue the existing task: inspect /home/web/raylib-demo.c and the previous compiler diagnostics, create or repair the source, run compile_raylib at optimization 3 until it succeeds, then call raylib exactly once. Do not switch to compile_c, link_wasi, run_wasi, HTML, JavaScript, Python, or slop, and do not stop with an explanation.",
+          );
+        }
+      }
       return;
 
     case "provider": {
@@ -2020,6 +2118,12 @@ async function renderEvent(event: AgentEvent) {
           case "run_wasi":
             footer = `  ↳ WASI exit ${d.exitCode ?? "?"} · ${d.outputBytes ?? 0} output bytes`;
             break;
+          case "compile_raylib":
+            footer = `  ↳ raylib compiled · ${d.bytes ?? 0} bytes · ${((d.durationMs ?? 0) / 1000).toFixed(1)}s${d.output ? ` · ${d.output}` : ""}`;
+            break;
+          case "raylib":
+            footer = `  ↳ raylib · ${d.width ?? "?"}×${d.height ?? "?"} · ${d.bytes ?? 0} bytes`;
+            break;
           case "slop":
             printSlopOutput(event.result, d.exitCode);
             footer = `  ↳ slop exit ${d.exitCode ?? "?"} · ${d.outputBytes ?? 0} output bytes`;
@@ -2055,6 +2159,20 @@ async function renderEvent(event: AgentEvent) {
           } catch (error) {
             writer.writeln(
               red(`  ↳ html preview failed: ${error instanceof Error ? error.message : String(error)}`),
+            );
+          }
+        }
+        if (
+          event.toolName === "raylib" &&
+          typeof d.path === "string" &&
+          typeof d.width === "number" &&
+          typeof d.height === "number"
+        ) {
+          try {
+            await openRaylibPreview(d.path, d.width, d.height, String(d.title ?? d.path));
+          } catch (error) {
+            writer.writeln(
+              red(`  ↳ raylib preview failed: ${error instanceof Error ? error.message : String(error)}`),
             );
           }
         }
@@ -2292,6 +2410,9 @@ async function main() {
           run: (text: string) => handleSubmit(text),
           toggleEditor: () => toggleNeovim(),
           toggleSlop: () => toggleSlop(),
+          openRaylib: (path: string, width: number, height: number, title = path) =>
+            openRaylibPreview(path, width, height, title),
+          closeRaylib: () => closeRaylibPreview(),
           get neovim() {
             return neovim;
           },
@@ -2300,6 +2421,9 @@ async function main() {
           },
           get slopTerminal() {
             return slopHandle;
+          },
+          get raylibPreview() {
+            return raylibPreview;
           },
           browserModelRuntime,
           webLLMRuntime,

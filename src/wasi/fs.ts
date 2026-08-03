@@ -95,23 +95,29 @@ export interface WasiFsMount {
 }
 
 export class RoutedFs implements WasiFs {
-  private mounts: WasiFsMount[];
+  private mounts: (WasiFsMount & { device: bigint })[];
   private root: WasiFs;
 
   constructor(root: WasiFs, mounts: WasiFsMount[]) {
     this.root = root;
     // Longest prefix first so nested mounts resolve correctly.
-    this.mounts = [...mounts].sort((a, b) => b.prefix.length - a.prefix.length);
+    this.mounts = mounts
+      .map((mount, index) => ({ ...mount, device: BigInt(index + 1) }))
+      .sort((a, b) => b.prefix.length - a.prefix.length);
   }
 
-  private route(path: string): { fs: WasiFs; path: string } {
+  private route(path: string): { fs: WasiFs; path: string; device: bigint } {
     for (const mount of this.mounts) {
-      if (path === mount.prefix) return { fs: mount.fs, path: "/" };
+      if (path === mount.prefix) return { fs: mount.fs, path: "/", device: mount.device };
       if (path.startsWith(`${mount.prefix}/`)) {
-        return { fs: mount.fs, path: path.slice(mount.prefix.length) };
+        return { fs: mount.fs, path: path.slice(mount.prefix.length), device: mount.device };
       }
     }
-    return { fs: this.root, path };
+    return { fs: this.root, path, device: 0n };
+  }
+
+  private namespacedIno(device: bigint, ino: bigint): bigint {
+    return (device << 48n) | (ino & 0xffffffffffffn);
   }
 
   open(path: string, options: WasiOpenOptions, mode: number): WasiHandle {
@@ -140,11 +146,19 @@ export class RoutedFs implements WasiFs {
   }
   stat(path: string, followSymlinks: boolean): WasiStat {
     const routed = this.route(path);
-    return routed.fs.stat(routed.path, followSymlinks);
+    const stat = routed.fs.stat(routed.path, followSymlinks);
+    return {
+      ...stat,
+      dev: routed.device,
+      ino: this.namespacedIno(routed.device, stat.ino),
+    };
   }
   readdir(path: string): WasiDirEntry[] {
     const routed = this.route(path);
-    return routed.fs.readdir(routed.path);
+    return routed.fs.readdir(routed.path).map((entry) => ({
+      ...entry,
+      ino: this.namespacedIno(routed.device, entry.ino),
+    }));
   }
   mkdir(path: string, mode: number): void {
     const routed = this.route(path);

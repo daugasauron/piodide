@@ -41,6 +41,20 @@
         ></iframe>
       </section>
     </div>
+    <div id="raylib-preview" hidden>
+      <section class="html-preview-window" role="dialog" aria-modal="true" aria-labelledby="raylib-preview-title">
+        <header class="html-preview-header">
+          <button id="raylib-preview-close" type="button" aria-label="Back to agent">
+            ← Back to agent
+          </button>
+          <span id="raylib-preview-title">raylib framebuffer</span>
+          <span id="raylib-preview-status">loading…</span>
+        </header>
+        <div id="raylib-preview-stage">
+          <canvas id="raylib-preview-canvas" aria-label="Interactive raylib game"></canvas>
+        </div>
+      </section>
+    </div>
     <footer id="footer" aria-label="Session status">
       <div class="footer-row">
         <span id="footer-location">/home/web</span>

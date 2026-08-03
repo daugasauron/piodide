@@ -382,6 +382,25 @@ export class WasiHost {
   }
 
   /**
+   * Bind a callable module's memory without invoking its entrypoint. The
+   * owner must call close() when the module is no longer in use.
+   */
+  bind(instance: WebAssembly.Instance): void {
+    const memory = instance.exports.memory;
+    if (!(memory instanceof WebAssembly.Memory)) {
+      throw new Error("WASI guest does not export memory");
+    }
+    this.memory = memory;
+  }
+
+  /** Release files held by a bound long-lived module. */
+  close(): void {
+    for (const entry of this.fds.values()) this.closeEntry(entry);
+    this.fds.clear();
+    this.memory = null;
+  }
+
+  /**
    * Bind the guest memory, call `_start`, and resolve with the exit code.
    * Re-throws guest traps as errors.
    */
@@ -391,8 +410,7 @@ export class WasiHost {
       _start?: () => void;
       _initialize?: () => void;
     };
-    if (!exports.memory) throw new Error("WASI guest does not export memory");
-    this.memory = exports.memory;
+    this.bind(instance);
     try {
       if (exports._start) {
         exports._start();
@@ -408,8 +426,7 @@ export class WasiHost {
       if (error instanceof WasiExit) return error.code;
       throw error;
     } finally {
-      for (const entry of this.fds.values()) this.closeEntry(entry);
-      this.fds.clear();
+      this.close();
     }
   }
 
