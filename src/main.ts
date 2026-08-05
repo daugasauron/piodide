@@ -2281,11 +2281,12 @@ async function ensureCrossOriginIsolation(): Promise<boolean> {
       await current.update();
     }
     if (crossOriginIsolated) return false;
-    await navigator.serviceWorker.register(scriptUrl);
-    if (
-      !navigator.serviceWorker.controller &&
-      !sessionStorage.getItem("coi-reloaded")
-    ) {
+    await navigator.serviceWorker.register(scriptUrl, { updateViaCache: "none" });
+    // register() may resolve while a new worker is still installing. Reloading
+    // before activation produces an uncontrolled page; the session guard then
+    // prevents the reload that would actually add COOP/COEP. Wait for active.
+    await navigator.serviceWorker.ready;
+    if (!sessionStorage.getItem("coi-reloaded")) {
       sessionStorage.setItem("coi-reloaded", "1");
       location.reload();
       return true;
