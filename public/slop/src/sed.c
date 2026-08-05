@@ -69,7 +69,11 @@ large:
 static int address_matches(const char **cmdp, const char *line, long lineno, int extended) {
   const char *p = *cmdp;
   if (isdigit((unsigned char)*p)) {
-    long n = strtol(p, (char **)&p, 10); *cmdp = p; return lineno == n;
+    long first = strtol(p, (char **)&p, 10), last = first;
+    if (*p == ',' && isdigit((unsigned char)p[1])) {
+      p++; last = strtol(p, (char **)&p, 10);
+    }
+    *cmdp = p; return lineno >= first && lineno <= last;
   }
   if (*p == '$') { p++; *cmdp = p; return 0; } /* final-line address is intentionally unsupported */
   if (*p == '/') {
@@ -101,6 +105,12 @@ static int apply_script(char **line, const char *script, long lineno, int extend
 }
 
 int main(int argc, char **argv) {
+  if (argc == 2 && (!strcmp(argv[1], "--help") || !strcmp(argv[1], "-h"))) {
+    puts("usage: sed [-n] [-E|-r] [-e SCRIPT] [SCRIPT] [FILE...]\n"
+         "commands: s/ERE/replacement/[gp], p, d, q; numeric and /ERE/ addresses");
+    return 0;
+  }
+  if (argc == 2 && !strcmp(argv[1], "--version")) { puts("sed 0.4-piodide"); return 0; }
   Script scripts[MAX_SCRIPTS]; int ns = 0, quiet = 0, extended = 0, i = 1;
   while (i < argc && argv[i][0] == '-') {
     if (!strcmp(argv[i], "-n")) { quiet = 1; i++; }

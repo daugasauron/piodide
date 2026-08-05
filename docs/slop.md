@@ -37,13 +37,13 @@ flowchart LR
 | Scripts | `sh script.sh`, `slop script.sh`, or an executable text path |
 
 Slop supports `-c`, `-s`, script arguments, general backslash escaping,
-assignments, exported variables, `set -e`, and `set -x`. Common builtins include
+assignments, exported variables, `set -euo pipefail`, and `set -x`. Common builtins include
 `cd`, `echo`, `printf`, `test`, `export`, `unset`, `read`, `shift`, `type`,
-`command -v`, `eval`, `source`, `break`, and `continue`.
+`which`, `command -v`, `local`, `eval`, `source`, `break`, and `continue`.
 
 ## Installed commands
 
-The shell installs the original `ls`, `cat`, `grep`, `echo`, `env`, and
+The shell installs the original `ls`, `cat`, `grep`/`rg`, `echo`, `env`, and
 `fd-find`, plus:
 
 ```text
@@ -51,6 +51,11 @@ make sh python python3 git curl sed ar
 rm cp mv mkdir rmdir touch ln head tail wc sort cut tr tee
 basename dirname seq cmp install readlink find mktemp chmod uniq xargs
 ```
+
+Use `rg PATTERN [PATH]` for recursive ERE search and `rg --files` for file
+discovery. Run `COMMAND --help` for each bounded option subset. Use Python for
+JSON, tabular transformations, and archives; `awk`, `jq`, and `tar` are not
+installed.
 
 These are bounded browser-oriented implementations. `sed` and `ar` provide
 practical subsets rather than every GNU extension. `make` supports timestamp
@@ -134,7 +139,18 @@ sent through a proxy. Run `/github` for private direct-GitHub snapshots and
 pushes.
 
 The snapshot fallback caps repositories at 32 MiB / 3,000 files and creates a
-local import commit. It is not a historical clone.
+synthetic local import commit. It does not create remote-tracking refs or import
+upstream history, tags, signatures, or commit IDs. `git branch -r` therefore
+lists only materialized refs; use `git ls-remote` to inspect upstream names.
+Run `git snapshot info` for the tracked upstream SHA, or
+`git snapshot checkout BRANCH` to explicitly import another branch snapshot.
+`git fetch` is unavailable in snapshot mode; `git pull` updates the tracked
+snapshot.
+
+Git accepts an authoritative shell cwd rather than trusting exported `PWD`.
+Piped stdin and author/committer identity variables are forwarded. Wrapper
+output above 1 MiB fails with status 23 instead of returning a partial result.
+Run `git help COMMAND` for the supported option subset.
 
 Local commands use [wasm-git](https://github.com/petersalomonsen/wasm-git)
 (libgit2) and [isomorphic-git](https://isomorphic-git.org/). The wasm-git
@@ -164,6 +180,8 @@ exit codes, and limits.
   implemented.
 - Compound syntax is line-oriented. Functions cannot be piped, redirected, or
   used in command substitution.
+- Put `if`/`for`/`while`/`case` bodies on separate lines. One-line Bash
+  compounds, heredocs, subshells, and background jobs are not implemented.
 - `xargs` splits bounded input on whitespace and supports `-n`; it is not the
   complete GNU utility. WASI `chmod` validates paths and modes but permissions
   remain host-managed.

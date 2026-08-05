@@ -79,6 +79,11 @@ static int write_archive(const char *path) {
 }
 
 int main(int argc, char **argv) {
+  if (argc == 2 && (!strcmp(argv[1], "--help") || !strcmp(argv[1], "-h"))) {
+    puts("usage: ar rcs ARCHIVE [MEMBERS...] | ar t ARCHIVE | ar x ARCHIVE | ar d ARCHIVE MEMBERS...");
+    return 0;
+  }
+  if (argc == 2 && !strcmp(argv[1], "--version")) { puts("ar 0.4-piodide"); return 0; }
   if (argc < 3) { fprintf(stderr, "usage: ar rcs archive [members...] | ar t archive | ar x archive\n"); return 2; }
   const char *flags = argv[1]; while (*flags == '-') flags++;
   char op = strchr(flags, 't') ? 't' : strchr(flags, 'x') ? 'x' : strchr(flags, 'd') ? 'd' : 'r';

@@ -25,6 +25,11 @@ Header, data, JSON, and URL-encoded file references accept `@file`. `@-` reads
 piped input or reads interactive lines until `Ctrl+D`. `-w @file` reads a
 write-out format. Run `curl --help` for the exact syntax.
 
+`-w` supports `http_code`, `response_code`, `content_type`, `size_download`,
+`url_effective`, `time_total`, `exitcode`, `errormsg`, `filename_effective`,
+`method`, `scheme`, `urlnum`, and `%header{name}`. Unknown variables print a
+warning but do not change the transfer's exit code.
+
 ## Browser rules
 
 - Cross-origin responses require CORS. Authorization and JSON commonly trigger

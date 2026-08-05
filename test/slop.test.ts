@@ -29,12 +29,15 @@ interface SlopRun {
   pythonCommands: string[][];
   curlCommands: string[][];
   gitCommands: Array<{ args: string[]; cwd: string }>;
+  gitStdin: string[];
+  gitEnvironments: Array<Record<string, string>>;
 }
 
 function installShell(fs: MemoryFs): void {
   for (const name of ["slop", "make", "sed", "ar", "ls", "cat", "fd-find", "echo", "env", "grep"]) {
     fs.writeFile(`/bin/${name}`, shellBin(`${name}.wasm`));
   }
+  fs.writeFile("/bin/rg", shellBin("grep.wasm"));
   fs.writeFile("/bin/sh", shellBin("slop.wasm"));
   fs.writeFile("/bin/python", "piodide host-backed Python entrypoint\n");
   fs.writeFile("/bin/python3", "piodide host-backed Python entrypoint\n");
@@ -54,6 +57,7 @@ async function runSlop(
   for (const name of ["slop", "make", "sed", "ar", "git", "cat", "ls", "fd-find", "echo", "env", "grep"] as const) {
     modules.set(name, await WebAssembly.compile(shellBin(`${name}.wasm`) as BufferSource));
   }
+  modules.set("rg", modules.get("grep")!);
   const coreutilsModule = await WebAssembly.compile(shellBin("coreutils.wasm") as BufferSource);
   for (const name of COREUTILS) modules.set(name, coreutilsModule);
   modules.set("sh", modules.get("slop")!);
@@ -66,6 +70,8 @@ async function runSlop(
   const pythonCommands: string[][] = [];
   const curlCommands: string[][] = [];
   const gitCommands: Array<{ args: string[]; cwd: string }> = [];
+  const gitStdin: string[] = [];
+  const gitEnvironments: Array<Record<string, string>> = [];
 
   interface SpawnIo {
     stdinText?: Uint8Array;
@@ -98,7 +104,11 @@ async function runSlop(
     };
     const host = new WasiHost({
       args,
-      env: { PATH: "/bin", PWD: cwd, TERM: "ghostty", ...(io.env ?? {}) },
+      env: {
+        PATH: "/bin", PWD: cwd, TERM: "ghostty", ...(io.env ?? {}),
+        PIODIDE_CWD: cwd,
+        ...(io.stdinText !== undefined ? { PIODIDE_STDIN: "1" } : {}),
+      },
       fs,
       preopens: [{ name: ".", path: cwd }, "/home/web", "/", "/bin"],
       stdin: () => {
@@ -202,6 +212,21 @@ async function runSlop(
     }
     if (childName === "git-engine") {
       gitCommands.push({ args: childArgs, cwd: childCwd });
+      if (ioPtr !== 0) {
+        const stdinPtr = callerHost.readUint32(ioPtr);
+        const stdinLen = callerHost.readUint32(ioPtr + 4);
+        if (stdinPtr && stdinLen) gitStdin.push(decoder.decode(callerHost.readBytes(stdinPtr, stdinLen)));
+        const envPtr = callerHost.readUint32(ioPtr + 28);
+        const envLen = callerHost.readUint32(ioPtr + 32);
+        if (envPtr && envLen) {
+          const values: Record<string, string> = {};
+          for (const entry of decoder.decode(callerHost.readBytes(envPtr, envLen)).split("\0")) {
+            const equals = entry.indexOf("=");
+            if (equals > 0) values[entry.slice(0, equals)] = entry.slice(equals + 1);
+          }
+          gitEnvironments.push(values);
+        }
+      }
       const value = childArgs[1] === "--version"
         ? encoder.encode("git version 2.0.0-piodide (libgit2 + isomorphic-git)\n")
         : new Uint8Array();
@@ -209,8 +234,15 @@ async function runSlop(
         const capturePtr = callerHost.readUint32(ioPtr + 8);
         const captureCap = callerHost.readUint32(ioPtr + 12);
         const captureLenPtr = callerHost.readUint32(ioPtr + 16);
-        if (capturePtr) callerHost.writeBytes(capturePtr, value.subarray(0, captureCap));
-        if (captureLenPtr) callerHost.writeUint32(captureLenPtr, value.byteLength);
+        const large = childArgs.includes("--large-output");
+        if (capturePtr) callerHost.writeBytes(
+          capturePtr,
+          large ? new Uint8Array(captureCap).fill(65) : value.subarray(0, captureCap),
+        );
+        if (captureLenPtr) callerHost.writeUint32(
+          captureLenPtr,
+          large ? captureCap + 1 : value.byteLength,
+        );
       }
       return 0;
     }
@@ -286,7 +318,10 @@ async function runSlop(
   });
   const slopModule = modules.get("slop")!;
   const exitCode = slopHost.start(new WebAssembly.Instance(slopModule, slopHost.getImportObject()));
-  return { stdout, exitCode, toolchainCommands, pythonCommands, curlCommands, gitCommands };
+  return {
+    stdout, exitCode, toolchainCommands, pythonCommands, curlCommands, gitCommands,
+    gitStdin, gitEnvironments,
+  };
 }
 
 test("slop: quiet one-shot mode emits only command output", async () => {
@@ -327,7 +362,10 @@ test("slop: native git and host curl are discoverable commands", async () => {
 
   const run = await runSlop(
     fs,
-    ["type git", "command -v curl", "git --version", "/bin/curl -I https://example.com"],
+    [
+      "type git", "command -v curl", "git --version", "/bin/curl -I https://example.com",
+      "PWD=/ git status",
+    ],
     { quiet: true },
   );
 
@@ -335,8 +373,56 @@ test("slop: native git and host curl are discoverable commands", async () => {
   assert.match(run.stdout, /git is \/bin\/git/);
   assert.match(run.stdout, /\/bin\/curl/);
   assert.match(run.stdout, /git version 2\.0\.0-piodide/);
-  assert.deepEqual(run.gitCommands, [{ args: ["git-engine", "--version"], cwd: "/home/web" }]);
+  assert.deepEqual(run.gitCommands, [
+    { args: ["git-engine", "--version"], cwd: "/home/web" },
+    { args: ["git-engine", "status"], cwd: "/home/web" },
+  ]);
   assert.deepEqual(run.curlCommands, [["/bin/curl", "-I", "https://example.com"]]);
+});
+
+test("slop: host markers do not hijack arbitrary explicit paths", async () => {
+  const fs = new MemoryFs();
+  fs.mkdirTree("/home/web");
+  installShell(fs);
+
+  const run = await runSlop(
+    fs,
+    ["./curl --version", "/definitely/not/here/curl --version"],
+    { quiet: true },
+  );
+
+  assert.equal(run.exitCode, 127);
+  assert.equal(run.curlCommands.length, 0);
+  assert.equal(run.stdout.match(/command not found/g)?.length, 2);
+});
+
+test("slop: Git wrapper rejects output truncation", async () => {
+  const fs = new MemoryFs();
+  fs.mkdirTree("/home/web");
+  installShell(fs);
+
+  const run = await runSlop(fs, ["git --large-output > git-large.out"], { quiet: true });
+
+  assert.equal(run.exitCode, 23);
+  assert.match(run.stdout, /git: output exceeds 1048576 bytes/);
+  assert.equal(fs.readFile("/home/web/git-large.out").byteLength, 0);
+});
+
+test("slop: Git wrapper forwards piped stdin and command environment", async () => {
+  const fs = new MemoryFs();
+  fs.mkdirTree("/home/web");
+  installShell(fs);
+
+  const run = await runSlop(
+    fs,
+    ["echo commit-message | GIT_AUTHOR_NAME=Agent GIT_AUTHOR_EMAIL=agent@example.com git commit -F -"],
+    { quiet: true },
+  );
+
+  assert.equal(run.exitCode, 0);
+  assert.deepEqual(run.gitStdin, ["commit-message\n"]);
+  assert.equal(run.gitEnvironments[0]?.GIT_AUTHOR_NAME, "Agent");
+  assert.equal(run.gitEnvironments[0]?.GIT_AUTHOR_EMAIL, "agent@example.com");
 });
 
 test("slop: oversized host and WASI output fail before a pipeline consumer runs", async () => {
@@ -391,6 +477,50 @@ test("slop: scripts, control flow, utilities, substitution, and exported env", a
   assert.doesNotMatch(run.stdout, /control-failed/);
 });
 
+test("slop: common agent search and strict-script workflows", async () => {
+  const fs = new MemoryFs();
+  fs.mkdirTree("/home/web/src/nested");
+  fs.mkdirTree("/home/web/.git");
+  installShell(fs);
+  fs.writeFile("/home/web/src/main.ts", "const answer = 42;\nconst other = 7;\n");
+  fs.writeFile("/home/web/src/nested/util.ts", "export const ANSWER = 42;\n");
+  fs.writeFile("/home/web/src/ignore.js", "const answer = 0;\n");
+  fs.writeFile("/home/web/.git/private.ts", "const answer = -1;\n");
+
+  const run = await runSlop(
+    fs,
+    [
+      "which rg",
+      "rg --files -g '*.ts'",
+      "rg -n -i -g '*.ts' 'answer[[:space:]]*=' src",
+      "rg -l -F '42' src",
+      "rg 'never-present' src || echo RG-NOMATCH-$?",
+      "set -euo pipefail",
+      "false | true || echo PIPEFAIL-$?",
+      "set +u",
+      "VALUE=$(false) || echo SUBSTITUTION-$?",
+      "echo STRICT-CONTINUED",
+    ],
+    { quiet: true },
+  );
+
+  assert.equal(run.exitCode, 0);
+  assert.match(run.stdout, /\/bin\/rg\n/);
+  assert.match(run.stdout, /src\/main\.ts\n/);
+  assert.match(run.stdout, /src\/nested\/util\.ts\n/);
+  assert.doesNotMatch(run.stdout, /ignore\.js|private\.ts/);
+  assert.match(run.stdout, /src\/main\.ts:1:const answer = 42;/);
+  assert.match(run.stdout, /src\/nested\/util\.ts:1:export const ANSWER = 42;/);
+  assert.match(run.stdout, /RG-NOMATCH-1\n/);
+  assert.match(run.stdout, /PIPEFAIL-1\n/);
+  assert.match(run.stdout, /SUBSTITUTION-1\n/);
+  assert.match(run.stdout, /STRICT-CONTINUED\n/);
+
+  const nounset = await runSlop(fs, ["set -u", "echo $MISSING"], { quiet: true });
+  assert.equal(nounset.exitCode, 2);
+  assert.match(nounset.stdout, /MISSING: unbound variable/);
+});
+
 test("slop: arithmetic, case blocks, and functions", async () => {
   const fs = new MemoryFs();
   fs.mkdirTree("/home/web");
@@ -415,11 +545,14 @@ test("slop: arithmetic, case blocks, and functions", async () => {
       "    ;;",
       "esac",
       "greet() {",
+      "  local SCOPED=inside",
       '  echo "HELLO-$1-$2"',
+      '  echo "LOCAL-$SCOPED"',
       "  return 7",
       "  echo FUNCTION-WRONG",
       "}",
       "greet one two || echo RETURN-$?",
+      "echo LOCAL-AFTER-${SCOPED-unset}",
       "type greet",
       "return 3",
       "echo OUTSIDE-RETURN-$?",
@@ -433,6 +566,8 @@ test("slop: arithmetic, case blocks, and functions", async () => {
   assert.match(run.stdout, /CASE-beta\n/);
   assert.doesNotMatch(run.stdout, /CASE-WRONG|CASE-DEFAULT/);
   assert.match(run.stdout, /HELLO-one-two\n/);
+  assert.match(run.stdout, /LOCAL-inside\n/);
+  assert.match(run.stdout, /LOCAL-AFTER-unset\n/);
   assert.match(run.stdout, /RETURN-7\n/);
   assert.match(run.stdout, /greet is a function\n/);
   assert.doesNotMatch(run.stdout, /FUNCTION-WRONG/);
@@ -493,6 +628,84 @@ test("slop: chmod, uniq, and xargs provide bounded useful subsets", async () => 
   assert.match(run.stdout, /ITEM a b\nITEM c\n/);
   assert.match(run.stdout, /chmod: missing\.txt:/);
   assert.match(run.stdout, /CHMOD-1\n/);
+});
+
+test("slop: common bounded utility forms are compatible and explicit", async () => {
+  const fs = new MemoryFs();
+  fs.mkdirTree("/home/web/tree/sub");
+  installShell(fs);
+  fs.writeFile("/home/web/tree/a.txt", "10\n2\n30\n");
+  fs.writeFile("/home/web/tree/sub/b.txt", "header\nsecond\nthird\n");
+
+  const run = await runSlop(
+    fs,
+    [
+      "cp -a tree tree-copy",
+      "head -c 4 tree/a.txt; echo",
+      "tail -n +2 tree/sub/b.txt",
+      "sort -n tree/a.txt",
+      "printf 'left:right\\n' | cut -d: -f1",
+      "find tree -maxdepth 1 -type f -name '*.txt'",
+      "find tree -type f -print0 | xargs -0 -n 1 basename | sort",
+      "printf '' | xargs -r echo SHOULD-NOT-RUN",
+      "printf 'x' | xargs definitely-missing || echo XARGS-MISSING-$?",
+      "rm --definitely-unsupported tree/a.txt || echo RM-STRICT-$?",
+      "head --help",
+    ],
+    { quiet: true },
+  );
+
+  assert.equal(run.exitCode, 0);
+  assert.equal(new TextDecoder().decode(fs.readFile("/home/web/tree-copy/sub/b.txt")), "header\nsecond\nthird\n");
+  assert.match(run.stdout, /10\n2\nsecond\nthird\n2\n10\n30\nleft\n/);
+  assert.match(run.stdout, /tree\/a\.txt\n/);
+  assert.match(run.stdout, /a\.txt\nb\.txt\n/);
+  assert.doesNotMatch(run.stdout, /SHOULD-NOT-RUN/);
+  assert.match(run.stdout, /xargs: command not found: definitely-missing\nXARGS-MISSING-127\n/);
+  assert.match(run.stdout, /rm: unsupported option: --definitely-unsupported/);
+  assert.match(run.stdout, /RM-STRICT-2\n/);
+  assert.match(run.stdout, /usage: head/);
+  assert.equal(new TextDecoder().decode(fs.readFile("/home/web/tree/a.txt")), "10\n2\n30\n");
+});
+
+test("slop: common text inspection and Make workflows", async () => {
+  const fs = new MemoryFs();
+  fs.mkdirTree("/home/web/project");
+  installShell(fs);
+  fs.writeFile("/home/web/project/input.txt", "alpha\nbeta\ngamma\ndelta\n");
+  fs.writeFile("/home/web/project/member.o", "bounded-object\n");
+  fs.writeFile(
+    "/home/web/project/Makefile",
+    "OUTPUT := output.txt\n.PHONY: all check\nall: $(OUTPUT)\n$(OUTPUT): input.txt\n\tcp $< $@\ncheck: $(OUTPUT)\n\tgrep -Eq '^beta$$' $(OUTPUT)\n",
+  );
+
+  const run = await runSlop(
+    fs,
+    [
+      "cd project",
+      "printf '%s\\n' one two",
+      "sed -n '2,3p' input.txt",
+      "grep -Eq '^beta$' input.txt && echo GREP-QUIET-OK",
+      "printf 'a  b   c\\n' | tr -s ' '",
+      "printf 'AbC\\r\\n' | tr '[:upper:]' '[:lower:]' | tr -d '\\r'",
+      "ar rcs libdemo.a member.o",
+      "ar t libdemo.a",
+      "make check",
+      "cat output.txt",
+      "make -q output.txt && echo MAKE-CURRENT",
+      "make missing || echo MAKE-MISSING-$?",
+    ],
+    { quiet: true },
+  );
+
+  assert.equal(run.exitCode, 0);
+  assert.match(run.stdout, /^one\ntwo\nbeta\ngamma\nGREP-QUIET-OK\na b c\nabc\n/m);
+  assert.match(run.stdout, /cp input\.txt output\.txt/);
+  assert.match(run.stdout, /member\.o\n/);
+  assert.match(run.stdout, /alpha\nbeta\ngamma\ndelta\n/);
+  assert.match(run.stdout, /MAKE-CURRENT\n/);
+  assert.match(run.stdout, /MAKE-MISSING-[12]\n/);
+  assert.equal(new TextDecoder().decode(fs.readFile("/home/web/project/output.txt")), "alpha\nbeta\ngamma\ndelta\n");
 });
 
 test("slop: command-prefixed assignments are temporary", async () => {

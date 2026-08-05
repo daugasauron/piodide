@@ -389,6 +389,21 @@ async function exerciseSlopChannels(client) {
         "e2e-slop-redirects",
         { command: "python -c \\\"import sys; print('redirected-python', file=sys.stderr)\\\" 2> python.err; cat /missing-e2e 2> cat.err; cc --not-real 2> cc.err; printf 'a b c' | xargs -n 2 echo ITEM" }
       );
+      const workflow = await tool.execute(
+        "e2e-slop-agent-workflow",
+        { command: [
+          "mkdir -p shell-audit/src && echo 'const answer = 42;' > shell-audit/src/main.ts",
+          "cd shell-audit",
+          "set -euo pipefail",
+          "which rg",
+          "rg -n 'answer[[:space:]]*=' src",
+          "false | true || echo PIPEFAIL-$?",
+          "for item in one two; do",
+          "  echo LOOP-$item",
+          "done",
+          "echo 'alpha beta' | tr '[:lower:]' '[:upper:]'",
+        ].join(String.fromCharCode(10)) }
+      );
       const decode = (path) => new TextDecoder().decode(window.__pi.py.FS.readFile(path));
       return {
         stdout: result.details?.stdout ?? "",
@@ -398,9 +413,17 @@ async function exerciseSlopChannels(client) {
         content: result.content?.[0]?.text ?? "",
         redirectedStdout: redirected.details?.stdout ?? "",
         redirectedStderr: redirected.details?.stderr ?? "",
+        workflowExit: workflow.details?.exitCode,
+        workflowStdout: workflow.details?.stdout ?? "",
+        workflowStderr: workflow.details?.stderr ?? "",
         pythonErrorFile: decode("/home/web/python.err"),
         catErrorFile: decode("/home/web/cat.err"),
         ccErrorFile: decode("/home/web/cc.err"),
+        promptGuidesShell:
+          systemPrompt.includes("Prefer rg")
+          && systemPrompt.includes("set -euo pipefail")
+          && systemPrompt.includes("awk, jq")
+          && systemPrompt.includes("tar"),
         promptUsesDirectWasi:
           systemPrompt.includes("run_wasi")
           && (
@@ -433,6 +456,14 @@ async function exerciseSlopChannels(client) {
     !state.pythonErrorFile.includes("redirected-python") ||
     !state.catErrorFile.includes("missing-e2e") ||
     !state.ccErrorFile.includes("unsupported option: --not-real") ||
+    state.workflowExit !== 0 ||
+    !state.workflowStdout.includes("/bin/rg") ||
+    !state.workflowStdout.includes("src/main.ts:1:const answer = 42;") ||
+    !state.workflowStdout.includes("PIPEFAIL-1") ||
+    !state.workflowStdout.includes("LOOP-one\nLOOP-two") ||
+    !state.workflowStdout.includes("ALPHA BETA") ||
+    state.workflowStderr !== "" ||
+    !state.promptGuidesShell ||
     !state.promptUsesDirectWasi
   ) {
     throw new Error(`Unexpected Slop channels: ${JSON.stringify(state)}`);
@@ -493,6 +524,18 @@ async function exerciseSlopGitAndCurl(client, curlFixtureUrl = "") {
         "e2e-slop-git",
         { command: "mkdir -p git-e2e/src && cd git-e2e && git init -b main && echo browser-git > src/file.txt && cd src && git add . && git commit -m initial && git switch -c feature && echo feature > file.txt && git add file.txt && git commit -m feature && git switch main && cat file.txt && git switch feature && git status --porcelain && git log --oneline -1 && git rev-parse --show-toplevel" }
       );
+      const gitAudit = await tool.execute(
+        "e2e-slop-git-audit",
+        { command: "cd git-e2e && echo audit > audit.txt && git add audit.txt && echo wrapper-stdin | GIT_AUTHOR_NAME='Browser Author' GIT_AUTHOR_EMAIL=browser@example.com git commit -F - && git log -n 1 && echo staged >> audit.txt && git add audit.txt && git reset && git status --short && PWD=/ git rev-parse --show-toplevel" }
+      );
+      const gitFailure = await tool.execute(
+        "e2e-slop-git-failure",
+        { command: "cd git-e2e && git reset missing-revision" }
+      );
+      const explicitCurl = await tool.execute(
+        "e2e-slop-explicit-curl",
+        { command: "/definitely/not/here/curl --version" }
+      );
       const gitTool = window.__pi.agent.state.tools.find(({ name }) => name === "git");
       if (!gitTool) throw new Error("git tool is missing");
       const savedFetch = window.fetch;
@@ -533,6 +576,15 @@ async function exerciseSlopGitAndCurl(client, curlFixtureUrl = "") {
         gitExit: git.details?.exitCode,
         gitOut: git.details?.stdout ?? "",
         gitErr: git.details?.stderr ?? "",
+        gitAuditExit: gitAudit.details?.exitCode,
+        gitAuditOut: gitAudit.details?.stdout ?? "",
+        gitAuditErr: gitAudit.details?.stderr ?? "",
+        gitFailureExit: gitFailure.details?.exitCode,
+        gitFailureOut: gitFailure.details?.stdout ?? "",
+        gitFailureErr: gitFailure.details?.stderr ?? "",
+        explicitCurlExit: explicitCurl.details?.exitCode,
+        explicitCurlErr: explicitCurl.details?.stderr ?? "",
+        curlSource: decode("/home/web/slop/curl-host.ts"),
         curlFile: new TextDecoder().decode(window.__pi.py.FS.readFile("/home/web/curl-e2e.txt")),
         curlBrowser,
         gitHead: new TextDecoder().decode(window.__pi.py.FS.readFile("/home/web/git-e2e/.git/HEAD")),
@@ -579,9 +631,20 @@ async function exerciseSlopGitAndCurl(client, curlFixtureUrl = "") {
     !state.gitOut.includes("browser-git") ||
     !state.gitOut.includes("/home/web/git-e2e") ||
     state.gitErr !== "" ||
+    state.gitAuditExit !== 0 ||
+    !state.gitAuditOut.includes("Browser Author") ||
+    !state.gitAuditOut.includes(" M audit.txt") ||
+    !state.gitAuditOut.includes("/home/web/git-e2e") ||
+    state.gitAuditErr !== "" ||
+    state.gitFailureExit === 0 ||
+    state.gitFailureOut !== "" ||
+    !state.gitFailureErr.includes("unknown revision: missing-revision") ||
+    state.explicitCurlExit !== 127 ||
+    !state.explicitCurlErr.includes("command not found") ||
+    !state.curlSource.includes("export async function runCurlCommand") ||
     state.gitHead !== "ref: refs/heads/feature\n" ||
     state.gitMain !== "feature\n" ||
-    !state.cloneOut.includes("Cloned browser/e2e") ||
+    !state.cloneOut.includes("Snapshot-cloned browser/e2e") ||
     state.cloneFile !== "remote\n" ||
     state.cloneHead !== "ref: refs/heads/main\n"
   ) {

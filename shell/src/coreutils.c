@@ -25,6 +25,7 @@ int chmod(const char *, mode_t);
 #define SORT_LINES 100000
 #define XARGS_MAX 128
 #define XARGS_BLOB 16384
+#define ENV_LIMIT 65536
 
 typedef struct {
   const char *stdin_data; int stdin_len; char *capture; int capture_cap;
@@ -33,6 +34,7 @@ typedef struct {
 } slop_io;
 extern int piodide_spawn(const char *path, const char *argv_blob, const char *cwd,
                          slop_io *io);
+extern char **environ;
 
 static const char *prog;
 static int errorf(const char *path) { fprintf(stderr, "%s: %s: %s\n", prog, path, strerror(errno)); return 1; }
@@ -123,10 +125,14 @@ static int copy_path(const char *src, const char *dst, int recursive, int depth)
 
 static int cmd_rm(int ac, char **av) {
   int recursive = 0, force = 0, i = 1;
-  for (; i < ac && av[i][0] == '-'; i++) {
+  for (; i < ac && av[i][0] == '-' && av[i][1]; i++) {
     if (!strcmp(av[i], "--")) { i++; break; }
-    if (strchr(av[i], 'r') || strchr(av[i], 'R')) recursive = 1;
-    if (strchr(av[i], 'f')) force = 1;
+    if (av[i][1] == '-') { fprintf(stderr, "rm: unsupported option: %s\n", av[i]); return 2; }
+    for (const char *flag = av[i] + 1; *flag; flag++) {
+      if (*flag == 'r' || *flag == 'R') recursive = 1;
+      else if (*flag == 'f') force = 1;
+      else { fprintf(stderr, "rm: unsupported option: -%c\n", *flag); return 2; }
+    }
   }
   if (i == ac && !force) { fprintf(stderr, "rm: missing operand\n"); return 1; }
   int rc = 0; for (; i < ac; i++) if (remove_path(av[i], recursive, force, 0)) rc = 1; return rc;
@@ -134,7 +140,14 @@ static int cmd_rm(int ac, char **av) {
 
 static int cmd_cp(int ac, char **av) {
   int recursive = 0, i = 1;
-  for (; i < ac && av[i][0] == '-'; i++) { if (strchr(av[i], 'r') || strchr(av[i], 'R')) recursive = 1; }
+  for (; i < ac && av[i][0] == '-' && av[i][1]; i++) {
+    if (!strcmp(av[i], "--")) { i++; break; }
+    for (const char *flag = av[i] + 1; *flag; flag++) {
+      if (*flag == 'r' || *flag == 'R' || *flag == 'a') recursive = 1;
+      else if (*flag == 'f' || *flag == 'p') { }
+      else { fprintf(stderr, "cp: unsupported option: -%c\n", *flag); return 2; }
+    }
+  }
   if (ac - i < 2) { fprintf(stderr, "cp: source and destination required\n"); return 1; }
   int rc = 0; const char *dst = av[ac - 1]; struct stat st;
   if (ac - i > 2 && (stat(dst, &st) || !S_ISDIR(st.st_mode))) { fprintf(stderr, "cp: destination must be a directory\n"); return 1; }
@@ -142,20 +155,37 @@ static int cmd_cp(int ac, char **av) {
 }
 
 static int cmd_mv(int ac, char **av) {
-  if (ac != 3) { fprintf(stderr, "mv: source and destination required\n"); return 1; }
-  const char *dst = av[2]; char *actual = NULL; struct stat st;
-  if (stat(dst, &st) == 0 && S_ISDIR(st.st_mode)) {
-    size_t n = strlen(dst) + strlen(base(av[1])) + 2; actual = malloc(n);
-    snprintf(actual, n, "%s/%s", dst, base(av[1])); dst = actual;
+  int i = 1, no_clobber = 0;
+  for (; i < ac && av[i][0] == '-' && av[i][1]; i++) {
+    if (!strcmp(av[i], "--")) { i++; break; }
+    for (const char *flag = av[i] + 1; *flag; flag++) {
+      if (*flag == 'f') no_clobber = 0;
+      else if (*flag == 'n') no_clobber = 1;
+      else { fprintf(stderr, "mv: unsupported option: -%c\n", *flag); return 2; }
+    }
   }
-  if (!rename(av[1], dst)) { free(actual); return 0; }
-  if (copy_path(av[1], dst, 1, 0)) { free(actual); return 1; }
-  int rc = remove_path(av[1], 1, 0, 0); free(actual); return rc;
+  if (ac - i != 2) { fprintf(stderr, "mv: source and destination required\n"); return 1; }
+  const char *src = av[i], *dst = av[i + 1]; char *actual = NULL; struct stat st;
+  if (stat(dst, &st) == 0 && S_ISDIR(st.st_mode)) {
+    size_t n = strlen(dst) + strlen(base(src)) + 2; actual = malloc(n);
+    if (!actual) return 1;
+    snprintf(actual, n, "%s/%s", dst, base(src)); dst = actual;
+  }
+  if (no_clobber && stat(dst, &st) == 0) { free(actual); return 0; }
+  if (!rename(src, dst)) { free(actual); return 0; }
+  if (copy_path(src, dst, 1, 0)) { free(actual); return 1; }
+  int rc = remove_path(src, 1, 0, 0); free(actual); return rc;
 }
 
 static int cmd_mkdir(int ac, char **av) {
   int parents = 0, i = 1;
-  for (; i < ac && av[i][0] == '-'; i++) if (strchr(av[i], 'p')) parents = 1;
+  for (; i < ac && av[i][0] == '-' && av[i][1]; i++) {
+    if (!strcmp(av[i], "--")) { i++; break; }
+    for (const char *flag = av[i] + 1; *flag; flag++) {
+      if (*flag == 'p') parents = 1;
+      else { fprintf(stderr, "mkdir: unsupported option: -%c\n", *flag); return 2; }
+    }
+  }
   if (i == ac) { fprintf(stderr, "mkdir: missing operand\n"); return 1; }
   int rc = 0;
   for (; i < ac; i++) {
@@ -166,8 +196,11 @@ static int cmd_mkdir(int ac, char **av) {
 }
 
 static int cmd_rmdir(int ac, char **av) {
-  int rc = 0; if (ac < 2) return 1;
-  for (int i = 1; i < ac; i++) if (rmdir(av[i])) rc = errorf(av[i]); return rc;
+  int rc = 0, i = 1;
+  if (i < ac && !strcmp(av[i], "--")) i++;
+  else if (i < ac && av[i][0] == '-') { fprintf(stderr, "rmdir: unsupported option: %s\n", av[i]); return 2; }
+  if (i == ac) return 1;
+  for (; i < ac; i++) if (rmdir(av[i])) rc = errorf(av[i]); return rc;
 }
 
 static int touch_one(const char *path) {
@@ -182,14 +215,35 @@ static int touch_one(const char *path) {
 }
 
 static int cmd_touch(int ac, char **av) {
-  int rc = 0, i = 1; while (i < ac && av[i][0] == '-') i++;
-  if (i == ac) return 1; for (; i < ac; i++) if (touch_one(av[i])) rc = 1; return rc;
+  int rc = 0, no_create = 0, i = 1;
+  for (; i < ac && av[i][0] == '-' && av[i][1]; i++) {
+    if (!strcmp(av[i], "--")) { i++; break; }
+    for (const char *flag = av[i] + 1; *flag; flag++) {
+      if (*flag == 'c') no_create = 1;
+      else { fprintf(stderr, "touch: unsupported option: -%c\n", *flag); return 2; }
+    }
+  }
+  if (i == ac) return 1;
+  for (; i < ac; i++) {
+    struct stat status;
+    if (no_create && stat(av[i], &status) != 0 && errno == ENOENT) continue;
+    if (touch_one(av[i])) rc = 1;
+  }
+  return rc;
 }
 
 static int cmd_ln(int ac, char **av) {
-  int symbolic = 0, i = 1;
-  for (; i < ac && av[i][0] == '-'; i++) if (strchr(av[i], 's')) symbolic = 1;
+  int symbolic = 0, force = 0, i = 1;
+  for (; i < ac && av[i][0] == '-' && av[i][1]; i++) {
+    if (!strcmp(av[i], "--")) { i++; break; }
+    for (const char *flag = av[i] + 1; *flag; flag++) {
+      if (*flag == 's') symbolic = 1;
+      else if (*flag == 'f') force = 1;
+      else { fprintf(stderr, "ln: unsupported option: -%c\n", *flag); return 2; }
+    }
+  }
   if (ac - i != 2) { fprintf(stderr, "ln: target and link name required\n"); return 1; }
+  if (force) unlink(av[i + 1]);
   int rc = symbolic ? symlink(av[i], av[i + 1]) : link(av[i], av[i + 1]);
   return rc ? errorf(av[i + 1]) : 0;
 }
@@ -197,15 +251,38 @@ static int cmd_ln(int ac, char **av) {
 static FILE *open_input(const char *name) { return !name || !strcmp(name, "-") ? stdin : fopen(name, "rb"); }
 
 static int cmd_head(int ac, char **av) {
-  long count = 10; int i = 1;
-  if (i < ac && !strcmp(av[i], "-n") && i + 1 < ac) { count = strtol(av[i + 1], NULL, 10); i += 2; }
-  else if (i < ac && av[i][0] == '-' && isdigit((unsigned char)av[i][1])) count = strtol(av[i++] + 1, NULL, 10);
+  long count = 10, byte_count = -1; int i = 1;
+  while (i < ac && av[i][0] == '-' && av[i][1]) {
+    if (!strcmp(av[i], "--")) { i++; break; }
+    if ((!strcmp(av[i], "-n") || !strcmp(av[i], "--lines")) && i + 1 < ac) {
+      count = strtol(av[i + 1], NULL, 10); i += 2;
+    } else if ((!strcmp(av[i], "-c") || !strcmp(av[i], "--bytes")) && i + 1 < ac) {
+      byte_count = strtol(av[i + 1], NULL, 10); i += 2;
+    } else if (!strncmp(av[i], "--lines=", 8)) { count = strtol(av[i++] + 8, NULL, 10); }
+    else if (!strncmp(av[i], "--bytes=", 8)) { byte_count = strtol(av[i++] + 8, NULL, 10); }
+    else if (!strncmp(av[i], "-c", 2) && av[i][2]) { byte_count = strtol(av[i++] + 2, NULL, 10); }
+    else if (isdigit((unsigned char)av[i][1])) count = strtol(av[i++] + 1, NULL, 10);
+    else { fprintf(stderr, "head: unsupported option: %s\n", av[i]); return 2; }
+  }
+  if (count < 0 || byte_count < -1) { fprintf(stderr, "head: count must be non-negative\n"); return 2; }
   if (i == ac) { av[--i] = "-"; ac = i + 1; }
   int rc = 0;
   for (; i < ac; i++) {
     FILE *f = open_input(av[i]); if (!f) { rc = errorf(av[i]); continue; }
-    char buf[8192]; long lines = 0;
-    while (lines < count && fgets(buf, sizeof buf, f)) { fputs(buf, stdout); if (strchr(buf, '\n')) lines++; }
+    char buf[8192];
+    if (byte_count >= 0) {
+      long left = byte_count;
+      while (left > 0) {
+        size_t wanted = left < (long)sizeof buf ? (size_t)left : sizeof buf;
+        size_t got = fread(buf, 1, wanted, f);
+        if (!got) break;
+        if (fwrite(buf, 1, got, stdout) != got) { rc = 1; break; }
+        left -= (long)got;
+      }
+    } else {
+      long lines = 0;
+      while (lines < count && fgets(buf, sizeof buf, f)) { fputs(buf, stdout); if (strchr(buf, '\n')) lines++; }
+    }
     if (f != stdin) fclose(f);
   }
   return rc;
@@ -224,35 +301,74 @@ static char *read_all(FILE *f, size_t *size) {
 }
 
 static int cmd_tail(int ac, char **av) {
-  long count = 10; int i = 1;
-  if (i < ac && !strcmp(av[i], "-n") && i + 1 < ac) { count = strtol(av[i + 1], NULL, 10); i += 2; }
+  long count = 10; int from_start = 0, i = 1;
+  if (i < ac && (!strcmp(av[i], "-n") || !strcmp(av[i], "--lines")) && i + 1 < ac) {
+    const char *value = av[i + 1]; from_start = value[0] == '+'; count = strtol(value, NULL, 10); i += 2;
+  } else if (i < ac && !strncmp(av[i], "--lines=", 8)) {
+    const char *value = av[i] + 8; from_start = value[0] == '+'; count = strtol(value, NULL, 10); i++;
+  } else if (i < ac && !strncmp(av[i], "-n", 2) && av[i][2]) {
+    const char *value = av[i] + 2; from_start = value[0] == '+'; count = strtol(value, NULL, 10); i++;
+  } else if (i < ac && av[i][0] == '-') {
+    fprintf(stderr, "tail: unsupported option: %s\n", av[i]); return 2;
+  }
+  if (ac - i > 1) { fprintf(stderr, "tail: only one input file is supported\n"); return 2; }
+  if (count < 0) count = -count;
   const char *name = i < ac ? av[i] : "-"; FILE *f = open_input(name);
   if (!f) return errorf(name); size_t n; char *data = read_all(f, &n); if (f != stdin) fclose(f);
   if (!data) return errorf(name);
-  size_t p = n; long seen = 0;
-  if (p && data[p - 1] == '\n') p--;
-  while (p && seen < count) if (data[--p] == '\n') { seen++; if (seen == count) { p++; break; } }
+  size_t p = 0;
+  if (from_start) {
+    long line = 1;
+    while (p < n && line < count) if (data[p++] == '\n') line++;
+  } else {
+    p = n; long seen = 0;
+    if (p && data[p - 1] == '\n') p--;
+    while (p && seen < count) if (data[--p] == '\n') { seen++; if (seen == count) { p++; break; } }
+  }
   fwrite(data + p, 1, n - p, stdout); free(data); return 0;
 }
 
 static int cmd_wc(int ac, char **av) {
   int show_l = 0, show_w = 0, show_c = 0, i = 1;
-  for (; i < ac && av[i][0] == '-'; i++) { show_l |= strchr(av[i], 'l') != NULL; show_w |= strchr(av[i], 'w') != NULL; show_c |= strchr(av[i], 'c') != NULL; }
+  for (; i < ac && av[i][0] == '-' && av[i][1]; i++) {
+    if (!strcmp(av[i], "--")) { i++; break; }
+    for (const char *flag = av[i] + 1; *flag; flag++) {
+      if (*flag == 'l') show_l = 1;
+      else if (*flag == 'w') show_w = 1;
+      else if (*flag == 'c') show_c = 1;
+      else { fprintf(stderr, "wc: unsupported option: -%c\n", *flag); return 2; }
+    }
+  }
   if (!show_l && !show_w && !show_c) show_l = show_w = show_c = 1;
+  if (ac - i > 1) { fprintf(stderr, "wc: only one input file is supported\n"); return 2; }
   const char *name = i < ac ? av[i] : "-"; FILE *f = open_input(name); if (!f) return errorf(name);
   unsigned long l = 0, w = 0, c = 0; int ch, inword = 0;
   while ((ch = fgetc(f)) != EOF) { c++; if (ch == '\n') l++; if (isspace((unsigned char)ch)) inword = 0; else if (!inword) { inword = 1; w++; } }
   if (f != stdin) fclose(f); if (show_l) printf("%lu ", l); if (show_w) printf("%lu ", w); if (show_c) printf("%lu ", c); if (strcmp(name, "-")) printf("%s", name); putchar('\n'); return 0;
 }
 
-static int reverse_sort;
+static int reverse_sort, numeric_sort;
 static int linecmp(const void *a, const void *b) {
-  int x = strcmp(*(char *const *)a, *(char *const *)b); return reverse_sort ? -x : x;
+  int x;
+  if (numeric_sort) {
+    double left = strtod(*(char *const *)a, NULL), right = strtod(*(char *const *)b, NULL);
+    x = left < right ? -1 : left > right ? 1 : strcmp(*(char *const *)a, *(char *const *)b);
+  } else x = strcmp(*(char *const *)a, *(char *const *)b);
+  return reverse_sort ? -x : x;
 }
 
 static int cmd_sort(int ac, char **av) {
-  int unique = 0, i = 1; reverse_sort = 0;
-  for (; i < ac && av[i][0] == '-'; i++) { reverse_sort |= strchr(av[i], 'r') != NULL; unique |= strchr(av[i], 'u') != NULL; }
+  int unique = 0, i = 1; reverse_sort = numeric_sort = 0;
+  for (; i < ac && av[i][0] == '-' && av[i][1]; i++) {
+    if (!strcmp(av[i], "--")) { i++; break; }
+    for (const char *flag = av[i] + 1; *flag; flag++) {
+      if (*flag == 'r') reverse_sort = 1;
+      else if (*flag == 'u') unique = 1;
+      else if (*flag == 'n') numeric_sort = 1;
+      else { fprintf(stderr, "sort: unsupported option: -%c\n", *flag); return 2; }
+    }
+  }
+  if (ac - i > 1) { fprintf(stderr, "sort: only one input file is supported\n"); return 2; }
   const char *name = i < ac ? av[i] : "-"; FILE *f = open_input(name); if (!f) return errorf(name);
   size_t n; char *data = read_all(f, &n); if (f != stdin) fclose(f); if (!data) return errorf(name);
   char **lines = malloc(SORT_LINES * sizeof *lines); if (!lines) { free(data); return 1; }
@@ -270,12 +386,17 @@ static int cmd_sort(int ac, char **av) {
 static int cmd_cut(int ac, char **av) {
   char delim = '\t'; int field = 0, i = 1;
   while (i < ac && av[i][0] == '-') {
+    if (!strcmp(av[i], "--")) { i++; break; }
     if (!strcmp(av[i], "-d") && i + 1 < ac) { delim = av[i + 1][0]; i += 2; }
+    else if (!strncmp(av[i], "--delimiter=", 12) && av[i][12]) { delim = av[i][12]; i++; }
+    else if (!strncmp(av[i], "-d", 2) && av[i][2]) { delim = av[i][2]; i++; }
     else if (!strcmp(av[i], "-f") && i + 1 < ac) { field = atoi(av[i + 1]); i += 2; }
+    else if (!strncmp(av[i], "--fields=", 9)) { field = atoi(av[i] + 9); i++; }
     else if (!strncmp(av[i], "-f", 2)) { field = atoi(av[i] + 2); i++; }
-    else i++;
+    else { fprintf(stderr, "cut: unsupported option: %s\n", av[i]); return 2; }
   }
   if (field < 1) { fprintf(stderr, "cut: a positive -f field is required\n"); return 1; }
+  if (ac - i > 1) { fprintf(stderr, "cut: only one input file is supported\n"); return 2; }
   FILE *f = i < ac ? fopen(av[i], "r") : stdin; if (!f) return errorf(av[i]);
   char line[65536];
   while (fgets(line, sizeof line, f)) {
@@ -287,22 +408,102 @@ static int cmd_cut(int ac, char **av) {
   if (f != stdin) fclose(f); return 0;
 }
 
+static int tr_append(unsigned char *out, size_t *used, unsigned char value) {
+  if (*used >= 512) return 0; out[(*used)++] = value; return 1;
+}
+
+static int tr_class(const char *value, unsigned char *out, size_t *used, size_t *consumed) {
+  struct Class { const char *name; const char *chars; } classes[] = {
+    { "[:lower:]", "abcdefghijklmnopqrstuvwxyz" },
+    { "[:upper:]", "ABCDEFGHIJKLMNOPQRSTUVWXYZ" },
+    { "[:digit:]", "0123456789" },
+    { "[:space:]", " \t\r\n\v\f" },
+    { "[:alpha:]", "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ" },
+    { "[:alnum:]", "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789" },
+  };
+  for (size_t index = 0; index < sizeof classes / sizeof classes[0]; index++) {
+    size_t length = strlen(classes[index].name);
+    if (!strncmp(value, classes[index].name, length)) {
+      for (const char *p = classes[index].chars; *p; p++) if (!tr_append(out, used, (unsigned char)*p)) return -1;
+      *consumed = length; return 1;
+    }
+  }
+  return 0;
+}
+
+static int tr_expand(const char *value, unsigned char *out, size_t *length) {
+  *length = 0;
+  for (size_t index = 0; value[index];) {
+    size_t consumed = 0;
+    int class_result = tr_class(value + index, out, length, &consumed);
+    if (class_result < 0) return 0;
+    if (class_result > 0) { index += consumed; continue; }
+    unsigned char first = (unsigned char)value[index++];
+    if (first == '\\' && value[index]) {
+      unsigned char escaped = (unsigned char)value[index++];
+      first = escaped == 'n' ? '\n' : escaped == 'r' ? '\r' : escaped == 't' ? '\t' :
+        escaped == 'v' ? '\v' : escaped == 'f' ? '\f' : escaped;
+    }
+    if (value[index] == '-' && value[index + 1]) {
+      index++;
+      unsigned char last = (unsigned char)value[index++];
+      if (last == '\\' && value[index]) last = (unsigned char)value[index++];
+      if (last < first) return 0;
+      for (unsigned value_byte = first; value_byte <= last; value_byte++)
+        if (!tr_append(out, length, (unsigned char)value_byte)) return 0;
+    } else if (!tr_append(out, length, first)) return 0;
+  }
+  return 1;
+}
+
+static int tr_index(const unsigned char *set, size_t length, unsigned char value) {
+  for (size_t index = 0; index < length; index++) if (set[index] == value) return (int)index;
+  return -1;
+}
+
 static int cmd_tr(int ac, char **av) {
-  int del = 0, i = 1; if (i < ac && !strcmp(av[i], "-d")) { del = 1; i++; }
-  if ((del && ac - i < 1) || (!del && ac - i < 2)) return 1;
-  const unsigned char *from = (unsigned char *)av[i], *to = del ? NULL : (unsigned char *)av[i + 1];
-  size_t nt = to ? strlen((char *)to) : 0; int c;
-  if (!del && !nt) return 1;
+  int del = 0, squeeze = 0, i = 1;
+  for (; i < ac && av[i][0] == '-' && av[i][1]; i++) {
+    if (!strcmp(av[i], "--")) { i++; break; }
+    for (const char *flag = av[i] + 1; *flag; flag++) {
+      if (*flag == 'd') del = 1;
+      else if (*flag == 's') squeeze = 1;
+      else { fprintf(stderr, "tr: unsupported option: -%c\n", *flag); return 2; }
+    }
+  }
+  int operands = ac - i;
+  int translate = !del && operands == 2;
+  int second_squeeze_set = del && squeeze && operands == 2;
+  if (operands < 1 || operands > 2 || (!del && !squeeze && !translate) ||
+      (del && !squeeze && operands != 1)) {
+    fprintf(stderr, "tr: expected SET1%s\n", del || squeeze ? " [SET2]" : " SET2"); return 2;
+  }
+  unsigned char from[512], to[512]; size_t nf = 0, nt = 0;
+  if (!tr_expand(av[i], from, &nf) ||
+      ((translate || second_squeeze_set) && !tr_expand(av[i + 1], to, &nt)) ||
+      ((translate || second_squeeze_set) && !nt)) {
+    fprintf(stderr, "tr: invalid or oversized character set\n"); return 2;
+  }
+  const unsigned char *squeeze_set = translate || second_squeeze_set ? to : from;
+  size_t squeeze_length = translate || second_squeeze_set ? nt : nf;
+  int c, previous = -1;
   while ((c = getchar()) != EOF) {
-    const unsigned char *p = (const unsigned char *)strchr((char *)from, c);
-    if (p) { if (del) continue; size_t ix = (size_t)(p - from); c = to[ix < nt ? ix : nt - 1]; }
-    putchar(c);
+    int index = tr_index(from, nf, (unsigned char)c);
+    if (index >= 0) {
+      if (del) continue;
+      if (translate) c = to[(size_t)index < nt ? (size_t)index : nt - 1];
+    }
+    if (squeeze && c == previous && tr_index(squeeze_set, squeeze_length, (unsigned char)c) >= 0) continue;
+    putchar(c); previous = c;
   }
   return 0;
 }
 
 static int cmd_tee(int ac, char **av) {
-  int append = 0, i = 1; if (i < ac && !strcmp(av[i], "-a")) { append = 1; i++; }
+  int append = 0, i = 1;
+  if (i < ac && (!strcmp(av[i], "-a") || !strcmp(av[i], "--append"))) { append = 1; i++; }
+  if (i < ac && !strcmp(av[i], "--")) i++;
+  else if (i < ac && av[i][0] == '-') { fprintf(stderr, "tee: unsupported option: %s\n", av[i]); return 2; }
   int nf = ac - i; FILE **files = calloc((size_t)(nf ? nf : 1), sizeof *files); if (!files) return 1;
   int rc = 0; for (int x = 0; x < nf; x++) if (!(files[x] = fopen(av[i + x], append ? "ab" : "wb"))) rc = errorf(av[i + x]);
   char buf[8192]; size_t n;
@@ -313,13 +514,15 @@ static int cmd_tee(int ac, char **av) {
 }
 
 static int cmd_basename(int ac, char **av) {
-  if (ac < 2) return 1; const char *b = base(av[1]); size_t n = strlen(b);
+  if (ac < 2 || ac > 3) { fprintf(stderr, "basename: expected PATH [SUFFIX]\n"); return 2; }
+  const char *b = base(av[1]); size_t n = strlen(b);
   if (ac > 2) { size_t s = strlen(av[2]); if (n > s && !strcmp(b + n - s, av[2])) n -= s; }
   fwrite(b, 1, n, stdout); putchar('\n'); return 0;
 }
 
 static int cmd_dirname(int ac, char **av) {
-  if (ac < 2) return 1; char *s = strdup(av[1]); size_t n = strlen(s);
+  if (ac != 2) { fprintf(stderr, "dirname: expected one path\n"); return 2; }
+  char *s = strdup(av[1]); size_t n = strlen(s);
   while (n > 1 && s[n - 1] == '/') s[--n] = 0; char *p = strrchr(s, '/');
   if (!p) puts("."); else { while (p > s && p[-1] == '/') p--; if (p == s) p++; *p = 0; puts(*s ? s : "/"); }
   free(s); return 0;
@@ -345,34 +548,52 @@ static int cmd_cmp(int ac, char **av) {
 }
 
 static int cmd_readlink(int ac, char **av) {
-  if (ac != 2) return 1; char buf[65536]; ssize_t n = readlink(av[1], buf, sizeof buf - 1);
+  if (ac != 2 || av[1][0] == '-') { fprintf(stderr, "readlink: expected one link path\n"); return 2; }
+  char buf[65536]; ssize_t n = readlink(av[1], buf, sizeof buf - 1);
   if (n < 0) return errorf(av[1]); buf[n] = 0; puts(buf); return 0;
 }
 
-static int find_walk(const char *path, const char *pattern, int wanted, int depth) {
+static void find_print(const char *path, int nul) {
+  fwrite(path, 1, strlen(path), stdout);
+  putchar(nul ? '\0' : '\n');
+}
+
+static int find_walk(const char *path, const char *pattern, int wanted, int depth,
+                     int max_depth, int nul) {
   if (depth > 128) return 1; struct stat st; if (lstat(path, &st)) return errorf(path);
   int type = S_ISDIR(st.st_mode) ? 'd' : S_ISREG(st.st_mode) ? 'f' : 'l';
-  if ((!wanted || wanted == type) && (!pattern || fnmatch(pattern, base(path), 0) == 0)) puts(path);
-  if (type != 'd') return 0; DIR *d = opendir(path); if (!d) return errorf(path);
+  if ((!wanted || wanted == type) && (!pattern || fnmatch(pattern, base(path), 0) == 0)) find_print(path, nul);
+  if (type != 'd' || (max_depth >= 0 && depth >= max_depth)) return 0;
+  DIR *d = opendir(path); if (!d) return errorf(path);
   struct dirent *e; int rc = 0;
   while ((e = readdir(d))) {
     if (!strcmp(e->d_name, ".") || !strcmp(e->d_name, "..")) continue;
     size_t n = strlen(path) + strlen(e->d_name) + 2; char *child = malloc(n); if (!child) { rc = 1; break; }
-    snprintf(child, n, "%s/%s", path, e->d_name); if (find_walk(child, pattern, wanted, depth + 1)) rc = 1; free(child);
+    snprintf(child, n, "%s/%s", path, e->d_name);
+    if (find_walk(child, pattern, wanted, depth + 1, max_depth, nul)) rc = 1;
+    free(child);
   }
   closedir(d); return rc;
 }
 
 static int cmd_find(int ac, char **av) {
   int i = 1; const char *paths[128]; int np = 0; while (i < ac && av[i][0] != '-') { if (np < 128) paths[np++] = av[i]; i++; }
-  if (!np) paths[np++] = "."; const char *pattern = NULL; int wanted = 0;
+  if (!np) paths[np++] = "."; const char *pattern = NULL; int wanted = 0, max_depth = -1, nul = 0;
   while (i < ac) {
     if (!strcmp(av[i], "-name") && i + 1 < ac) { pattern = av[i + 1]; i += 2; }
     else if (!strcmp(av[i], "-type") && i + 1 < ac) { wanted = av[i + 1][0]; i += 2; }
+    else if (!strcmp(av[i], "-maxdepth") && i + 1 < ac) {
+      char *end = NULL; long value = strtol(av[i + 1], &end, 10);
+      if (*end || value < 0 || value > 128) { fprintf(stderr, "find: invalid -maxdepth: %s\n", av[i + 1]); return 2; }
+      max_depth = (int)value; i += 2;
+    }
     else if (!strcmp(av[i], "-print")) i++;
-    else { fprintf(stderr, "find: unsupported expression: %s\n", av[i]); return 1; }
+    else if (!strcmp(av[i], "-print0")) { nul = 1; i++; }
+    else { fprintf(stderr, "find: unsupported expression: %s\n", av[i]); return 2; }
   }
-  int rc = 0; for (i = 0; i < np; i++) if (find_walk(paths[i], pattern, wanted, 0)) rc = 1; return rc;
+  int rc = 0;
+  for (i = 0; i < np; i++) if (find_walk(paths[i], pattern, wanted, 0, max_depth, nul)) rc = 1;
+  return rc;
 }
 
 static int cmd_mktemp(int ac, char **av) {
@@ -397,7 +618,8 @@ static int cmd_install(int ac, char **av) {
   while (i < ac && av[i][0] == '-') {
     if (!strcmp(av[i], "-d")) { directory = 1; i++; }
     else if ((!strcmp(av[i], "-m") || !strcmp(av[i], "-o") || !strcmp(av[i], "-g")) && i + 1 < ac) i += 2;
-    else i++;
+    else if (!strcmp(av[i], "--")) { i++; break; }
+    else { fprintf(stderr, "install: unsupported option: %s\n", av[i]); return 2; }
   }
   if (directory) { int rc = 0; for (; i < ac; i++) if (mkdir_parents(av[i])) rc = 1; return rc; }
   if (ac - i < 2) return 1; int rc = 0; const char *dst = av[ac - 1];
@@ -457,26 +679,45 @@ static int xargs_append(char *blob, size_t *used, const char *value) {
 
 static int xargs_run(const char *cmd, char **fixed, int fixed_count,
                      char **items, int item_count) {
-  static char blob[XARGS_BLOB], captured[COPY_BUF];
+  static char blob[XARGS_BLOB], captured[COPY_BUF], environment[ENV_LIMIT];
   char path[4096];
+  const char *cwd = getenv("PIODIDE_CWD");
+  if (!cwd) cwd = getenv("PWD");
+  if (!cwd) cwd = "/home/web";
   if (strchr(cmd, '/')) {
     if (*cmd == '/') snprintf(path, sizeof path, "%s", cmd);
-    else snprintf(path, sizeof path, "%s/%s", getenv("PWD") ? getenv("PWD") : "/home/web", cmd);
+    else snprintf(path, sizeof path, "%s/%s", cwd, cmd);
   } else if (!strcmp(cmd, "cc") || !strcmp(cmd, "ld") ||
              !strcmp(cmd, "compile") || !strcmp(cmd, "link")) {
     snprintf(path, sizeof path, "%s", cmd);
   } else {
     snprintf(path, sizeof path, "/bin/%s", cmd);
   }
+  if (path[0] == '/') {
+    struct stat status;
+    if (stat(path, &status) != 0 || !S_ISREG(status.st_mode)) {
+      fprintf(stderr, "xargs: command not found: %s\n", cmd); return 127;
+    }
+  }
   size_t used = 0;
   if (!xargs_append(blob, &used, path)) return 1;
   for (int i = 0; i < fixed_count; i++) if (!xargs_append(blob, &used, fixed[i])) return 1;
   for (int i = 0; i < item_count; i++) if (!xargs_append(blob, &used, items[i])) return 1;
   blob[used] = 0;
+  size_t env_used = 0;
+  for (char **entry = environ; entry && *entry; entry++) {
+    size_t length = strlen(*entry) + 1;
+    if (env_used + length + 1 > sizeof environment) {
+      fprintf(stderr, "xargs: environment exceeds %d bytes\n", ENV_LIMIT); return 2;
+    }
+    memcpy(environment + env_used, *entry, length); env_used += length;
+  }
+  environment[env_used++] = 0;
   int captured_len = 0;
   slop_io io; memset(&io, 0, sizeof io);
   io.capture = captured; io.capture_cap = COPY_BUF; io.capture_len = &captured_len;
-  int rc = piodide_spawn(path, blob, getenv("PWD") ? getenv("PWD") : "/home/web", &io);
+  io.env_data = environment; io.env_len = (int)env_used;
+  int rc = piodide_spawn(path, blob, cwd, &io);
   int shown = captured_len > COPY_BUF ? COPY_BUF : captured_len;
   if (shown > 0) fwrite(captured, 1, (size_t)shown, stdout);
   if (captured_len > COPY_BUF) { fprintf(stderr, "xargs: command output exceeds %d bytes\n", COPY_BUF); return 1; }
@@ -487,6 +728,7 @@ static int cmd_xargs(int ac, char **av) {
   const char *cmd = "echo";
   int n_cmd_args = 0;
   int max_args = 0;
+  int nul = 0, no_run_empty = 0;
   static char *cmd_args[XARGS_MAX];
   int i = 1;
   while (i < ac && av[i][0] == '-') {
@@ -495,6 +737,8 @@ static int cmd_xargs(int ac, char **av) {
       if (max_args <= 0) { fprintf(stderr, "xargs: -n requires a positive number\n"); return 1; }
       i += 2;
     }
+    else if (!strcmp(av[i], "-0") || !strcmp(av[i], "--null")) { nul = 1; i++; }
+    else if (!strcmp(av[i], "-r") || !strcmp(av[i], "--no-run-if-empty")) { no_run_empty = 1; i++; }
     else if (!strcmp(av[i], "--")) { i++; break; }
     else { fprintf(stderr, "xargs: unsupported option: %s\n", av[i]); return 1; }
   }
@@ -515,17 +759,18 @@ static int cmd_xargs(int ac, char **av) {
   }
   buf[total] = 0;
 
-  char *p = buf;
+  char *p = buf, *end = buf + total;
   char *items[XARGS_MAX]; int batch_count = 0, ran = 0, rc = 0;
   int batch_limit = max_args > 0 ? max_args : XARGS_MAX - n_cmd_args - 1;
   if (batch_limit > XARGS_MAX - n_cmd_args - 1) batch_limit = XARGS_MAX - n_cmd_args - 1;
   if (batch_limit < 1) { fprintf(stderr, "xargs: too many fixed command arguments\n"); return 1; }
-  while (*p) {
-    while (*p && isspace((unsigned char)*p)) p++;
-    if (!*p) break;
+  while (p < end) {
+    while (p < end && !nul && isspace((unsigned char)*p)) p++;
+    if (p >= end) break;
     char *start = p;
-    while (*p && !isspace((unsigned char)*p)) p++;
-    if (*p) { *p = 0; p++; }
+    if (nul) while (p < end && *p) p++;
+    else while (p < end && !isspace((unsigned char)*p)) p++;
+    if (p < end) { *p = 0; p++; }
     items[batch_count++] = start;
     if (batch_count >= batch_limit) {
       int status = xargs_run(cmd, cmd_args, n_cmd_args, items, batch_count);
@@ -533,15 +778,46 @@ static int cmd_xargs(int ac, char **av) {
       batch_count = 0; ran = 1;
     }
   }
-  if (batch_count > 0 || !ran) {
+  if (batch_count > 0 || (!ran && !no_run_empty)) {
     int status = xargs_run(cmd, cmd_args, n_cmd_args, items, batch_count);
     if (status) rc = status;
   }
   return rc;
 }
 
+static void print_help(const char *name) {
+  if (!strcmp(name, "rm")) puts("usage: rm [-f] [-r|-R] [--] PATH...");
+  else if (!strcmp(name, "cp")) puts("usage: cp [-a|-r|-R] [-f] [--] SOURCE... DEST");
+  else if (!strcmp(name, "mv")) puts("usage: mv [-f|-n] [--] SOURCE DEST");
+  else if (!strcmp(name, "mkdir")) puts("usage: mkdir [-p] [--] DIRECTORY...");
+  else if (!strcmp(name, "rmdir")) puts("usage: rmdir [--] DIRECTORY...");
+  else if (!strcmp(name, "touch")) puts("usage: touch [-c] [--] FILE...");
+  else if (!strcmp(name, "ln")) puts("usage: ln [-s] [-f] [--] TARGET LINK");
+  else if (!strcmp(name, "head")) puts("usage: head [-n LINES|-c BYTES] [FILE...]");
+  else if (!strcmp(name, "tail")) puts("usage: tail [-n LINES] [FILE]  # +N starts at line N");
+  else if (!strcmp(name, "wc")) puts("usage: wc [-lwc] [FILE]");
+  else if (!strcmp(name, "sort")) puts("usage: sort [-rnu] [FILE]");
+  else if (!strcmp(name, "cut")) puts("usage: cut -d DELIMITER -f FIELD [FILE]");
+  else if (!strcmp(name, "tr")) puts("usage: tr [-d] [-s] SET1 [SET2]");
+  else if (!strcmp(name, "tee")) puts("usage: tee [-a] [FILE...]");
+  else if (!strcmp(name, "basename")) puts("usage: basename PATH [SUFFIX]");
+  else if (!strcmp(name, "dirname")) puts("usage: dirname PATH");
+  else if (!strcmp(name, "seq")) puts("usage: seq [FIRST [STEP]] LAST");
+  else if (!strcmp(name, "cmp")) puts("usage: cmp FILE1 FILE2");
+  else if (!strcmp(name, "install")) puts("usage: install [-d] [-m MODE] SOURCE... DEST");
+  else if (!strcmp(name, "readlink")) puts("usage: readlink LINK");
+  else if (!strcmp(name, "find")) puts("usage: find [PATH...] [-maxdepth N] [-name GLOB] [-type f|d|l] [-print|-print0]");
+  else if (!strcmp(name, "mktemp")) puts("usage: mktemp [-d] [TEMPLATE.XXXXXX]");
+  else if (!strcmp(name, "chmod")) puts("usage: chmod OCTAL_MODE FILE...");
+  else if (!strcmp(name, "uniq")) puts("usage: uniq [-c] [FILE]");
+  else if (!strcmp(name, "xargs")) puts("usage: xargs [-0r] [-n COUNT] [COMMAND [ARGS...]]");
+  else puts("bounded Slop utility");
+}
+
 int main(int argc, char **argv) {
   prog = base(argv[0]);
+  if (argc == 2 && !strcmp(argv[1], "--help")) { print_help(prog); return 0; }
+  if (argc == 2 && !strcmp(argv[1], "--version")) { printf("%s 0.4-piodide\n", prog); return 0; }
   if (!strcmp(prog, "rm")) return cmd_rm(argc, argv);
   if (!strcmp(prog, "cp")) return cmd_cp(argc, argv);
   if (!strcmp(prog, "mv")) return cmd_mv(argc, argv);

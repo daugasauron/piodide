@@ -11,7 +11,6 @@
 #include <ctype.h>
 #include <dirent.h>
 #include <sys/stat.h>
-#include <unistd.h>
 #include <errno.h>
 
 static const char *pattern = "";
@@ -74,10 +73,10 @@ static int walk(const char *path, const char *display, int depth) {
 }
 
 int main(int argc, char **argv) {
-  /* slop passes its cwd as PWD: adopt it so relative paths work. */
-  const char *pwd = getenv("PWD");
-  if (pwd) chdir(pwd);
-
+  if (argc == 2 && !strcmp(argv[1], "--help")) {
+    puts("usage: fd-find [SUBSTRING] [PATH]  # prefer rg --files for agent search"); return 0;
+  }
+  if (argc == 2 && !strcmp(argv[1], "--version")) { puts("fd-find 0.4-piodide"); return 0; }
   const char *root = ".";
   if (argc > 1) pattern = argv[1];
   if (argc > 2) root = argv[2];

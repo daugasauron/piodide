@@ -10,7 +10,6 @@
 #include <string.h>
 #include <dirent.h>
 #include <sys/stat.h>
-#include <unistd.h>
 #include <errno.h>
 
 static int cmpstr(const void *a, const void *b) {
@@ -27,18 +26,21 @@ static void print_entry(const char *name, const struct stat *st, int long_fmt) {
 }
 
 int main(int argc, char **argv) {
-  /* slop passes its cwd as PWD: adopt it so relative paths work. */
-  const char *pwd = getenv("PWD");
-  if (pwd) chdir(pwd);
-
   int long_fmt = 0, all = 0;
   const char *paths[64];
   int npaths = 0;
   for (int i = 1; i < argc; i++) {
+    if (!strcmp(argv[i], "--help")) { puts("usage: ls [-la] [--] [PATH...]"); return 0; }
+    if (!strcmp(argv[i], "--version")) { puts("ls 0.4-piodide"); return 0; }
+    if (!strcmp(argv[i], "--")) {
+      for (i++; i < argc && npaths < 64; i++) paths[npaths++] = argv[i];
+      break;
+    }
     if (argv[i][0] == '-' && argv[i][1] != '\0') {
       for (const char *f = argv[i] + 1; *f; f++) {
         if (*f == 'l') long_fmt = 1;
         else if (*f == 'a') all = 1;
+        else if (*f == '1') { }
         else {
           fprintf(stderr, "ls: unknown option -%c\n", *f);
           return 2;

@@ -5,6 +5,7 @@ import {
   markGitRemoteHead,
   isGitHubRemoteRepository,
   listGitHubRemoteRefs,
+  readGitHubSnapshotInfo,
   readGitRemoteMarker,
   retargetGitHubSnapshotBranch,
   runGitRemoteCommand,
@@ -34,31 +35,59 @@ Local repositories use canonical .git objects, refs, index, and config.
   tag, stash, blame, rev-list, rev-parse, cat-file
   cherry-pick, clean, fsck, gc, config
 
-Browser note: smart HTTP requires a CORS-enabled server. Use
---cors-proxy URL (or git config http.corsProxy URL) when you control a proxy.
-GitHub falls back to a bounded single-branch snapshot without one.
+Run git help <command> for the supported subset. Global -C is supported; -c is
+limited to user.name, user.email, and http.corsProxy.
+
+Smart HTTP requires CORS or a trusted --cors-proxy. Direct GitHub uses a
+bounded snapshot: run git snapshot info for its upstream identity and limits.
 `;
 
 const COMMAND_HELP: Record<string, string> = {
+  init: "usage: git init [-b branch] [directory]  # --bare is unavailable\n",
   clone: "usage: git clone [-b branch] [--depth n] [--single-branch] [--cors-proxy URL] <repository> [directory]\n",
+  status: "usage: git status [--short] [--branch] [--porcelain[=v1]]\n",
+  add: "usage: git add [-A] [--] <paths...>\n",
+  commit: "usage: git commit -m <message> | git commit -F -\n",
+  diff: "usage: git diff [--cached] [revisions...] [-- paths...]\n",
+  log: "usage: git log [--oneline] [-n count] [--all] [--graph] [--stat]\n",
   branch: "usage: git branch [-a|-r|-v] | git branch <name> [start-point] | git branch -m [old] <new> | git branch -d <name>\n",
-  switch: "usage: git switch [-c] <branch>\n",
+  switch: "usage: git switch [-c branch [start-point]] | [--detach] <branch-or-commit>\n",
   checkout: "usage: git checkout [-b branch] [start-point] | git checkout [ref] [--] [paths...]\n",
+  merge: "usage: git merge <branch> | git merge --abort | git merge --continue\n",
+  restore: "usage: git restore [--source ref] [--staged] [--worktree] <paths...>\n",
+  reset: "usage: git reset [--mixed|--soft|--hard] [commit] | git reset [commit] -- <paths...>\n",
+  snapshot: "usage: git snapshot [info] | git snapshot checkout <branch>\n",
   pull: "usage: git pull [--cors-proxy URL] [remote] [branch]\n",
   push: "usage: git push [--cors-proxy URL] [remote] [refspec]\n",
   fetch: "usage: git fetch [--cors-proxy URL] [remote] [branch]\n",
   "ls-remote": "usage: git ls-remote [--cors-proxy URL] [repository] [patterns...]\n",
-  status: "usage: git status [--short] [--branch] [--porcelain[=v1]]\n",
-  restore: "usage: git restore [--source ref] [--staged] [--worktree] <paths...>\n",
   clean: "usage: git clean -n | git clean -f [-d]\n",
   config: "usage: git config [--list] | git config [--get] <name> | git config <name> <value>\n",
   remote: "usage: git remote [-v] | git remote add <name> <url> | git remote remove <name>\n",
+  stash: "usage: git stash [push] | git stash list | git stash pop  # custom messages are unavailable\n",
+  tag: "usage: git tag | git tag [-a] <name> [-m message] [commit]\n",
+  blame: "usage: git blame [revision] -- <path>\n",
+  "rev-list": "usage: git rev-list [--max-count n] <revision>\n",
+  "rev-parse": "usage: git rev-parse <revision> | git rev-parse --show-toplevel|--show-prefix|--git-dir\n",
+  "cat-file": "usage: git cat-file -t|-s|-p <object>\n",
+  "cherry-pick": "usage: git cherry-pick <commit>\n",
+  fsck: "usage: git fsck\n",
+  gc: "usage: git gc\n",
+  "ls-files": "usage: git ls-files [--stage]\n",
 };
 
+type GitCommandContext = HostCommandContext & { gitConfigOverrides?: Record<string, string> };
+
+function configOverrides(context: HostCommandContext): Record<string, string> {
+  return (context as GitCommandContext).gitConfigOverrides ?? {};
+}
+
 function result(exitCode: number, output: string): HostCommandResult {
-  // /bin/git captures this stream and sends it to stdout or stderr according
-  // to the exit code. This keeps shell pipes and redirects working normally.
   return { exitCode, stdout: encoder.encode(output) };
+}
+
+function errorResult(exitCode: number, output: string): HostCommandResult {
+  return { exitCode, stderr: encoder.encode(output) };
 }
 
 function workspacePath(cwd: string, value: string): string {
@@ -71,12 +100,16 @@ function workspacePath(cwd: string, value: string): string {
 
 function identity(context: HostCommandContext) {
   const credentials = context.getGitHubCredentials?.();
-  return credentials
-    ? {
-        name: credentials.name || credentials.login,
-        email: credentials.email || `${credentials.id}+${credentials.login}@users.noreply.github.com`,
-      }
-    : undefined;
+  const fallback = credentials ? {
+    name: credentials.name || credentials.login,
+    email: credentials.email || `${credentials.id}+${credentials.login}@users.noreply.github.com`,
+  } : undefined;
+  const overrides = configOverrides(context);
+  const name = context.env?.GIT_AUTHOR_NAME || context.env?.GIT_COMMITTER_NAME ||
+    overrides["user.name"] || fallback?.name;
+  const email = context.env?.GIT_AUTHOR_EMAIL || context.env?.GIT_COMMITTER_EMAIL ||
+    overrides["user.email"] || fallback?.email;
+  return name && email ? { name, email } : fallback;
 }
 
 async function invoke(
@@ -88,7 +121,11 @@ async function invoke(
 }
 
 function render(value: Libgit2Result): HostCommandResult {
-  return result(value.exitCode, `${value.stdout}${value.stderr}`);
+  return {
+    exitCode: value.exitCode,
+    ...(value.stdout ? { stdout: encoder.encode(value.stdout) } : {}),
+    ...(value.stderr ? { stderr: encoder.encode(value.stderr) } : {}),
+  };
 }
 
 function assertBranchName(name: string): void {
@@ -189,6 +226,10 @@ function configuredCorsProxy(py: Pyodide, root?: string): string | undefined {
     (entry) => entry.key.toLowerCase() === "http.corsproxy",
   ).at(-1)?.value;
   return value?.trim() || undefined;
+}
+
+function contextCorsProxy(context: HostCommandContext, root?: string): string | undefined {
+  return configOverrides(context)["http.corsproxy"] || configuredCorsProxy(context.py, root);
 }
 
 function browserNetworkError(error: unknown, url: string): Error {
@@ -299,16 +340,7 @@ async function runBranch(context: HostCommandContext, args: string[]): Promise<H
     for (const [branch, oid] of looseBranches(context.py, cwd)) branches.set(branch, oid);
     const local = remotesOnly ? [] : [...branches].map(([branch, oid]) => ({ branch, oid, remote: false }));
     const remoteBranches: Array<{ remote: string; branch: string }> = [];
-    if ((all || remotesOnly) && isGitHubRemoteRepository(context.py, cwd)) {
-      remoteBranches.push(...(await listGitHubRemoteRefs(
-          context.py,
-          cwd,
-          context.getGitHubCredentials?.() ?? null,
-          context.signal,
-        )).filter(({ ref }) => ref.startsWith("refs/heads/")).map(
-          ({ ref }) => ({ remote: "origin", branch: ref.slice(11) }),
-        ));
-    } else if (all || remotesOnly) {
+    if ((all || remotesOnly) && !isGitHubRemoteRepository(context.py, cwd)) {
       for (const { remote } of await isomorphicGit.listRemotes({ fs: gitFs(context), dir: cwd })) {
         const names = await isomorphicGit.listBranches({ fs: gitFs(context), dir: cwd, remote }).catch(() => []);
         remoteBranches.push(...names.map((branch) => ({ remote, branch })));
@@ -368,34 +400,10 @@ async function runSwitch(context: HostCommandContext, args: string[]): Promise<H
   const ref = positional[0];
   const localExists = fsExists(context.py, branchRef(root, ref)) || packedBranches(context.py, root).has(ref);
   if (!create && !detach && !localExists && isGitHubRemoteRepository(context.py, root)) {
-    if (!(await isClean(context, root))) throw new Error("commit or discard local changes before switching remote branches");
-    const remoteRefs = await listGitHubRemoteRefs(
-      context.py,
-      root,
-      context.getGitHubCredentials?.() ?? null,
-      context.signal,
+    throw new Error(
+      `branch '${ref}' is not materialized in this GitHub snapshot; ` +
+      `use 'git snapshot checkout ${ref}' to import it explicitly`,
     );
-    if (!remoteRefs.some((entry) => entry.ref === `refs/heads/${ref}`)) {
-      throw new Error(`branch '${ref}' not found`);
-    }
-    await isomorphicGit.branch({ fs: gitFs(context), dir: root, ref, object: "HEAD" });
-    await isomorphicGit.checkout({ fs: gitFs(context), dir: root, ref, track: false });
-    const fetched = await runGitRemoteCommand({
-      ...context,
-      cwd: root,
-      args: ["git-remote", "checkout", ref],
-    });
-    const fetchedText = new TextDecoder().decode(fetched.stdout ?? fetched.stderr ?? new Uint8Array());
-    if (fetched.exitCode !== 0) return result(fetched.exitCode, fetchedText);
-    const added = await invoke(context, ["add", "."], root);
-    if (added.exitCode !== 0) return render(added);
-    const message = readGitRemoteMarker(context.py, root, "remote-message") || `Import remote branch ${ref}`;
-    const committed = await invoke(context, ["commit", "-m", message], root);
-    if (committed.exitCode !== 0) return render(committed);
-    const head = await headId(context, root);
-    markGitRemoteHead(context.py, root, head);
-    await setUpstream(context, root, "origin", ref);
-    return result(0, `Switched to a new branch '${ref}'\n${fetchedText}`);
   }
   await isomorphicGit.checkout({
     fs: gitFs(context),
@@ -404,6 +412,65 @@ async function runSwitch(context: HostCommandContext, args: string[]): Promise<H
     track: !detach,
   });
   return result(0, detach ? `HEAD is now at ${ref}\n` : `Switched to branch '${ref}'\n`);
+}
+
+async function runSnapshot(context: HostCommandContext, args: string[]): Promise<HostCommandResult> {
+  const root = repositoryRoot(context.py, context.cwd);
+  if (!isGitHubRemoteRepository(context.py, root)) {
+    throw new Error("this is a full Git repository, not a GitHub snapshot");
+  }
+  const info = readGitHubSnapshotInfo(context.py, root);
+  if (args.length === 0 || (args.length === 1 && args[0] === "info")) {
+    const localHead = await headId(context, root);
+    return result(0,
+      `mode=github-snapshot\nrepository=${info.repository}\n` +
+      `upstream_branch=${info.upstreamBranch}\nupstream_commit=${info.upstreamCommit}\n` +
+      `local_branch=${currentBranch(context.py, root) || "(detached)"}\n` +
+      `local_commit=${localHead}\nhistory=not-materialized\n`,
+    );
+  }
+  if (args.length !== 2 || args[0] !== "checkout") {
+    throw new Error("usage: git snapshot [info] | git snapshot checkout <branch>");
+  }
+  const branch = args[1];
+  assertBranchName(branch);
+  if (!(await isClean(context, root))) {
+    throw new Error("commit or discard local changes before importing a snapshot branch");
+  }
+  const remoteRefs = await listGitHubRemoteRefs(
+    context.py,
+    root,
+    context.getGitHubCredentials?.() ?? null,
+    context.signal,
+  );
+  if (!remoteRefs.some((entry) => entry.ref === `refs/heads/${branch}`)) {
+    throw new Error(`upstream branch '${branch}' not found`);
+  }
+  const localExists = fsExists(context.py, branchRef(root, branch)) || packedBranches(context.py, root).has(branch);
+  if (localExists) throw new Error(`local branch '${branch}' already exists; use git switch ${branch}`);
+  await isomorphicGit.branch({ fs: gitFs(context), dir: root, ref: branch, object: "HEAD" });
+  await isomorphicGit.checkout({ fs: gitFs(context), dir: root, ref: branch, track: false });
+  const fetched = await runGitRemoteCommand({
+    ...context,
+    cwd: root,
+    args: ["git-remote", "checkout", branch],
+  });
+  const fetchedText = new TextDecoder().decode(fetched.stdout ?? fetched.stderr ?? new Uint8Array());
+  if (fetched.exitCode !== 0) return fetched.stderr
+    ? { exitCode: fetched.exitCode, stderr: fetched.stderr }
+    : errorResult(fetched.exitCode, fetchedText);
+  const added = await invoke(context, ["add", "."], root);
+  if (added.exitCode !== 0) return render(added);
+  const message = readGitRemoteMarker(context.py, root, "remote-message") || `Import snapshot branch ${branch}`;
+  const committed = await invoke(context, ["commit", "-m", message], root);
+  if (committed.exitCode !== 0) return render(committed);
+  const head = await headId(context, root);
+  markGitRemoteHead(context.py, root, head);
+  await setUpstream(context, root, "origin", branch);
+  return result(0,
+    `Imported ${info.repository}@${branch} as synthetic local commit ${head.slice(0, 7)}.\n` +
+    "Upstream history and remote-tracking refs are not materialized.\n" + fetchedText,
+  );
 }
 
 function removePackedBranch(py: Pyodide, cwd: string, branch: string): void {
@@ -518,7 +585,7 @@ async function runClone(context: HostCommandContext, args: string[]): Promise<Ho
     }
     return render(cloned);
   }
-  const proxy = parsed.corsProxy || configuredCorsProxy(context.py);
+  const proxy = parsed.corsProxy || contextCorsProxy(context);
   if (!isGitHubUrl(parsed.project) || proxy) {
     assertSupportedRemote(parsed.project);
     if (!isHttpRemote(parsed.project)) {
@@ -560,7 +627,7 @@ async function runClone(context: HostCommandContext, args: string[]): Promise<Ho
     args: ["git-remote", "clone", parsed.project, parsed.branch || ""],
   });
   const fetchedText = new TextDecoder().decode(fetched.stdout ?? fetched.stderr ?? new Uint8Array());
-  if (fetched.exitCode !== 0) return result(fetched.exitCode, fetchedText);
+  if (fetched.exitCode !== 0) return fetched;
   const added = await invoke(context, ["add", "."], parsed.destination);
   if (added.exitCode !== 0) return render(added);
   const message = readGitRemoteMarker(context.py, parsed.destination, "remote-message") || "Import repository";
@@ -570,8 +637,9 @@ async function runClone(context: HostCommandContext, args: string[]): Promise<Ho
   markGitRemoteHead(context.py, parsed.destination, head);
   return result(
     0,
-    `Cloned ${parsed.project} into ${parsed.destination}\n${fetchedText}` +
-      `Created local commit ${head.slice(0, 7)}\n`,
+    `Snapshot-cloned ${parsed.project} into ${parsed.destination}\n${fetchedText}` +
+      `Created synthetic local commit ${head.slice(0, 7)}. ` +
+      "Upstream history, tags, and remote-tracking refs are not materialized.\n",
   );
 }
 
@@ -605,6 +673,12 @@ function networkArguments(args: string[]): {
 
 async function runFetch(context: HostCommandContext, args: string[]): Promise<HostCommandResult> {
   const cwd = repositoryRoot(context.py, context.cwd);
+  if (isGitHubRemoteRepository(context.py, cwd)) {
+    throw new Error(
+      "git fetch cannot materialize objects in GitHub snapshot mode; " +
+      "use git pull for the tracked snapshot or clone through a trusted CORS proxy for full history",
+    );
+  }
   const parsed = networkArguments(args);
   const remote = parsed.positional[0] || "origin";
   const url = remoteUrl(context.py, cwd, remote);
@@ -618,7 +692,7 @@ async function runFetch(context: HostCommandContext, args: string[]): Promise<Ho
       url,
       remote,
       ref: parsed.positional[1],
-      corsProxy: parsed.corsProxy || configuredCorsProxy(context.py, cwd),
+      corsProxy: parsed.corsProxy || contextCorsProxy(context, cwd),
       prune: parsed.prune,
       pruneTags: parsed.pruneTags,
       credentials: context.getGitHubCredentials?.(),
@@ -651,7 +725,7 @@ async function runPull(context: HostCommandContext, args: string[]): Promise<Hos
           remote,
           ref: branch,
           remoteRef: requestedBranch,
-          corsProxy: parsed.corsProxy || configuredCorsProxy(context.py, cwd),
+          corsProxy: parsed.corsProxy || contextCorsProxy(context, cwd),
           credentials: context.getGitHubCredentials?.(),
           signal: context.signal,
         }, author(context));
@@ -663,16 +737,24 @@ async function runPull(context: HostCommandContext, args: string[]): Promise<Hos
     const fetched = await invoke(context, ["fetch", remote], cwd);
     if (fetched.exitCode !== 0) return render(fetched);
     const merged = await runLibgitCommand(context, cwd, ["merge", `${remote}/${requestedBranch}`]);
-    const mergedOutput = new TextDecoder().decode(merged.stdout ?? merged.stderr ?? new Uint8Array());
-    return result(merged.exitCode, `${fetched.stdout}${fetched.stderr}${mergedOutput}`);
+    return {
+      exitCode: merged.exitCode,
+      stdout: encoder.encode(
+        `${fetched.stdout}${new TextDecoder().decode(merged.stdout ?? new Uint8Array())}`,
+      ),
+      ...(fetched.stderr || merged.stderr ? {
+        stderr: encoder.encode(
+          `${fetched.stderr}${new TextDecoder().decode(merged.stderr ?? new Uint8Array())}`,
+        ),
+      } : {}),
+    };
   }
   if (args.length) throw new Error("the GitHub snapshot pull accepts no remote or branch arguments");
   const head = await headId(context, cwd);
   const pulled = await runGitRemoteCommand({ ...context, cwd, args: ["git-remote", "pull", head] });
   const output = new TextDecoder().decode(pulled.stdout ?? pulled.stderr ?? new Uint8Array());
-  if (pulled.exitCode !== 0 || output.startsWith("Already up to date")) {
-    return result(pulled.exitCode, output);
-  }
+  if (pulled.exitCode !== 0) return pulled;
+  if (output.startsWith("Already up to date")) return result(0, output);
   const added = await invoke(context, ["add", "."], cwd);
   if (added.exitCode !== 0) return render(added);
   const message = readGitRemoteMarker(context.py, cwd, "remote-message") || "Pull remote snapshot";
@@ -706,12 +788,14 @@ async function runPush(context: HostCommandContext, args: string[]): Promise<Hos
         remote,
         ref,
         remoteRef,
-        corsProxy: parsed.corsProxy || configuredCorsProxy(context.py, cwd),
+        corsProxy: parsed.corsProxy || contextCorsProxy(context, cwd),
         credentials: context.getGitHubCredentials?.(),
         signal: context.signal,
       });
       if (pushed.ok && parsed.setUpstream) await setUpstream(context, cwd, remote, remoteRef || ref);
-      return result(0, pushed.ok ? `Pushed ${ref} to ${remote}\n` : `Push rejected by ${remote}\n`);
+      return pushed.ok
+        ? result(0, `Pushed ${ref} to ${remote}\n`)
+        : errorResult(1, `git: push rejected by ${remote}\n`);
     } catch (error) {
       throw browserNetworkError(error, url);
     }
@@ -737,10 +821,7 @@ async function runPush(context: HostCommandContext, args: string[]): Promise<Hos
     args: ["git-remote", "push", head, message],
   });
   if (pushed.exitCode === 0 && parsed.setUpstream) await setUpstream(context, cwd, "origin", remoteRef);
-  return result(
-    pushed.exitCode,
-    new TextDecoder().decode(pushed.stdout ?? pushed.stderr ?? new Uint8Array()),
-  );
+  return pushed;
 }
 
 async function setUpstream(
@@ -781,7 +862,7 @@ async function runLsRemote(context: HostCommandContext, args: string[]): Promise
   const refs = await smartListServerRefs({
     py: context.py,
     url,
-    corsProxy: parsed.corsProxy || configuredCorsProxy(context.py, root),
+    corsProxy: parsed.corsProxy || contextCorsProxy(context, root),
     credentials: context.getGitHubCredentials?.(),
     signal: context.signal,
   }).catch((error) => { throw browserNetworkError(error, url); });
@@ -802,9 +883,13 @@ async function runConfig(context: HostCommandContext, args: string[]): Promise<H
   args = args.filter((arg) => arg !== "--global" && arg !== "--local");
   let root: string | undefined;
   try { root = repositoryRoot(context.py, context.cwd); } catch { /* global config only */ }
-  const entries = global
+  const storedEntries = global
     ? (fsExists(context.py, "/home/web/.gitconfig") ? parseConfig(fsReadText(context.py, "/home/web/.gitconfig")) : [])
     : configEntries(context.py, root);
+  const entries = [
+    ...storedEntries,
+    ...Object.entries(configOverrides(context)).map(([key, value]) => ({ key, value })),
+  ];
   if (args.length === 0 || args[0] === "--list" || args[0] === "-l") {
     return result(0, entries.map(({ key, value }) => `${key}=${value}\n`).join(""));
   }
@@ -852,7 +937,7 @@ async function runRemote(context: HostCommandContext, args: string[]): Promise<H
   }
   if (args[0] === "get-url" && args.length === 2) {
     const url = remoteUrl(context.py, root, args[1]);
-    return url ? result(0, `${url}\n`) : result(2, `error: No such remote '${args[1]}'\n`);
+    return url ? result(0, `${url}\n`) : errorResult(2, `error: No such remote '${args[1]}'\n`);
   }
   if (args[0] === "add" && args.length === 3) {
     await isomorphicGit.addRemote({ fs, dir: root, remote: args[1], url: args[2] });
@@ -902,6 +987,103 @@ async function runRestore(context: HostCommandContext, args: string[]): Promise<
     });
   }
   return result(0, "");
+}
+
+type ResetMode = "mixed" | "soft" | "hard";
+
+async function resetIndexPaths(
+  context: HostCommandContext,
+  root: string,
+  ref: string,
+  paths?: string[],
+): Promise<void> {
+  const fs = gitFs(context);
+  const filepaths = paths ?? [...new Set([
+    ...await isomorphicGit.listFiles({ fs, dir: root }),
+    ...await isomorphicGit.listFiles({ fs, dir: root, ref }),
+  ])];
+  for (const filepath of filepaths) {
+    await isomorphicGit.resetIndex({ fs, dir: root, filepath, ref });
+  }
+}
+
+function clearMergeState(py: Pyodide, root: string): void {
+  for (const name of ["MERGE_HEAD", "MERGE_MODE", "MERGE_MSG"]) {
+    const path = `${root}/.git/${name}`;
+    if (fsExists(py, path)) py.FS.unlink(path);
+  }
+}
+
+async function moveHead(context: HostCommandContext, root: string, oid: string): Promise<void> {
+  const branch = currentBranch(context.py, root);
+  await isomorphicGit.writeRef({
+    fs: gitFs(context),
+    dir: root,
+    ref: branch ? `refs/heads/${branch}` : "HEAD",
+    value: oid,
+    force: true,
+  });
+}
+
+async function runReset(context: HostCommandContext, args: string[]): Promise<HostCommandResult> {
+  const root = repositoryRoot(context.py, context.cwd);
+  let mode: ResetMode = "mixed";
+  let separator = -1;
+  const positional: string[] = [];
+  for (let index = 0; index < args.length; index++) {
+    const value = args[index];
+    if (value === "--") {
+      separator = index;
+      positional.push(...args.slice(index + 1));
+      break;
+    }
+    if (value === "--mixed" || value === "--soft" || value === "--hard") {
+      mode = value.slice(2) as ResetMode;
+    } else if (value.startsWith("-")) {
+      throw new Error(`unsupported reset option: ${value}`);
+    } else positional.push(value);
+  }
+
+  let ref = "HEAD";
+  let paths: string[] = [];
+  if (separator >= 0) {
+    const before = args.slice(0, separator).filter((value) => !value.startsWith("--"));
+    if (before.length > 1) throw new Error("reset accepts at most one revision before --");
+    ref = before[0] || "HEAD";
+    paths = args.slice(separator + 1);
+  } else if (positional.length > 0) {
+    ref = positional[0];
+    paths = positional.slice(1);
+  }
+  if (paths.length && mode !== "mixed") {
+    throw new Error(`reset --${mode} does not accept paths`);
+  }
+
+  const fs = gitFs(context);
+  let oid: string;
+  try {
+    oid = await isomorphicGit.resolveRef({ fs, dir: root, ref });
+  } catch {
+    throw new Error(`unknown revision: ${ref}`);
+  }
+  if (paths.length) {
+    await resetIndexPaths(
+      context,
+      root,
+      oid,
+      paths.map((path) => pathFromRepository(root, context.cwd, path)),
+    );
+    return result(0, "");
+  }
+
+  if (mode === "hard") {
+    await isomorphicGit.checkout({ fs, dir: root, ref: oid, noUpdateHead: true, force: true });
+  } else if (mode === "mixed") {
+    await resetIndexPaths(context, root, oid);
+  }
+  await moveHead(context, root, oid);
+  clearMergeState(context.py, root);
+  return result(0, mode === "hard" ? `HEAD is now at ${oid.slice(0, 7)}\n` : "");
 }
 
 async function runClean(context: HostCommandContext, args: string[]): Promise<HostCommandResult> {
@@ -955,7 +1137,7 @@ async function runCherryPick(context: HostCommandContext, args: string[]): Promi
     });
     return result(0, `[${currentBranch(context.py, root) || "detached"} ${created.slice(0, 7)}] cherry-pick\n`);
   } catch (error) {
-    return result(1, `git: ${error instanceof Error ? error.message : String(error)}\n`);
+    return errorResult(1, `git: ${error instanceof Error ? error.message : String(error)}\n`);
   }
 }
 
@@ -1024,7 +1206,7 @@ async function runFsck(context: HostCommandContext): Promise<HostCommandResult> 
       failures.push(`${oid}: ${error instanceof Error ? error.message : String(error)}`);
     }
   }
-  if (failures.length) return result(1, failures.map((line) => `error: ${line}\n`).join(""));
+  if (failures.length) return errorResult(1, failures.map((line) => `error: ${line}\n`).join(""));
   return result(0, `Checked ${seen.size} reachable object(s); no errors.\n`);
 }
 
@@ -1190,39 +1372,78 @@ function normalizeStatus(py: Pyodide, root: string, args: string[], output: stri
   return normalized;
 }
 
+function rejectVirtualSnapshotRefs(context: HostCommandContext, command: string, args: string[]): void {
+  if (!new Set([
+    "branch", "checkout", "diff", "log", "blame", "rev-list", "rev-parse", "cat-file", "merge",
+    "restore", "reset", "cherry-pick",
+  ]).has(command)) return;
+  if (!isGitHubRemoteRepository(context.py, repositoryRoot(context.py, context.cwd))) return;
+  const separator = args.indexOf("--");
+  const revisions = separator < 0 ? args : args.slice(0, separator);
+  const remoteRef = revisions.find((value) =>
+    /^(?:refs\/remotes\/origin\/|remotes\/origin\/|origin\/)/.test(value),
+  );
+  if (remoteRef) {
+    throw new Error(
+      `remote ref '${remoteRef}' is not materialized in GitHub snapshot mode; ` +
+      "use git ls-remote to inspect upstream IDs or clone through a trusted CORS proxy for full history",
+    );
+  }
+}
+
 async function runLibgitCommand(
   context: HostCommandContext,
   cwd: string,
   args: string[],
 ): Promise<HostCommandResult> {
   const value = await invoke(context, translate(context.py, cwd, args), cwd);
-  let output = `${value.stdout}${value.stderr}`;
+  let stdout = value.stdout;
+  let stderr = value.stderr;
   if (args[0] === "status") {
-    output = normalizeStatus(context.py, repositoryRoot(context.py, cwd), args, output);
+    stdout = normalizeStatus(context.py, repositoryRoot(context.py, cwd), args, stdout);
   }
   if (args[0] === "checkout" || args[0] === "switch") {
-    output = output.replace(/^Branch '.*' set up to track remote branch 'origin\/.*'\.?\n?/gm, "");
+    stdout = stdout.replace(/^Branch '.*' set up to track remote branch 'origin\/.*'\.?\n?/gm, "");
   }
   let exitCode = value.exitCode;
   if (args[0] === "merge") {
     const root = repositoryRoot(context.py, cwd);
-    if (fsExists(context.py, `${root}/.git/MERGE_HEAD`) || /^conflict:/m.test(output)) exitCode = 1;
+    if (fsExists(context.py, `${root}/.git/MERGE_HEAD`) || /^conflict:/m.test(`${stdout}${stderr}`)) {
+      exitCode = 1;
+    }
   }
-  return result(exitCode, output);
+  return {
+    exitCode,
+    ...(stdout ? { stdout: encoder.encode(stdout) } : {}),
+    ...(stderr ? { stderr: encoder.encode(stderr) } : {}),
+  };
 }
 
 export async function runGitEngineCommand(context: HostCommandContext): Promise<HostCommandResult> {
   try {
     let cwd = context.cwd;
     const args = context.args.slice(1);
-    if (args[0] === "-C") {
-      if (!args[1]) throw new Error("-C requires a directory");
-      cwd = workspacePath(cwd, args[1]);
+    const overrides: Record<string, string> = {};
+    while (args[0] === "-C" || args[0] === "-c") {
+      const option = args[0];
+      const value = args[1];
+      if (!value) throw new Error(`${option} requires a value`);
+      if (option === "-C") {
+        cwd = workspacePath(cwd, value);
+      } else {
+        const equals = value.indexOf("=");
+        if (equals <= 0) throw new Error("-c requires name=value");
+        const key = value.slice(0, equals).toLowerCase();
+        if (!["user.name", "user.email", "http.corsproxy"].includes(key)) {
+          throw new Error(`unsupported -c setting: ${value.slice(0, equals)}`);
+        }
+        overrides[key] = value.slice(equals + 1);
+      }
       args.splice(0, 2);
     }
-    const scoped = { ...context, cwd };
+    const scoped: GitCommandContext = { ...context, cwd, gitConfigOverrides: overrides };
     const command = args[0];
-    if (!command) return result(1, HELP);
+    if (!command) return errorResult(1, HELP);
     if (command === "help" || command === "-h" || command === "--help") {
       const topic = command === "help" ? args[1] : undefined;
       return result(0, topic ? (COMMAND_HELP[topic] || `usage: git ${topic} [options]\n`) : HELP);
@@ -1233,23 +1454,26 @@ export async function runGitEngineCommand(context: HostCommandContext): Promise<
     if (command === "--version" || command === "version") {
       return result(0, "git version 2.0.0-piodide (libgit2 + isomorphic-git)\n");
     }
-    if (command === "branch") return runBranch(scoped, args.slice(1));
-    if (command === "switch") return runSwitch(scoped, args.slice(1));
-    if (command === "clone") return runClone(scoped, args.slice(1));
-    if (command === "fetch") return runFetch(scoped, args.slice(1));
-    if (command === "pull") return runPull(scoped, args.slice(1));
-    if (command === "push") return runPush(scoped, args.slice(1));
-    if (command === "ls-remote") return runLsRemote(scoped, args.slice(1));
-    if (command === "config") return runConfig(scoped, args.slice(1));
-    if (command === "remote") return runRemote(scoped, args.slice(1));
-    if (command === "restore") return runRestore(scoped, args.slice(1));
-    if (command === "clean") return runClean(scoped, args.slice(1));
-    if (command === "cherry-pick") return runCherryPick(scoped, args.slice(1));
-    if (command === "gc") return runGc(scoped);
-    if (command === "fsck") return runFsck(scoped);
-    if (command === "ls-files") return runLsFiles(scoped, args.slice(1));
-    if (command === "log") return runLog(scoped, args.slice(1));
-    if (command === "merge") return runMerge(scoped, args.slice(1));
+    rejectVirtualSnapshotRefs(scoped, command, args.slice(1));
+    if (command === "branch") return await runBranch(scoped, args.slice(1));
+    if (command === "switch") return await runSwitch(scoped, args.slice(1));
+    if (command === "snapshot") return await runSnapshot(scoped, args.slice(1));
+    if (command === "clone") return await runClone(scoped, args.slice(1));
+    if (command === "fetch") return await runFetch(scoped, args.slice(1));
+    if (command === "pull") return await runPull(scoped, args.slice(1));
+    if (command === "push") return await runPush(scoped, args.slice(1));
+    if (command === "ls-remote") return await runLsRemote(scoped, args.slice(1));
+    if (command === "config") return await runConfig(scoped, args.slice(1));
+    if (command === "remote") return await runRemote(scoped, args.slice(1));
+    if (command === "restore") return await runRestore(scoped, args.slice(1));
+    if (command === "reset") return await runReset(scoped, args.slice(1));
+    if (command === "clean") return await runClean(scoped, args.slice(1));
+    if (command === "cherry-pick") return await runCherryPick(scoped, args.slice(1));
+    if (command === "gc") return await runGc(scoped);
+    if (command === "fsck") return await runFsck(scoped);
+    if (command === "ls-files") return await runLsFiles(scoped, args.slice(1));
+    if (command === "log") return await runLog(scoped, args.slice(1));
+    if (command === "merge") return await runMerge(scoped, args.slice(1));
     if (command === "init") {
       let branch: string | undefined;
       const target: string[] = [];
@@ -1272,10 +1496,58 @@ export async function runGitEngineCommand(context: HostCommandContext): Promise<
       return render(initialized);
     }
     if (command === "commit") {
-      const committed = await invoke(scoped, args, cwd);
-      if (committed.exitCode !== 0) return render(committed);
+      const commitArgs = [...args];
+      const fileIndex = commitArgs.findIndex((value) => value === "-F" || value === "--file");
+      if (fileIndex >= 0 && commitArgs[fileIndex + 1] === "-") {
+        if (scoped.stdin === undefined) throw new Error("commit -F - requires piped stdin");
+        const message = new TextDecoder().decode(scoped.stdin).replace(/\0/g, "").trimEnd();
+        if (!message) throw new Error("empty commit message from stdin");
+        commitArgs.splice(fileIndex, 2, "-m", message);
+      }
+      const explicitIdentity = Boolean(
+        scoped.env?.GIT_AUTHOR_NAME || scoped.env?.GIT_AUTHOR_EMAIL ||
+        scoped.env?.GIT_COMMITTER_NAME || scoped.env?.GIT_COMMITTER_EMAIL ||
+        overrides["user.name"] || overrides["user.email"],
+      );
+      let committed: Libgit2Result | null = null;
+      if (explicitIdentity) {
+        const messages: string[] = [];
+        for (let index = 1; index < commitArgs.length; index++) {
+          const value = commitArgs[index];
+          if (value === "-m" || value === "--message") {
+            const message = commitArgs[++index];
+            if (message === undefined) throw new Error(`${value} requires a message`);
+            messages.push(message);
+          } else if (value.startsWith("--message=")) messages.push(value.slice(10));
+          else throw new Error(`explicit Git identity currently supports commit -m or commit -F -; unsupported option: ${value}`);
+        }
+        if (!messages.length) throw new Error("commit requires -m or -F -");
+        const root = repositoryRoot(context.py, cwd);
+        const fallback = identity(scoped) || { name: "Piodide", email: "piodide@browser.local" };
+        const configuredName = configValue(context.py, root, "user.name") || fallback.name;
+        const configuredEmail = configValue(context.py, root, "user.email") || fallback.email;
+        const authorIdentity = {
+          name: scoped.env?.GIT_AUTHOR_NAME || overrides["user.name"] || configuredName,
+          email: scoped.env?.GIT_AUTHOR_EMAIL || overrides["user.email"] || configuredEmail,
+        };
+        const committerIdentity = {
+          name: scoped.env?.GIT_COMMITTER_NAME || overrides["user.name"] || configuredName,
+          email: scoped.env?.GIT_COMMITTER_EMAIL || overrides["user.email"] || configuredEmail,
+        };
+        await isomorphicGit.commit({
+          fs: gitFs(scoped),
+          dir: root,
+          message: messages.join("\n\n"),
+          author: authorIdentity,
+          committer: committerIdentity,
+          disallowEmpty: true,
+        });
+      } else {
+        committed = await invoke(scoped, commitArgs, cwd);
+        if (committed.exitCode !== 0) return render(committed);
+      }
       const summary = await invoke(scoped, ["log", "--oneline", "-n", "1"], cwd);
-      return result(0, summary.exitCode === 0 ? summary.stdout : committed.stdout);
+      return result(0, summary.exitCode === 0 ? summary.stdout : (committed?.stdout ?? ""));
     }
     if (command === "rev-parse" && args.length === 2) {
       const root = repositoryRoot(context.py, cwd);
@@ -1291,25 +1563,8 @@ export async function runGitEngineCommand(context: HostCommandContext): Promise<
       const root = repositoryRoot(context.py, cwd);
       if (args[2] === "HEAD") return result(0, `${currentBranch(context.py, root) || "HEAD"}\n`);
     }
-    if (command === "reset") {
-      const separator = args.indexOf("--");
-      const pathStart = separator >= 0 ? separator + 1 : (args.length > 2 ? 2 : -1);
-      if (pathStart >= 0 && args.length > pathStart) {
-        const root = repositoryRoot(context.py, cwd);
-        const ref = separator >= 0 ? (args[1] === "--" ? "HEAD" : args[1]) : args[1];
-        for (const path of args.slice(pathStart)) {
-          await isomorphicGit.resetIndex({
-            fs: gitFs(context),
-            dir: root,
-            filepath: pathFromRepository(root, cwd, path),
-            ref,
-          });
-        }
-        return result(0, "");
-      }
-    }
-    return runLibgitCommand(scoped, cwd, args);
+    return await runLibgitCommand(scoped, cwd, args);
   } catch (error) {
-    return result(1, `git: ${error instanceof Error ? error.message : String(error)}\n`);
+    return errorResult(1, `git: ${error instanceof Error ? error.message : String(error)}\n`);
   }
 }

@@ -131,7 +131,35 @@ test("native Git remote bridge clones and pushes GitHub snapshots", { timeout: 1
       cwd: root,
       args: ["git-engine", "branch", "-r"],
     });
-    assert.match(new TextDecoder().decode(remoteBranches.stdout), /origin\/feature/);
+    assert.equal(new TextDecoder().decode(remoteBranches.stdout), "");
+    const snapshotInfo = await runGitEngineCommand({
+      py,
+      cwd: root,
+      args: ["git-engine", "snapshot", "info"],
+    });
+    assert.match(new TextDecoder().decode(snapshotInfo.stdout), /mode=github-snapshot/);
+    assert.match(new TextDecoder().decode(snapshotInfo.stdout), /upstream_commit=remote0/);
+    const virtualRef = await runGitEngineCommand({
+      py,
+      cwd: root,
+      args: ["git-engine", "rev-parse", "origin/feature"],
+    });
+    assert.equal(virtualRef.exitCode, 1);
+    assert.match(new TextDecoder().decode(virtualRef.stderr), /not materialized/);
+    const implicitSwitch = await runGitEngineCommand({
+      py,
+      cwd: root,
+      args: ["git-engine", "switch", "feature"],
+    });
+    assert.equal(implicitSwitch.exitCode, 1);
+    assert.match(new TextDecoder().decode(implicitSwitch.stderr), /git snapshot checkout feature/);
+    const fetchSnapshot = await runGitEngineCommand({
+      py,
+      cwd: root,
+      args: ["git-engine", "fetch"],
+    });
+    assert.equal(fetchSnapshot.exitCode, 1);
+    assert.match(new TextDecoder().decode(fetchSnapshot.stderr), /cannot materialize objects/);
     const remoteRefs = await runGitEngineCommand({
       py,
       cwd: root,

@@ -241,7 +241,11 @@ function startInWorker(
       const child = startWasiProgram(py, {
         executablePath: path,
         args: args.slice(1),
-        env: { PATH: "/bin", PWD: cwd, ...(request.env ?? {}), ...(env ?? {}) },
+        env: {
+          PATH: "/bin", PWD: cwd, ...(request.env ?? {}), ...(env ?? {}),
+          PIODIDE_CWD: cwd,
+          ...(stdinText !== undefined ? { PIODIDE_STDIN: "1" } : {}),
+        },
         preopens: [{ name: ".", path: cwd }, "/home/web", "/", "/bin"],
         timeoutMs: request.timeoutMs ?? DEFAULT_TIMEOUT_MS,
         spawnDepth: spawnDepth + 1,

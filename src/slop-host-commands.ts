@@ -16,6 +16,8 @@ export interface HostCommandContext {
   args: string[];
   cwd: string;
   stdin?: Uint8Array;
+  /** Bounded exported environment supplied by the spawning shell. */
+  env?: Record<string, string>;
   /** Interactive host commands can pull until this returns null (Ctrl+D). */
   readStdin?: () => Promise<Uint8Array | null> | Uint8Array | null;
   signal?: AbortSignal;
@@ -117,10 +119,16 @@ Browser-native HTTP client backed by Fetch; this is not libcurl.
   -m, --max-time SECONDS     whole-request timeout; 0 disables
   -w, --write-out FORMAT     print selected response metadata
 
+Write-out variables: http_code, response_code, content_type, size_download,
+url_effective, time_total, exitcode, errormsg, filename_effective, method,
+scheme, urlnum, and %header{name}. Unknown variables warn without changing the
+transfer's exit code.
+
 Only one HTTP(S) URL is supported. Cross-origin responses require CORS.
 Redirects are followed only with -L; cross-origin redirect details are hidden
 without it. TLS, cookies, proxies, HTTP versions, User-Agent, and forbidden
-headers are browser-controlled. Request and response bodies are capped at 32 MiB.
+headers are browser-controlled. HTTP/? is a synthetic status line because
+Fetch hides the HTTP version. Request and response bodies are capped at 32 MiB.
 `;
 
 function optionValue(args: string[], index: number, option: string): [string, number] {

@@ -20,7 +20,10 @@ const shellBinDir = join(root, "shell", "bin");
 const publicBinDir = join(root, "public", "slop", "bin");
 const assetsDir = join(root, "test", "toolchain-assets");
 const check = process.argv.includes("--check");
-const programs = ["slop", "make", "coreutils", "sed", "ar", "git"] as const;
+const programs = [
+  "slop", "make", "coreutils", "sed", "ar", "git",
+  "ls", "cat", "fd-find", "echo", "env", "grep",
+] as const;
 const spawnPrograms = new Set(["slop", "make", "coreutils", "git"]);
 
 function bytes(path: string): ArrayBuffer {

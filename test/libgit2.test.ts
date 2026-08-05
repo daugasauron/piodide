@@ -250,6 +250,42 @@ test("Git audit regressions and browser smart HTTP are compatible and script-saf
     assert.match((await gitResult(py, "/home/web/smart", "gc")).output, /Packed/);
     assert.equal((await gitResult(py, "/home/web/smart", "rev-parse", "--abbrev-ref", "HEAD")).output, "main\n");
 
+    py.FS.writeFile("/home/web/smart/reset.txt", "base\n");
+    await git(py, "/home/web/smart", "add", "reset.txt");
+    await git(py, "/home/web/smart", "commit", "-m", "reset base");
+    py.FS.writeFile("/home/web/smart/reset.txt", "staged\n");
+    await git(py, "/home/web/smart", "add", "reset.txt");
+    assert.equal((await gitResult(py, "/home/web/smart", "reset")).exitCode, 0);
+    assert.match((await gitResult(py, "/home/web/smart", "status", "--short")).output, /^ M reset\.txt$/m);
+    assert.equal((await gitResult(py, "/home/web/smart", "reset", "--hard", "HEAD")).exitCode, 0);
+    assert.equal(py.FS.readFile("/home/web/smart/reset.txt", { encoding: "utf8" }), "base\n");
+    const badReset = await gitResult(py, "/home/web/smart", "reset", "missing-revision");
+    assert.notEqual(badReset.exitCode, 0);
+    assert.match(badReset.output, /unknown revision/);
+
+    py.FS.writeFile("/home/web/smart/stdin-message.txt", "stdin\n");
+    await git(py, "/home/web/smart", "add", "stdin-message.txt");
+    await git(py, "/home/web/smart", "config", "user.name", "Configured Identity");
+    await git(py, "/home/web/smart", "config", "user.email", "configured@example.com");
+    const stdinCommit = await runGitEngineCommand({
+      py,
+      cwd: "/home/web/smart",
+      args: ["git-engine", "commit", "-F", "-"],
+      stdin: new TextEncoder().encode("message from stdin\n"),
+      env: { GIT_AUTHOR_NAME: "Environment Author", GIT_AUTHOR_EMAIL: "env@example.com" },
+    });
+    assert.equal(stdinCommit.exitCode, 0, new TextDecoder().decode(stdinCommit.stderr));
+    assert.match((await gitResult(py, "/home/web/smart", "log", "-n", "1")).output, /Environment Author/);
+
+    py.FS.writeFile("/home/web/smart/scoped.txt", "scoped\n");
+    await git(py, "/home/web/smart", "add", "scoped.txt");
+    await git(
+      py, "/home/web/smart",
+      "-c", "user.name=Scoped Author", "-c", "user.email=scoped@example.com",
+      "commit", "-m", "scoped identity",
+    );
+    assert.match((await gitResult(py, "/home/web/smart", "log", "-n", "1")).output, /Scoped Author/);
+
     py.FS.writeFile("/home/web/smart/pushed.txt", "from browser\n");
     await git(py, "/home/web/smart", "add", ".");
     await git(py, "/home/web/smart", "commit", "-m", "browser smart push");

@@ -49,6 +49,7 @@ static const char *positional(int index);
 #define LOOP_LIMIT 10000
 #define ENV_CAP 65536
 #define MAX_FUNCS 64
+#define MAX_FUNCTION_DEPTH 32
 
 typedef struct { char *s; size_t len, cap; } Buf;
 typedef struct { char *text; int quoted; } Token;
@@ -76,14 +77,16 @@ static const char *shell_name = "slop";
 static int exit_requested;
 static int exit_status;
 static int flow_signal;
-static int option_errexit, option_xtrace;
+static int option_errexit, option_xtrace, option_nounset, option_pipefail;
 static int suppress_errexit;
+static int substitution_status;
 static int capture_active, capture_length;
 static char *capture_buffer;
 static char parse_error[256];
 static char *pipe_a, *pipe_b, *redirect_input, *spawn_env;
 static Function functions[MAX_FUNCS];
 static int func_count, function_depth;
+static AssignmentScope function_locals[MAX_FUNCTION_DEPTH];
 
 static int execute_script(char *text);
 static int execute_command_list(char *line);
@@ -234,6 +237,8 @@ static void expand_parameter(Buf *out, const char **pp, int depth) {
   } else if (isdigit((unsigned char)*p)) {
     int n = 0; while (isdigit((unsigned char)*p)) n = n * 10 + (*p++ - '0');
     value = positional(n);
+    if (option_nounset && n > shell_argc)
+      snprintf(parse_error, sizeof parse_error, "%d: unbound positional parameter", n);
   } else if (*p == '{') {
     p++;
     const char *start = p;
@@ -255,6 +260,8 @@ static void expand_parameter(Buf *out, const char **pp, int depth) {
     int set = getenv(name) != NULL;
     if (name[0] && isdigit((unsigned char)name[0])) set = atoi(name) <= shell_argc;
     int missing = !set || (colon && !*value);
+    if (!op && !set && option_nounset)
+      snprintf(parse_error, sizeof parse_error, "%s: unbound variable", name);
     int use_alt = (op == '-' && missing) || (op == '+' && !missing);
     if (op == '=' && missing) {
       char *alt = xmalloc(alt_len + 1); memcpy(alt, alt_start, alt_len); alt[alt_len] = 0;
@@ -280,6 +287,8 @@ static void expand_parameter(Buf *out, const char **pp, int depth) {
       p++;
     }
     name[n] = 0; const char *v = getenv(name); value = v ? v : "";
+    if (!v && option_nounset)
+      snprintf(parse_error, sizeof parse_error, "%s: unbound variable", name);
   } else {
     bputc(out, '$'); *pp = p; return;
   }
@@ -839,7 +848,7 @@ static int parse_list(char *line, ListItem *items) {
 static int builtin_name(const char *s) {
   static const char *names[] = {"cd","pwd","help","echo","printf",":","true","false",
     "export","readonly","unset","set","test","[","shift","read","type","command","eval",
-    ".","source","break","continue","umask","return",NULL};
+    ".","source","break","continue","umask","return","which","local",NULL};
   for (int i = 0; names[i]; i++) if (!strcmp(s, names[i])) return 1;
   return 0;
 }
@@ -901,19 +910,27 @@ static void print_escaped(FILE *out, const char *s) {
 static int printf_builtin(char **v, int n, FILE *out) {
   if (!n) return 0;
   const char *f = v[0]; int ai = 1;
-  for (size_t i = 0; f[i]; i++) {
-    if (f[i] == '\\') {
-      char pair[3] = {'\\', f[i + 1], 0}; print_escaped(out, pair); if (f[i + 1]) i++;
-    } else if (f[i] == '%' && f[i + 1]) {
-      char spec = f[++i];
-      if (spec == '%') fputc('%', out);
-      else if (spec == 's') fputs(ai < n ? v[ai++] : "", out);
-      else if (spec == 'd' || spec == 'i') fprintf(out, "%ld", ai < n ? strtol(v[ai++], NULL, 0) : 0L);
-      else if (spec == 'x') fprintf(out, "%lx", ai < n ? strtol(v[ai++], NULL, 0) : 0L);
-      else if (spec == 'o') fprintf(out, "%lo", ai < n ? strtol(v[ai++], NULL, 0) : 0L);
-      else if (spec == 'c') fputc(ai < n ? v[ai++][0] : ' ', out);
-      else { fputc('%', out); fputc(spec, out); }
-    } else fputc(f[i], out);
+  for (;;) {
+    int before = ai;
+    for (size_t i = 0; f[i]; i++) {
+      if (f[i] == '\\') {
+        char pair[3] = {'\\', f[i + 1], 0}; print_escaped(out, pair); if (f[i + 1]) i++;
+      } else if (f[i] == '%' && f[i + 1]) {
+        char spec = f[++i];
+        if (spec == '%') fputc('%', out);
+        else if (spec == 's') fputs(ai < n ? v[ai++] : "", out);
+        else if (spec == 'd' || spec == 'i') fprintf(out, "%ld", ai < n ? strtol(v[ai++], NULL, 0) : 0L);
+        else if (spec == 'u') fprintf(out, "%lu", ai < n ? strtoul(v[ai++], NULL, 0) : 0UL);
+        else if (spec == 'x' || spec == 'X') {
+          unsigned long value = ai < n ? strtoul(v[ai++], NULL, 0) : 0UL;
+          fprintf(out, spec == 'x' ? "%lx" : "%lX", value);
+        }
+        else if (spec == 'o') fprintf(out, "%lo", ai < n ? strtoul(v[ai++], NULL, 0) : 0UL);
+        else if (spec == 'c') fputc(ai < n ? v[ai++][0] : 0, out);
+        else { fputc('%', out); fputc(spec, out); }
+      } else fputc(f[i], out);
+    }
+    if (ai == before || ai >= n) break;
   }
   return 0;
 }
@@ -937,7 +954,9 @@ static void print_help(FILE *out) {
         "        lists: && || ;\n"
         "blocks: if/then/elif/else/fi, for/in/do/done, while/do/done, case/esac\n"
         "functions: name() { ... }\n"
-        "builtins: cd pwd echo printf export unset test [ shift read type source true false\n", out);
+        "options: set -e, set -u, set -x, set -o pipefail (combined -euo works)\n"
+        "builtins: cd pwd echo printf export local unset test [ shift read type which source true false\n"
+        "search: rg PATTERN [PATH...] or rg --files; use python for JSON, tables, and archives\n", out);
 }
 
 static int run_builtin(Command *c, FILE *out, FILE *err, const char *input, int input_len) {
@@ -947,9 +966,16 @@ static int run_builtin(Command *c, FILE *out, FILE *err, const char *input, int 
   if (!strcmp(name, "pwd")) { fprintf(out, "%s\n", cwd); return 0; }
   if (!strcmp(name, "help")) { print_help(out); return 0; }
   if (!strcmp(name, "cd")) {
-    const char *dest = n > 1 ? a[1] : getenv("HOME"); char path[PATH_CAP];
+    int index = n > 1 && !strcmp(a[1], "--") ? 2 : 1;
+    if (n > index + 1) { fprintf(err, "slop: cd: too many arguments\n"); return 2; }
+    int previous = n > index && !strcmp(a[index], "-");
+    const char *dest = n > index ? (previous ? getenv("OLDPWD") : a[index]) : getenv("HOME");
+    char path[PATH_CAP];
     if (!dest || !resolve_path(dest, path) || !is_dir(path)) { fprintf(err, "slop: cd: %s: no such directory\n", dest ? dest : ""); return 1; }
-    snprintf(cwd, sizeof cwd, "%s", path); setenv("PWD", cwd, 1); return 0;
+    char old[PATH_CAP]; snprintf(old, sizeof old, "%s", cwd);
+    snprintf(cwd, sizeof cwd, "%s", path); setenv("OLDPWD", old, 1); setenv("PWD", cwd, 1);
+    if (previous) fprintf(out, "%s\n", cwd);
+    return 0;
   }
   if (!strcmp(name, "echo")) {
     int i = 1, newline = 1;
@@ -960,12 +986,26 @@ static int run_builtin(Command *c, FILE *out, FILE *err, const char *input, int 
   if (!strcmp(name, "printf")) return printf_builtin(a + 1, n - 1, out);
   if (!strcmp(name, "set")) {
     for (int i = 1; i < n; i++) {
-      if (!strcmp(a[i], "-e")) option_errexit = 1;
-      else if (!strcmp(a[i], "+e")) option_errexit = 0;
-      else if (!strcmp(a[i], "-x")) option_xtrace = 1;
-      else if (!strcmp(a[i], "+x")) option_xtrace = 0;
-      else if (!strcmp(a[i], "-u") || !strcmp(a[i], "+u")) { }
-      else if (!strcmp(a[i], "--")) break;
+      if (!strcmp(a[i], "--")) break;
+      else if ((!strcmp(a[i], "-o") || !strcmp(a[i], "+o")) && i + 1 < n) {
+        int enabled = a[i][0] == '-';
+        if (strcmp(a[++i], "pipefail")) { fprintf(err, "slop: set: unsupported option: %s\n", a[i]); return 2; }
+        option_pipefail = enabled;
+      }
+      else if ((a[i][0] == '-' || a[i][0] == '+') && a[i][1]) {
+        int enabled = a[i][0] == '-';
+        for (const char *flag = a[i] + 1; *flag; flag++) {
+          if (*flag == 'e') option_errexit = enabled;
+          else if (*flag == 'u') option_nounset = enabled;
+          else if (*flag == 'x') option_xtrace = enabled;
+          else if (*flag == 'o') {
+            if (flag[1] || i + 1 >= n || strcmp(a[i + 1], "pipefail")) {
+              fprintf(err, "slop: set: -o requires supported option 'pipefail'\n"); return 2;
+            }
+            option_pipefail = enabled; i++;
+          } else { fprintf(err, "slop: set: unsupported flag: %c\n", *flag); return 2; }
+        }
+      }
       else { fprintf(err, "slop: set: unsupported option: %s\n", a[i]); return 2; }
     }
     return 0;
@@ -983,6 +1023,31 @@ static int run_builtin(Command *c, FILE *out, FILE *err, const char *input, int 
   if (!strcmp(name, "unset")) {
     for (int i = 1; i < n; i++)
       if (valid_name_n(a[i], strlen(a[i]))) unsetenv(a[i]);
+    return 0;
+  }
+  if (!strcmp(name, "local")) {
+    if (!function_depth) { fprintf(err, "slop: local: not in a function\n"); return 2; }
+    AssignmentScope *scope = &function_locals[function_depth - 1];
+    for (int i = 1; i < n; i++) {
+      const char *eq = NULL;
+      size_t length = strlen(a[i]);
+      if (assignment_word(a[i], &eq)) length = (size_t)(eq - a[i]);
+      if (!valid_name_n(a[i], length)) { fprintf(err, "slop: local: invalid name: %s\n", a[i]); return 2; }
+      char namebuf[128];
+      if (length >= sizeof namebuf) { fprintf(err, "slop: local: name too long\n"); return 2; }
+      memcpy(namebuf, a[i], length); namebuf[length] = 0;
+      int already_saved = 0;
+      for (int item = 0; item < scope->count; item++)
+        if (!strcmp(scope->items[item].name, namebuf)) already_saved = 1;
+      if (!already_saved) {
+        if (scope->count >= MAX_ARGS) { fprintf(err, "slop: local: too many variables\n"); return 2; }
+        const char *old = getenv(namebuf);
+        SavedAssignment *saved = &scope->items[scope->count++];
+        saved->name = xstrdup(namebuf); saved->value = old ? xstrdup(old) : NULL;
+        saved->was_set = old != NULL;
+      }
+      if (setenv(namebuf, eq ? eq + 1 : "", 1)) return 2;
+    }
     return 0;
   }
   if (!strcmp(name, "test") || !strcmp(name, "[")) return test_builtin(a + 1, n - 1);
@@ -1007,6 +1072,17 @@ static int run_builtin(Command *c, FILE *out, FILE *err, const char *input, int 
       return rc;
     }
     fprintf(err, "slop: command: only 'command -v' is supported\n"); return 2;
+  }
+  if (!strcmp(name, "which")) {
+    int rc = 0;
+    for (int i = 1; i < n; i++) {
+      char path[PATH_CAP];
+      if (builtin_name(a[i])) fprintf(out, "%s\n", a[i]);
+      else if (find_function(a[i])) fprintf(out, "%s\n", a[i]);
+      else if (find_command(a[i], path)) fprintf(out, "%s\n", path);
+      else rc = 1;
+    }
+    return rc;
   }
   if (!strcmp(name, "eval")) {
     Buf text; binit(&text); for (int i = 1; i < n; i++) { if (i > 1) bputc(&text, ' '); bputs(&text, a[i]); }
@@ -1060,10 +1136,10 @@ static int serialize_environment(void) {
 }
 
 static int host_command(const char *s) {
-  const char *base = strrchr(s, '/'); base = base ? base + 1 : s;
   return !strcmp(s, "cc") || !strcmp(s, "compile") || !strcmp(s, "ld") ||
-    !strcmp(s, "link") || !strcmp(base, "python") || !strcmp(base, "python3") ||
-    !strcmp(base, "curl");
+    !strcmp(s, "link") || !strcmp(s, "python") || !strcmp(s, "python3") ||
+    !strcmp(s, "/bin/python") || !strcmp(s, "/bin/python3") ||
+    !strcmp(s, "curl") || !strcmp(s, "/bin/curl");
 }
 
 static int append_spawn_arg(char *blob, size_t cap, size_t *off, const char *s) {
@@ -1123,12 +1199,12 @@ static int load_redirect(const char *name) {
 static int run_pipeline(Command *cmds, int ncmd) {
   static char blob[16384], resolved[PATH_CAP], out_path[PATH_CAP], err_path[PATH_CAP];
   char *cur = pipe_a, *next = pipe_b;
-  const char *previous = NULL; int previous_len = 0, code = 0;
+  const char *previous = NULL; int previous_len = 0, code = 0, pipeline_failure = 0;
   for (int i = 0; i < ncmd; i++) {
     Command *c = &cmds[i]; int last = i + 1 == ncmd;
     AssignmentScope assignments; memset(&assignments, 0, sizeof assignments);
     if (apply_assignments(c, &assignments) < 0) return 2;
-    if (!c->argc) { code = 0; continue; }
+    if (!c->argc) { code = substitution_status; if (code) pipeline_failure = code; continue; }
 
     const char *input = previous; int input_len = previous_len;
     if (c->in_file) {
@@ -1175,12 +1251,22 @@ static int run_pipeline(Command *cmds, int ncmd) {
       }
 
       if (fn) {
+        if (function_depth >= MAX_FUNCTION_DEPTH) {
+          fprintf(stderr, "slop: function recursion limit (%d) exceeded\n", MAX_FUNCTION_DEPTH);
+          code = 2;
+          if (capture) fclose(out);
+          if (efile && err != out) fclose(err);
+          restore_assignments(&assignments);
+          return code;
+        }
         int saved_argc = shell_argc; char **saved_argv = shell_argv;
         const char *saved_name = shell_name;
         shell_argc = c->argc - 1; shell_argv = c->argv + 1; shell_name = c->argv[0];
         char *body = xstrdup(fn->body);
+        memset(&function_locals[function_depth], 0, sizeof function_locals[function_depth]);
         function_depth++;
         code = execute_script(body);
+        restore_assignments(&function_locals[function_depth - 1]);
         function_depth--;
         free(body);
         shell_argc = saved_argc; shell_argv = saved_argv; shell_name = saved_name;
@@ -1240,9 +1326,10 @@ static int run_pipeline(Command *cmds, int ncmd) {
       } else { previous = NULL; previous_len = 0; }
     }
     restore_assignments(&assignments);
+    if (code) pipeline_failure = code;
     char *swap = cur; cur = next; next = swap;
   }
-  return code;
+  return option_pipefail && pipeline_failure ? pipeline_failure : code;
 }
 
 static int execute_command_list(char *line) {
@@ -1254,6 +1341,7 @@ static int execute_command_list(char *line) {
       (items[i].condition == COND_AND && last_status == 0) ||
       (items[i].condition == COND_OR && last_status != 0);
     if (!run) continue;
+    substitution_status = 0;
     Command cmds[MAX_CMDS]; int nc = parse_pipeline(items[i].text, cmds, 1);
     if (nc <= 0) {
       fprintf(stderr, "slop: %s\n", parse_error[0] ? parse_error : "invalid command");
@@ -1279,11 +1367,13 @@ static char *capture_command(const char *text) {
   int saved_flow = flow_signal;
   capture_active = 1; capture_length = 0; suppress_errexit++;
   char *copy = xstrdup(text); execute_command_list(copy); free(copy);
+  int command_status = last_status;
   suppress_errexit--; capture_active = 0;
   while (capture_length > 0 && (capture_buffer[capture_length - 1] == '\n' || capture_buffer[capture_length - 1] == '\r')) capture_length--;
   char *result = xmalloc((size_t)capture_length + 1);
   memcpy(result, capture_buffer, (size_t)capture_length); result[capture_length] = 0;
   last_status = saved_status; exit_requested = saved_exit; exit_status = saved_exit_status; flow_signal = saved_flow;
+  substitution_status = command_status;
   return result;
 }
 
@@ -1607,7 +1697,7 @@ int main(int argc, char **argv) {
   normalize(cwd); setenv("PWD", cwd, 1);
   if (!getenv("PATH")) setenv("PATH", "/bin", 1);
 
-  if (argc > 1 && !strcmp(argv[1], "--version")) { puts("slop 0.3 (piodide build shell)"); return 0; }
+  if (argc > 1 && !strcmp(argv[1], "--version")) { puts("slop 0.4 (piodide build shell)"); return 0; }
   if (argc > 1 && (!strcmp(argv[1], "-h") || !strcmp(argv[1], "--help"))) { print_help(stdout); return 0; }
   if (argc > 2 && !strcmp(argv[1], "-c")) {
     shell_name = argc > 3 ? argv[3] : argv[0];

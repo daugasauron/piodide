@@ -78,6 +78,13 @@ interface GitHubMetadata {
   baseline: Record<string, BaselineEntry>;
 }
 
+export interface GitHubSnapshotInfo {
+  repository: string;
+  upstreamBranch: string;
+  upstreamCommit: string;
+  localBranch: string;
+}
+
 interface WorktreeEntry {
   bytes: Uint8Array;
   mode: string;
@@ -92,9 +99,7 @@ function success(value: string): GitRemoteResult {
 
 function failure(error: unknown): GitRemoteResult {
   const message = error instanceof Error ? error.message : String(error);
-  // Native git captures this command's stdout and routes it to stderr when the
-  // transport exits non-zero. This preserves shell pipes and redirections.
-  return { exitCode: 1, stdout: encoder.encode(`git: ${message}\n`) };
+  return { exitCode: 1, stderr: encoder.encode(`git: ${message}\n`) };
 }
 
 export function normalizeGitHubApiUrl(value: string): string {
@@ -512,6 +517,16 @@ function metadataPath(cwd: string): string {
 
 export function isGitHubRemoteRepository(py: Pyodide, cwd: string): boolean {
   return fsExists(py, metadataPath(cwd));
+}
+
+export function readGitHubSnapshotInfo(py: Pyodide, cwd: string): GitHubSnapshotInfo {
+  const metadata = readMetadata(py, cwd);
+  return {
+    repository: metadata.repository,
+    upstreamBranch: metadata.branch,
+    upstreamCommit: metadata.remoteCommit,
+    localBranch: metadata.localBranch,
+  };
 }
 
 export interface GitHubRemoteRef {

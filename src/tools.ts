@@ -241,8 +241,8 @@ const RaylibParams = Type.Object({
 const SlopParams = Type.Object({
   command: Type.String({
     description:
-      "One shell command line: pipes (|), redirects (> and >>), &&/|| short-circuit " +
-      "lists, ; sequences, $VAR/${VAR}/$? expansion, and quotes. Runs via /bin/slop.",
+      "A shell command or newline-delimited script. Pipes, redirects, &&/||, ;, variables, " +
+      "substitution, globbing, and quotes are supported. Put compound blocks on separate lines.",
   }),
   cwd: Type.Optional(
     Type.String({ description: "Working directory for the fresh shell (default /home/web)." }),
@@ -722,13 +722,18 @@ export function createSlopTool(
       "Run one command line in the slop shell against the live Pyodide filesystem. " +
       "Supports pipes (|), stdout/stderr redirects, &&/|| short-circuit lists, ; sequences, " +
       "$VAR/${VAR}/$?/$(command)/$((arithmetic)) expansion, globbing, and quotes. " +
-      "$PATH is exactly /bin and includes bounded file utilities, uniq, and xargs. Host-routed " +
+      "Use rg for recursive regex/file search; common bounded utilities include grep, sed, find, " +
+      "head, tail, sort, cut, tr, uniq, and xargs. Strict scripts support set -euo pipefail. " +
+      "Use Python—not guessed awk/jq/tar commands—for JSON, tables, or archives. Host-routed " +
       "cc/ld compile and link WASI programs; libgit2 provides Git-compatible repositories, " +
-      "with GitHub clone/pull/push over browser fetch; browser curl is CORS-limited, follows " +
+      "with full smart HTTP where CORS allows it and explicit synthetic GitHub snapshots " +
+      "otherwise (git snapshot info; no remote-tracking refs/history); browser curl is " +
+      "CORS-limited, follows " +
       "redirects only with -L, and requires -o for output above the 1 MiB pipeline limit. " +
       "Each call is a fresh " +
       "shell: cwd does not persist between calls (pass cwd instead), but every file " +
-      "change does. stdout, stderr, and the exit code are returned.",
+      "change does. Compound blocks must be newline-delimited. stdout, stderr, and the exit " +
+      "code are returned; COMMAND --help describes bounded option subsets.",
     parameters: SlopParams,
     executionMode: "sequential",
     async execute(_id, params, signal, onUpdate) {

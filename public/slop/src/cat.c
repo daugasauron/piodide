@@ -23,13 +23,17 @@ static int pump(int fd) {
 }
 
 int main(int argc, char **argv) {
-  /* slop passes its cwd as PWD: adopt it so relative paths work. */
-  const char *pwd = getenv("PWD");
-  if (pwd) chdir(pwd);
-
-  if (argc == 1) return pump(STDIN_FILENO) < 0 ? 1 : 0;
+  if (argc == 2 && strcmp(argv[1], "--help") == 0) {
+    puts("usage: cat [--] [FILE...]"); return 0;
+  }
+  if (argc == 2 && strcmp(argv[1], "--version") == 0) {
+    puts("cat 0.4-piodide"); return 0;
+  }
+  int first = 1;
+  if (first < argc && strcmp(argv[first], "--") == 0) first++;
+  if (first == argc) return pump(STDIN_FILENO) < 0 ? 1 : 0;
   int rc = 0;
-  for (int i = 1; i < argc; i++) {
+  for (int i = first; i < argc; i++) {
     if (strcmp(argv[i], "-") == 0) {
       if (pump(STDIN_FILENO) < 0) rc = 1;
       continue;

@@ -71,6 +71,8 @@ export function ensureSlopInstalled(py: Pyodide, note?: (text: string) => void):
       const nativeGitInstalled = fsExists(py, "/bin/git") && py.FS.stat("/bin/git").size > 1024;
       if (fsExists(py, "/bin/slop") && nativeGitInstalled) {
         installHostEntrypoints(py);
+        installShellAliases(py);
+        await installHostSources(py);
         return;
       }
       note?.("  installing slop into /bin …");
@@ -91,6 +93,8 @@ export function ensureSlopInstalled(py: Pyodide, note?: (text: string) => void):
       const coreutils = new Uint8Array(await coreutilsResponse.arrayBuffer());
       for (const name of COREUTILS) py.FS.writeFile(`/bin/${name}`, coreutils);
       installHostEntrypoints(py);
+      installShellAliases(py);
+      await installHostSources(py);
       try {
         for (const name of SHELL_SOURCES) {
           const response = await fetch(`${base}slop/src/${name}`);
@@ -113,6 +117,23 @@ function installHostEntrypoints(py: Pyodide): void {
     const path = `/bin/${name}`;
     if (!fsExists(py, path)) py.FS.writeFile(path, HOST_ENTRYPOINT_MARKER);
     py.FS.chmod(path, 0o755);
+  }
+}
+
+function installShellAliases(py: Pyodide): void {
+  if (fsExists(py, "/bin/grep")) {
+    py.FS.writeFile("/bin/rg", py.FS.readFile("/bin/grep"));
+    py.FS.chmod("/bin/rg", 0o755);
+  }
+}
+
+async function installHostSources(py: Pyodide): Promise<void> {
+  try {
+    const { default: source } = await import("./slop-host-commands.ts?raw");
+    py.FS.mkdirTree("/home/web/slop");
+    py.FS.writeFile("/home/web/slop/curl-host.ts", source);
+  } catch {
+    // Host source is an audit convenience, not a runtime requirement.
   }
 }
 
@@ -267,7 +288,11 @@ export class SlopSpawner {
       {
         executablePath: path,
         args: args.slice(1),
-        env: { PATH: "/bin", PWD: cwd, TERM: "ghostty", ...(env ?? {}) },
+        env: {
+          PATH: "/bin", PWD: cwd, TERM: "ghostty", ...(env ?? {}),
+          PIODIDE_CWD: cwd,
+          ...(stdinText !== undefined ? { PIODIDE_STDIN: "1" } : {}),
+        },
         preopens: shellPreopens(cwd),
         interactiveStdin: true,
         stdinProvider,
@@ -333,6 +358,7 @@ export class SlopSpawner {
         args: request.args,
         cwd: request.cwd,
         stdin: request.stdinText,
+        env: request.env,
         readStdin: this.deps.childStdin,
         signal: controller.signal,
         getGitHubCredentials: this.deps.getGitHubCredentials,
