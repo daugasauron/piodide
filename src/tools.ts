@@ -6,7 +6,7 @@
  *   write   -> create/overwrite a file in the MEMFS
  *   edit    -> exact string replacements in a MEMFS file
  *   download -> save a MEMFS file through the browser
- *   git     -> local Dulwich repositories + GitHub API synchronization
+ *   git     -> canonical Git repositories through Slop + libgit2 Wasm
  *   image   -> display an image file from the MEMFS
  *   html_debug -> check an HTML file in a hidden sandbox
  *   html    -> display an HTML file in a sandboxed browser popout
@@ -713,6 +713,7 @@ export function createRaylibTool(
 
 export function createSlopTool(
   py: Pyodide,
+  getGitHubCredentials: () => GitHubCredentials | null = () => null,
 ): AgentTool<typeof SlopParams, SlopDetails> {
   return {
     name: "slop",
@@ -721,8 +722,9 @@ export function createSlopTool(
       "Run one command line in the slop shell against the live Pyodide filesystem. " +
       "Supports pipes (|), stdout/stderr redirects, &&/|| short-circuit lists, ; sequences, " +
       "$VAR/${VAR}/$?/$(command)/$((arithmetic)) expansion, globbing, and quotes. " +
-      "$PATH is exactly /bin and includes bounded file utilities, uniq, and xargs. Host-routed cc/ld " +
-      "commands compile C and link WASI objects without placing the large toolchain in /bin. " +
+      "$PATH is exactly /bin and includes bounded file utilities, uniq, and xargs. Host-routed " +
+      "cc/ld compile and link WASI programs; libgit2 provides Git-compatible repositories, " +
+      "with GitHub clone/pull/push over browser fetch; curl is also CORS-limited. " +
       "Each call is a fresh " +
       "shell: cwd does not persist between calls (pass cwd instead), but every file " +
       "change does. stdout, stderr, and the exit code are returned.",
@@ -787,6 +789,7 @@ export function createSlopTool(
             if (captured) emitUpdate("stderr", captured);
           },
           signal,
+          getGitHubCredentials,
         },
       );
 
@@ -1356,7 +1359,7 @@ export function createAllTools(
     createRunWasiTool(py),
     createCompileRaylibTool(py),
     createRaylibTool(py),
-    createSlopTool(py),
+    createSlopTool(py, getGitHubCredentials),
     createReadTool(py),
     createWriteTool(py),
     createEditTool(py),

@@ -1062,7 +1062,8 @@ static int serialize_environment(void) {
 static int host_command(const char *s) {
   const char *base = strrchr(s, '/'); base = base ? base + 1 : s;
   return !strcmp(s, "cc") || !strcmp(s, "compile") || !strcmp(s, "ld") ||
-    !strcmp(s, "link") || !strcmp(base, "python") || !strcmp(base, "python3");
+    !strcmp(s, "link") || !strcmp(base, "python") || !strcmp(base, "python3") ||
+    !strcmp(base, "curl");
 }
 
 static int append_spawn_arg(char *blob, size_t cap, size_t *off, const char *s) {

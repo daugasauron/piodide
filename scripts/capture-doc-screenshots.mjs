@@ -364,6 +364,97 @@ async function exerciseSlopChannels(client) {
   }
 }
 
+async function exerciseSlopGitAndCurl(client) {
+  const evaluation = await client.send("Runtime.evaluate", {
+    expression: `(async () => {
+      const tool = window.__pi.agent.state.tools.find(({ name }) => name === "slop");
+      if (!tool) throw new Error("slop tool is missing");
+      const url = location.origin + location.pathname;
+      const curl = await tool.execute(
+        "e2e-slop-curl",
+        { command: "curl -fsS " + url + " | grep '<title>piodide</title>' > curl-pipe.txt && curl -fsS -o curl-e2e.txt " + url + " && cat curl-pipe.txt" }
+      );
+      const git = await tool.execute(
+        "e2e-slop-git",
+        { command: "mkdir -p git-e2e/src && cd git-e2e && git init -b main && echo browser-git > src/file.txt && cd src && git add . && git commit -m initial && git switch -c feature && echo feature > file.txt && git add file.txt && git commit -m feature && git switch main && cat file.txt && git switch feature && git status --porcelain && git log --oneline -1 && git rev-parse --show-toplevel" }
+      );
+      const gitTool = window.__pi.agent.state.tools.find(({ name }) => name === "git");
+      if (!gitTool) throw new Error("git tool is missing");
+      const savedFetch = window.fetch;
+      window.fetch = async (input, init = {}) => {
+        const url = String(input);
+        const reply = (value) => new Response(JSON.stringify(value), {
+          status: 200,
+          headers: { "Content-Type": "application/json" }
+        });
+        if (url.endsWith("/repos/browser/e2e")) return reply({
+          name: "e2e", full_name: "browser/e2e", default_branch: "main"
+        });
+        if (url.endsWith("/repos/browser/e2e/commits/main")) return reply({
+          sha: "remote0", commit: { message: "remote", tree: { sha: "tree0" } }
+        });
+        if (url.includes("/repos/browser/e2e/git/trees/tree0?recursive=1")) return reply({
+          sha: "tree0", truncated: false,
+          tree: [{ path: "remote.txt", mode: "100644", type: "blob", sha: "blob0", size: 7 }]
+        });
+        if (url.endsWith("/repos/browser/e2e/git/blobs/blob0")) return reply({
+          content: btoa("remote\\n"), encoding: "base64", size: 7
+        });
+        return new Response("not found", { status: 404 });
+      };
+      let clone;
+      try {
+        clone = await gitTool.execute("e2e-git-clone", {
+          operation: "clone", project: "browser/e2e", cwd: "/home/web/remote-e2e"
+        });
+      } finally {
+        window.fetch = savedFetch;
+      }
+      const decode = (path) => new TextDecoder().decode(window.__pi.py.FS.readFile(path));
+      return {
+        curlExit: curl.details?.exitCode,
+        curlOut: curl.details?.stdout ?? "",
+        curlErr: curl.details?.stderr ?? "",
+        gitExit: git.details?.exitCode,
+        gitOut: git.details?.stdout ?? "",
+        gitErr: git.details?.stderr ?? "",
+        curlFile: new TextDecoder().decode(window.__pi.py.FS.readFile("/home/web/curl-e2e.txt")),
+        gitHead: new TextDecoder().decode(window.__pi.py.FS.readFile("/home/web/git-e2e/.git/HEAD")),
+        gitMain: decode("/home/web/git-e2e/src/file.txt"),
+        cloneOut: clone.content?.[0]?.text ?? "",
+        cloneFile: decode("/home/web/remote-e2e/remote.txt"),
+        cloneHead: decode("/home/web/remote-e2e/.git/HEAD"),
+      };
+    })()`,
+    awaitPromise: true,
+    returnByValue: true,
+  });
+  if (evaluation.exceptionDetails) {
+    throw new Error(
+      `Slop git/curl check threw: ${evaluation.exceptionDetails.exception?.description ?? evaluation.exceptionDetails.text}`,
+    );
+  }
+  const state = evaluation.result.value;
+  if (
+    state.curlExit !== 0 ||
+    !state.curlOut.includes("<title>piodide</title>") ||
+    state.curlErr !== "" ||
+    !state.curlFile.includes("<title>piodide</title>") ||
+    state.gitExit !== 0 ||
+    !state.gitOut.includes("initial") ||
+    !state.gitOut.includes("browser-git") ||
+    !state.gitOut.includes("/home/web/git-e2e") ||
+    state.gitErr !== "" ||
+    state.gitHead !== "ref: refs/heads/feature\n" ||
+    state.gitMain !== "feature\n" ||
+    !state.cloneOut.includes("Cloned browser/e2e") ||
+    state.cloneFile !== "remote\n" ||
+    state.cloneHead !== "ref: refs/heads/main\n"
+  ) {
+    throw new Error(`Unexpected Slop git/curl result: ${JSON.stringify(state)}`);
+  }
+}
+
 async function exerciseRaylibPreview(client, expectedWidth, expectedHeight) {
   const evaluation = await client.send("Runtime.evaluate", {
     expression: `(async () => {
@@ -536,6 +627,7 @@ async function main() {
     await waitForPython(client);
     await exerciseHtmlDebug(client);
     await exerciseSlopChannels(client);
+    await exerciseSlopGitAndCurl(client);
     await exerciseRaylibPreview(client, viewport.width, viewport.height);
     await exerciseHtmlPreview(client, viewport.width, viewport.height, false);
     await focusTerminal(client);

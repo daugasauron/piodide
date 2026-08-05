@@ -1,0 +1,1315 @@
+/** Git CLI adapter backed by libgit2 compiled to WebAssembly. */
+import type { Pyodide } from "./pyodide-host.ts";
+import { fsExists, fsIsDir, fsReadText, fsWriteText } from "./pyodide-host.ts";
+import {
+  markGitRemoteHead,
+  isGitHubRemoteRepository,
+  listGitHubRemoteRefs,
+  readGitRemoteMarker,
+  retargetGitHubSnapshotBranch,
+  runGitRemoteCommand,
+} from "./git-remote.ts";
+import { runLibgit2, type Libgit2Result } from "./libgit2.ts";
+import {
+  createIsomorphicGitFs,
+  isomorphicGit,
+  smartClone,
+  smartFetch,
+  smartListServerRefs,
+  smartPull,
+  smartPush,
+} from "./git-smart-http.ts";
+import type { HostCommandContext, HostCommandResult } from "./slop-host-commands.ts";
+import { normalizePath } from "./wasi/abi.ts";
+
+const encoder = new TextEncoder();
+
+const HELP = `usage: git <command> [options]
+
+Local repositories use canonical .git objects, refs, index, and config.
+
+  init, clone, status, add, commit, diff, log
+  branch, switch, checkout, merge, restore, reset
+  remote, fetch, pull, push, ls-remote
+  tag, stash, blame, rev-list, rev-parse, cat-file
+  cherry-pick, clean, fsck, gc, config
+
+Browser note: smart HTTP requires a CORS-enabled server. Use
+--cors-proxy URL (or git config http.corsProxy URL) when you control a proxy.
+GitHub falls back to a bounded single-branch snapshot without one.
+`;
+
+const COMMAND_HELP: Record<string, string> = {
+  clone: "usage: git clone [-b branch] [--depth n] [--single-branch] [--cors-proxy URL] <repository> [directory]\n",
+  branch: "usage: git branch [-a|-r|-v] | git branch <name> [start-point] | git branch -m [old] <new> | git branch -d <name>\n",
+  switch: "usage: git switch [-c] <branch>\n",
+  checkout: "usage: git checkout [-b branch] [start-point] | git checkout [ref] [--] [paths...]\n",
+  pull: "usage: git pull [--cors-proxy URL] [remote] [branch]\n",
+  push: "usage: git push [--cors-proxy URL] [remote] [refspec]\n",
+  fetch: "usage: git fetch [--cors-proxy URL] [remote] [branch]\n",
+  "ls-remote": "usage: git ls-remote [--cors-proxy URL] [repository] [patterns...]\n",
+  status: "usage: git status [--short] [--branch] [--porcelain[=v1]]\n",
+  restore: "usage: git restore [--source ref] [--staged] [--worktree] <paths...>\n",
+  clean: "usage: git clean -n | git clean -f [-d]\n",
+  config: "usage: git config [--list] | git config [--get] <name> | git config <name> <value>\n",
+  remote: "usage: git remote [-v] | git remote add <name> <url> | git remote remove <name>\n",
+};
+
+function result(exitCode: number, output: string): HostCommandResult {
+  // /bin/git captures this stream and sends it to stdout or stderr according
+  // to the exit code. This keeps shell pipes and redirects working normally.
+  return { exitCode, stdout: encoder.encode(output) };
+}
+
+function workspacePath(cwd: string, value: string): string {
+  const path = value.startsWith("/") ? normalizePath(value) : normalizePath(`${cwd}/${value}`);
+  if (path !== "/home/web" && !path.startsWith("/home/web/")) {
+    throw new Error(`path must stay inside /home/web: ${value}`);
+  }
+  return path;
+}
+
+function identity(context: HostCommandContext) {
+  const credentials = context.getGitHubCredentials?.();
+  return credentials
+    ? {
+        name: credentials.name || credentials.login,
+        email: credentials.email || `${credentials.id}+${credentials.login}@users.noreply.github.com`,
+      }
+    : undefined;
+}
+
+async function invoke(
+  context: HostCommandContext,
+  args: string[],
+  cwd = context.cwd,
+): Promise<Libgit2Result> {
+  return runLibgit2(context.py, args, cwd, identity(context));
+}
+
+function render(value: Libgit2Result): HostCommandResult {
+  return result(value.exitCode, `${value.stdout}${value.stderr}`);
+}
+
+function assertBranchName(name: string): void {
+  if (
+    !name || name === "@" || name.startsWith("-") || name.startsWith("/") ||
+    name.endsWith("/") || name.endsWith(".") || name.includes("..") || name.includes("@{") ||
+    /[\x00-\x20\x7f~^:?*[\\]/.test(name) ||
+    name.split("/").some((part) => !part || part.startsWith(".") || part.endsWith(".lock"))
+  ) {
+    throw new Error(`invalid branch name: ${name}`);
+  }
+}
+
+function currentBranch(py: Pyodide, cwd: string): string | null {
+  const path = `${cwd}/.git/HEAD`;
+  if (!fsExists(py, path)) throw new Error(`not a Git repository: ${cwd}`);
+  const head = fsReadText(py, path).trim();
+  const prefix = "ref: refs/heads/";
+  return head.startsWith(prefix) ? head.slice(prefix.length) : null;
+}
+
+function repositoryRoot(py: Pyodide, cwd: string): string {
+  let directory = cwd;
+  while (directory === "/home/web" || directory.startsWith("/home/web/")) {
+    if (fsExists(py, `${directory}/.git`)) return directory;
+    if (directory === "/home/web") break;
+    directory = directory.slice(0, directory.lastIndexOf("/")) || "/";
+  }
+  throw new Error(`not a Git repository: ${cwd}`);
+}
+
+function gitFs(context: HostCommandContext) {
+  return createIsomorphicGitFs(context.py);
+}
+
+interface ConfigEntry {
+  key: string;
+  value: string;
+}
+
+function parseConfig(text: string): ConfigEntry[] {
+  const entries: ConfigEntry[] = [];
+  let section = "";
+  let subsection = "";
+  for (const source of text.split(/\r?\n/)) {
+    const line = source.trim();
+    if (!line || line.startsWith("#") || line.startsWith(";")) continue;
+    const header = /^\[([^\s\]"]+)(?:\s+"([^"]+)")?\]$/.exec(line);
+    if (header) {
+      section = header[1].toLowerCase();
+      subsection = header[2] || "";
+      continue;
+    }
+    const setting = /^([^=\s]+)\s*(?:=\s*)?(.*)$/.exec(line);
+    if (!section || !setting) continue;
+    const prefix = subsection ? `${section}.${subsection}` : section;
+    entries.push({ key: `${prefix}.${setting[1]}`, value: setting[2].trim() });
+  }
+  return entries;
+}
+
+function configEntries(py: Pyodide, root?: string): ConfigEntry[] {
+  const paths = ["/home/web/.gitconfig", ...(root ? [`${root}/.git/config`] : [])];
+  return paths.flatMap((path) => fsExists(py, path) ? parseConfig(fsReadText(py, path)) : []);
+}
+
+function configValue(py: Pyodide, root: string, key: string): string | undefined {
+  const normalized = key.toLowerCase();
+  return configEntries(py, root).filter(
+    (entry) => entry.key.toLowerCase() === normalized,
+  ).at(-1)?.value;
+}
+
+function remoteUrl(py: Pyodide, root: string, remote = "origin"): string | undefined {
+  return configValue(py, root, `remote.${remote}.url`);
+}
+
+function isHttpRemote(value: string): boolean {
+  return /^https?:\/\//i.test(value);
+}
+
+function assertSupportedRemote(value: string): void {
+  if (/^(?:git|ssh):\/\//i.test(value) || /^[^/\s]+@[^:]+:/.test(value)) {
+    throw new Error("browsers cannot open Git or SSH sockets; use an HTTPS remote");
+  }
+}
+
+function isGitHubUrl(value: string): boolean {
+  try {
+    return new URL(value).hostname.toLowerCase() === "github.com";
+  } catch {
+    return /^(?:git@github\.com:|github:)/i.test(value) || /^[^/\s]+\/[^/\s]+(?:\.git)?$/.test(value);
+  }
+}
+
+function configuredCorsProxy(py: Pyodide, root?: string): string | undefined {
+  const value = root ? configValue(py, root, "http.corsProxy") : configEntries(py).filter(
+    (entry) => entry.key.toLowerCase() === "http.corsproxy",
+  ).at(-1)?.value;
+  return value?.trim() || undefined;
+}
+
+function browserNetworkError(error: unknown, url: string): Error {
+  const message = error instanceof Error ? error.message : String(error);
+  if (/cors|failed to fetch|networkerror|load failed/i.test(message)) {
+    return new Error(
+      `cannot access ${url} from this browser (the server blocked CORS); ` +
+      "use --cors-proxy URL with a proxy you trust",
+    );
+  }
+  return error instanceof Error ? error : new Error(message);
+}
+
+function author(context: HostCommandContext): { name: string; email: string } {
+  return identity(context) || { name: "Piodide", email: "piodide@localhost" };
+}
+
+function pathFromRepository(root: string, cwd: string, path: string): string {
+  const absolute = workspacePath(cwd, path);
+  if (absolute !== root && !absolute.startsWith(`${root}/`)) {
+    throw new Error(`path is outside the repository: ${path}`);
+  }
+  return absolute === root ? "." : absolute.slice(root.length + 1);
+}
+
+async function headId(context: HostCommandContext, cwd: string): Promise<string> {
+  const resolved = await invoke(context, ["rev-parse", "HEAD"], cwd);
+  if (resolved.exitCode !== 0) throw new Error(`${resolved.stdout}${resolved.stderr}`.trim());
+  return resolved.stdout.trim();
+}
+
+async function isClean(context: HostCommandContext, cwd: string): Promise<boolean> {
+  const status = await invoke(context, ["status", "--porcelain"], cwd);
+  if (status.exitCode !== 0) throw new Error(`${status.stdout}${status.stderr}`.trim());
+  return status.stdout.length === 0;
+}
+
+function branchRef(cwd: string, name: string): string {
+  assertBranchName(name);
+  return `${cwd}/.git/refs/heads/${name}`;
+}
+
+function packedBranches(py: Pyodide, cwd: string): Map<string, string> {
+  const path = `${cwd}/.git/packed-refs`;
+  const branches = new Map<string, string>();
+  if (!fsExists(py, path)) return branches;
+  for (const line of fsReadText(py, path).split(/\r?\n/)) {
+    const match = /^([0-9a-f]{40,64}) refs\/heads\/(.+)$/.exec(line);
+    if (match) branches.set(match[2], match[1]);
+  }
+  return branches;
+}
+
+function looseBranches(py: Pyodide, cwd: string): Map<string, string> {
+  const branches = new Map<string, string>();
+  const root = `${cwd}/.git/refs/heads`;
+  const visit = (directory: string, prefix: string) => {
+    if (!fsExists(py, directory)) return;
+    for (const name of py.FS.readdir(directory).sort()) {
+      if (name === "." || name === "..") continue;
+      const path = `${directory}/${name}`;
+      const relative = prefix ? `${prefix}/${name}` : name;
+      if (py.FS.isDir(py.FS.stat(path).mode)) visit(path, relative);
+      else branches.set(relative, fsReadText(py, path).trim());
+    }
+  };
+  visit(root, "");
+  return branches;
+}
+
+async function runBranch(context: HostCommandContext, args: string[]): Promise<HostCommandResult> {
+  const cwd = repositoryRoot(context.py, context.cwd);
+  currentBranch(context.py, cwd);
+  let deletion = false;
+  let rename = false;
+  let all = false;
+  let remotesOnly = false;
+  let verbose = false;
+  const positional: string[] = [];
+  for (const arg of args) {
+    if (arg === "-d" || arg === "-D" || arg === "--delete") deletion = true;
+    else if (arg === "-m" || arg === "--move") rename = true;
+    else if (arg === "-a" || arg === "--all") all = true;
+    else if (arg === "-r" || arg === "--remotes") remotesOnly = true;
+    else if (arg === "-v" || arg === "-vv" || arg === "--verbose") verbose = true;
+    else if (arg === "--show-current") return result(0, `${currentBranch(context.py, cwd) || ""}\n`);
+    else if (arg === "--list") continue;
+    else if (arg.startsWith("-")) throw new Error(`unsupported branch option: ${arg}`);
+    else positional.push(arg);
+  }
+  if (rename) {
+    if (positional.length < 1 || positional.length > 2) {
+      throw new Error("branch -m accepts [old-name] new-name");
+    }
+    const oldName = positional.length === 2 ? positional[0] : currentBranch(context.py, cwd);
+    const newName = positional.at(-1)!;
+    if (!oldName) throw new Error("cannot rename a detached HEAD");
+    assertBranchName(oldName);
+    assertBranchName(newName);
+    await isomorphicGit.renameBranch({ fs: gitFs(context), dir: cwd, oldref: oldName, ref: newName });
+    return result(0, "");
+  }
+  if (positional.length > 2) throw new Error("branch accepts a branch name and optional start-point");
+  const name = positional[0];
+  if (!name) {
+    const current = currentBranch(context.py, cwd);
+    const branches = packedBranches(context.py, cwd);
+    for (const [branch, oid] of looseBranches(context.py, cwd)) branches.set(branch, oid);
+    const local = remotesOnly ? [] : [...branches].map(([branch, oid]) => ({ branch, oid, remote: false }));
+    const remoteBranches: Array<{ remote: string; branch: string }> = [];
+    if ((all || remotesOnly) && isGitHubRemoteRepository(context.py, cwd)) {
+      remoteBranches.push(...(await listGitHubRemoteRefs(
+          context.py,
+          cwd,
+          context.getGitHubCredentials?.() ?? null,
+          context.signal,
+        )).filter(({ ref }) => ref.startsWith("refs/heads/")).map(
+          ({ ref }) => ({ remote: "origin", branch: ref.slice(11) }),
+        ));
+    } else if (all || remotesOnly) {
+      for (const { remote } of await isomorphicGit.listRemotes({ fs: gitFs(context), dir: cwd })) {
+        const names = await isomorphicGit.listBranches({ fs: gitFs(context), dir: cwd, remote }).catch(() => []);
+        remoteBranches.push(...names.map((branch) => ({ remote, branch })));
+      }
+    }
+    const remote = remoteBranches.map(({ remote, branch }) => ({
+      branch: `remotes/${remote}/${branch}`,
+      oid: "",
+      remote: true,
+    }));
+    const output = [...local, ...remote].sort((a, b) => a.branch.localeCompare(b.branch)).map(
+      ({ branch, oid, remote }) => `${!remote && branch === current ? "*" : " "} ${branch}` +
+        `${verbose && oid ? ` ${oid.slice(0, 7)}` : ""}\n`,
+    ).join("");
+    return result(0, output);
+  }
+  assertBranchName(name);
+  const loose = branchRef(cwd, name);
+  const packed = packedBranches(context.py, cwd);
+  const exists = fsExists(context.py, loose) || packed.has(name);
+  if (deletion) {
+    if (!exists) throw new Error(`branch '${name}' not found`);
+    if (currentBranch(context.py, cwd) === name) throw new Error(`cannot delete checked out branch '${name}'`);
+    if (fsExists(context.py, loose)) context.py.FS.unlink(loose);
+    if (packed.has(name)) removePackedBranch(context.py, cwd, name);
+    return result(0, `Deleted branch ${name}.\n`);
+  }
+  if (exists) throw new Error(`a branch named '${name}' already exists`);
+  const startPoint = positional[1] || "HEAD";
+  const resolved = await invoke(context, ["rev-parse", startPoint], cwd);
+  if (resolved.exitCode !== 0) throw new Error(`${resolved.stdout}${resolved.stderr}`.trim());
+  fsWriteText(context.py, loose, `${resolved.stdout.trim()}\n`);
+  return result(0, "");
+}
+
+async function runSwitch(context: HostCommandContext, args: string[]): Promise<HostCommandResult> {
+  const root = repositoryRoot(context.py, context.cwd);
+  let create = false;
+  let detach = false;
+  const positional: string[] = [];
+  for (const arg of args) {
+    if (arg === "-c" || arg === "--create") create = true;
+    else if (arg === "--detach") detach = true;
+    else if (arg.startsWith("-")) throw new Error(`unsupported switch option: ${arg}`);
+    else positional.push(arg);
+  }
+  if (create) {
+    if (positional.length < 1 || positional.length > 2) throw new Error("switch -c requires a branch and optional start-point");
+    assertBranchName(positional[0]);
+    await isomorphicGit.branch({
+      fs: gitFs(context),
+      dir: root,
+      ref: positional[0],
+      object: positional[1] || "HEAD",
+    });
+  } else if (positional.length !== 1) throw new Error("switch requires exactly one branch or commit");
+  const ref = positional[0];
+  const localExists = fsExists(context.py, branchRef(root, ref)) || packedBranches(context.py, root).has(ref);
+  if (!create && !detach && !localExists && isGitHubRemoteRepository(context.py, root)) {
+    if (!(await isClean(context, root))) throw new Error("commit or discard local changes before switching remote branches");
+    const remoteRefs = await listGitHubRemoteRefs(
+      context.py,
+      root,
+      context.getGitHubCredentials?.() ?? null,
+      context.signal,
+    );
+    if (!remoteRefs.some((entry) => entry.ref === `refs/heads/${ref}`)) {
+      throw new Error(`branch '${ref}' not found`);
+    }
+    await isomorphicGit.branch({ fs: gitFs(context), dir: root, ref, object: "HEAD" });
+    await isomorphicGit.checkout({ fs: gitFs(context), dir: root, ref, track: false });
+    const fetched = await runGitRemoteCommand({
+      ...context,
+      cwd: root,
+      args: ["git-remote", "checkout", ref],
+    });
+    const fetchedText = new TextDecoder().decode(fetched.stdout ?? fetched.stderr ?? new Uint8Array());
+    if (fetched.exitCode !== 0) return result(fetched.exitCode, fetchedText);
+    const added = await invoke(context, ["add", "."], root);
+    if (added.exitCode !== 0) return render(added);
+    const message = readGitRemoteMarker(context.py, root, "remote-message") || `Import remote branch ${ref}`;
+    const committed = await invoke(context, ["commit", "-m", message], root);
+    if (committed.exitCode !== 0) return render(committed);
+    const head = await headId(context, root);
+    markGitRemoteHead(context.py, root, head);
+    await setUpstream(context, root, "origin", ref);
+    return result(0, `Switched to a new branch '${ref}'\n${fetchedText}`);
+  }
+  await isomorphicGit.checkout({
+    fs: gitFs(context),
+    dir: root,
+    ref,
+    track: !detach,
+  });
+  return result(0, detach ? `HEAD is now at ${ref}\n` : `Switched to branch '${ref}'\n`);
+}
+
+function removePackedBranch(py: Pyodide, cwd: string, branch: string): void {
+  const path = `${cwd}/.git/packed-refs`;
+  const lines = fsReadText(py, path).split(/\r?\n/);
+  const target = ` refs/heads/${branch}`;
+  const kept: string[] = [];
+  let removed = false;
+  for (const line of lines) {
+    if (line.endsWith(target)) {
+      removed = true;
+      continue;
+    }
+    if (removed && line.startsWith("^")) {
+      removed = false;
+      continue;
+    }
+    removed = false;
+    kept.push(line);
+  }
+  fsWriteText(py, path, kept.join("\n"));
+}
+
+function cloneArguments(args: string[], cwd: string): {
+  project: string;
+  destination: string;
+  branch?: string;
+  corsProxy?: string;
+  depth?: number;
+  singleBranch: boolean;
+} {
+  let branch: string | undefined;
+  let corsProxy: string | undefined;
+  let depth: number | undefined;
+  let singleBranch = false;
+  const positional: string[] = [];
+  for (let index = 0; index < args.length; index++) {
+    const arg = args[index];
+    if (arg === "-b" || arg === "--branch") {
+      branch = args[++index];
+      if (!branch) throw new Error(`${arg} requires a branch name`);
+    } else if (arg === "--cors-proxy") {
+      corsProxy = args[++index];
+      if (!corsProxy) throw new Error("--cors-proxy requires a URL");
+    } else if (arg === "--depth") {
+      depth = Number(args[++index]);
+      if (!Number.isSafeInteger(depth) || depth < 1) throw new Error("--depth requires a positive integer");
+    } else if (arg.startsWith("--depth=")) {
+      depth = Number(arg.slice(8));
+      if (!Number.isSafeInteger(depth) || depth < 1) throw new Error("--depth requires a positive integer");
+    } else if (arg === "--single-branch") {
+      singleBranch = true;
+    } else if (arg === "--") {
+      positional.push(...args.slice(index + 1));
+      break;
+    } else if (arg.startsWith("-")) {
+      throw new Error(`unsupported clone option: ${arg}`);
+    } else positional.push(arg);
+  }
+  if (positional.length < 1 || positional.length > 2) {
+    throw new Error("usage: git clone [-b branch] <repository> [directory]");
+  }
+  const project = positional[0];
+  const inferred = project.replace(/\/+$/, "").slice(project.replace(/\/+$/, "").lastIndexOf("/") + 1)
+    .replace(/\.git$/i, "");
+  if (!inferred || inferred === "." || inferred === "..") throw new Error("cannot derive clone directory");
+  return {
+    project,
+    destination: workspacePath(cwd, positional[1] || inferred),
+    branch,
+    corsProxy,
+    depth,
+    singleBranch,
+  };
+}
+
+function libgitPath(path: string): string {
+  return path === "/home/web" ? "/workspace" : `/workspace/${path.slice("/home/web/".length)}`;
+}
+
+function localCloneSource(context: HostCommandContext, project: string): string | null {
+  if (/^[a-z][a-z0-9+.-]*:\/\//i.test(project) || /^git@/i.test(project)) return null;
+  try {
+    const source = workspacePath(context.cwd, project);
+    return fsExists(context.py, source) ? source : null;
+  } catch {
+    return null;
+  }
+}
+
+async function runClone(context: HostCommandContext, args: string[]): Promise<HostCommandResult> {
+  const parsed = cloneArguments(args, context.cwd);
+  const localSource = localCloneSource(context, parsed.project);
+  if (localSource) {
+    if (localSource === parsed.destination) throw new Error("source and destination are the same repository");
+    if (fsExists(context.py, parsed.destination) && (
+      !fsIsDir(context.py, parsed.destination) || context.py.FS.readdir(parsed.destination).length > 2
+    )) {
+      throw new Error(`destination is not empty: ${parsed.destination}`);
+    }
+    const cloned = await invoke(
+      context,
+      ["clone", libgitPath(localSource), libgitPath(parsed.destination)],
+      "/home/web",
+    );
+    if (cloned.exitCode === 0 && parsed.branch) {
+      assertBranchName(parsed.branch);
+      const checkedOut = await invoke(context, ["checkout", parsed.branch], parsed.destination);
+      if (checkedOut.exitCode !== 0) return render(checkedOut);
+      cloned.stdout += checkedOut.stdout;
+      cloned.stderr += checkedOut.stderr;
+    }
+    return render(cloned);
+  }
+  const proxy = parsed.corsProxy || configuredCorsProxy(context.py);
+  if (!isGitHubUrl(parsed.project) || proxy) {
+    assertSupportedRemote(parsed.project);
+    if (!isHttpRemote(parsed.project)) {
+      throw new Error("browser smart HTTP clone requires an http(s) repository URL");
+    }
+    if (fsExists(context.py, parsed.destination) && (
+      !fsIsDir(context.py, parsed.destination) || context.py.FS.readdir(parsed.destination).length > 2
+    )) {
+      throw new Error(`destination is not empty: ${parsed.destination}`);
+    }
+    try {
+      await smartClone({
+        py: context.py,
+        dir: parsed.destination,
+        url: parsed.project,
+        ref: parsed.branch,
+        singleBranch: parsed.singleBranch,
+        depth: parsed.depth,
+        corsProxy: proxy,
+        credentials: context.getGitHubCredentials?.(),
+        signal: context.signal,
+      });
+      return result(0, `Cloned ${parsed.project} into ${parsed.destination}\n`);
+    } catch (error) {
+      throw browserNetworkError(error, parsed.project);
+    }
+  }
+  if (fsExists(context.py, parsed.destination)) {
+    if (!fsIsDir(context.py, parsed.destination) || context.py.FS.readdir(parsed.destination).length > 2) {
+      throw new Error(`destination is not empty: ${parsed.destination}`);
+    }
+  } else context.py.FS.mkdirTree(parsed.destination);
+
+  const initialized = await invoke(context, ["init", "."], parsed.destination);
+  if (initialized.exitCode !== 0) return render(initialized);
+  const fetched = await runGitRemoteCommand({
+    ...context,
+    cwd: parsed.destination,
+    args: ["git-remote", "clone", parsed.project, parsed.branch || ""],
+  });
+  const fetchedText = new TextDecoder().decode(fetched.stdout ?? fetched.stderr ?? new Uint8Array());
+  if (fetched.exitCode !== 0) return result(fetched.exitCode, fetchedText);
+  const added = await invoke(context, ["add", "."], parsed.destination);
+  if (added.exitCode !== 0) return render(added);
+  const message = readGitRemoteMarker(context.py, parsed.destination, "remote-message") || "Import repository";
+  const committed = await invoke(context, ["commit", "-m", message], parsed.destination);
+  if (committed.exitCode !== 0) return render(committed);
+  const head = await headId(context, parsed.destination);
+  markGitRemoteHead(context.py, parsed.destination, head);
+  return result(
+    0,
+    `Cloned ${parsed.project} into ${parsed.destination}\n${fetchedText}` +
+      `Created local commit ${head.slice(0, 7)}\n`,
+  );
+}
+
+function networkArguments(args: string[]): {
+  positional: string[];
+  corsProxy?: string;
+  prune: boolean;
+  pruneTags: boolean;
+  setUpstream: boolean;
+} {
+  const positional: string[] = [];
+  let corsProxy: string | undefined;
+  let prune = false;
+  let pruneTags = false;
+  let setUpstream = false;
+  for (let index = 0; index < args.length; index++) {
+    const value = args[index];
+    if (value === "--cors-proxy") {
+      corsProxy = args[++index];
+      if (!corsProxy) throw new Error("--cors-proxy requires a URL");
+    } else if (value.startsWith("--cors-proxy=")) corsProxy = value.slice(13);
+    else if (value === "--prune" || value === "-p") prune = true;
+    else if (value === "--prune-tags") pruneTags = true;
+    else if (value === "-u" || value === "--set-upstream") setUpstream = true;
+    else if (value === "--") positional.push(...args.slice(index + 1));
+    else if (value.startsWith("-")) throw new Error(`unsupported network option: ${value}`);
+    else positional.push(value);
+  }
+  return { positional, corsProxy, prune, pruneTags, setUpstream };
+}
+
+async function runFetch(context: HostCommandContext, args: string[]): Promise<HostCommandResult> {
+  const cwd = repositoryRoot(context.py, context.cwd);
+  const parsed = networkArguments(args);
+  const remote = parsed.positional[0] || "origin";
+  const url = remoteUrl(context.py, cwd, remote);
+  if (!url) throw new Error(`remote '${remote}' has no URL`);
+  assertSupportedRemote(url);
+  if (!isHttpRemote(url)) return render(await invoke(context, ["fetch", remote, ...parsed.positional.slice(1)], cwd));
+  try {
+    await smartFetch({
+      py: context.py,
+      dir: cwd,
+      url,
+      remote,
+      ref: parsed.positional[1],
+      corsProxy: parsed.corsProxy || configuredCorsProxy(context.py, cwd),
+      prune: parsed.prune,
+      pruneTags: parsed.pruneTags,
+      credentials: context.getGitHubCredentials?.(),
+      signal: context.signal,
+    });
+    return result(0, `Fetched ${remote}\n`);
+  } catch (error) {
+    throw browserNetworkError(error, url);
+  }
+}
+
+async function runPull(context: HostCommandContext, args: string[]): Promise<HostCommandResult> {
+  const cwd = repositoryRoot(context.py, context.cwd);
+  if (!(await isClean(context, cwd))) throw new Error("commit or discard local changes before pulling");
+  if (!isGitHubRemoteRepository(context.py, cwd)) {
+    const branch = currentBranch(context.py, cwd);
+    if (!branch) throw new Error("cannot pull with a detached HEAD");
+    const parsed = networkArguments(args);
+    const remote = parsed.positional[0] || "origin";
+    const requestedBranch = parsed.positional[1] || branch;
+    const url = remoteUrl(context.py, cwd, remote);
+    if (!url) throw new Error(`remote '${remote}' has no URL`);
+    assertSupportedRemote(url);
+    if (isHttpRemote(url)) {
+      try {
+        await smartPull({
+          py: context.py,
+          dir: cwd,
+          url,
+          remote,
+          ref: branch,
+          remoteRef: requestedBranch,
+          corsProxy: parsed.corsProxy || configuredCorsProxy(context.py, cwd),
+          credentials: context.getGitHubCredentials?.(),
+          signal: context.signal,
+        }, author(context));
+        return result(0, "Already up to date or fast-forwarded.\n");
+      } catch (error) {
+        throw browserNetworkError(error, url);
+      }
+    }
+    const fetched = await invoke(context, ["fetch", remote], cwd);
+    if (fetched.exitCode !== 0) return render(fetched);
+    const merged = await runLibgitCommand(context, cwd, ["merge", `${remote}/${requestedBranch}`]);
+    const mergedOutput = new TextDecoder().decode(merged.stdout ?? merged.stderr ?? new Uint8Array());
+    return result(merged.exitCode, `${fetched.stdout}${fetched.stderr}${mergedOutput}`);
+  }
+  if (args.length) throw new Error("the GitHub snapshot pull accepts no remote or branch arguments");
+  const head = await headId(context, cwd);
+  const pulled = await runGitRemoteCommand({ ...context, cwd, args: ["git-remote", "pull", head] });
+  const output = new TextDecoder().decode(pulled.stdout ?? pulled.stderr ?? new Uint8Array());
+  if (pulled.exitCode !== 0 || output.startsWith("Already up to date")) {
+    return result(pulled.exitCode, output);
+  }
+  const added = await invoke(context, ["add", "."], cwd);
+  if (added.exitCode !== 0) return render(added);
+  const message = readGitRemoteMarker(context.py, cwd, "remote-message") || "Pull remote snapshot";
+  const committed = await invoke(context, ["commit", "-m", message], cwd);
+  if (committed.exitCode !== 0) return render(committed);
+  markGitRemoteHead(context.py, cwd, await headId(context, cwd));
+  return result(0, output);
+}
+
+async function runPush(context: HostCommandContext, args: string[]): Promise<HostCommandResult> {
+  const cwd = repositoryRoot(context.py, context.cwd);
+  if (!isGitHubRemoteRepository(context.py, cwd)) {
+    const parsed = networkArguments(args);
+    const remote = parsed.positional[0] || "origin";
+    const url = remoteUrl(context.py, cwd, remote);
+    if (url) assertSupportedRemote(url);
+    if (!url || !isHttpRemote(url)) {
+      const pushed = await invoke(context, ["push", ...parsed.positional], cwd);
+      if (pushed.exitCode === 0 && parsed.setUpstream) await setUpstream(context, cwd, remote, parsed.positional[1]);
+      return render(pushed);
+    }
+    const branch = currentBranch(context.py, cwd);
+    if (!branch) throw new Error("cannot push a detached HEAD without an explicit refspec");
+    const refspec = parsed.positional[1];
+    const [ref, remoteRef] = refspec?.includes(":") ? refspec.split(":", 2) : [refspec || branch, undefined];
+    try {
+      const pushed = await smartPush({
+        py: context.py,
+        dir: cwd,
+        url,
+        remote,
+        ref,
+        remoteRef,
+        corsProxy: parsed.corsProxy || configuredCorsProxy(context.py, cwd),
+        credentials: context.getGitHubCredentials?.(),
+        signal: context.signal,
+      });
+      if (pushed.ok && parsed.setUpstream) await setUpstream(context, cwd, remote, remoteRef || ref);
+      return result(0, pushed.ok ? `Pushed ${ref} to ${remote}\n` : `Push rejected by ${remote}\n`);
+    } catch (error) {
+      throw browserNetworkError(error, url);
+    }
+  }
+  const parsed = networkArguments(args);
+  const remote = parsed.positional[0] || "origin";
+  if (remote !== "origin") throw new Error("the GitHub snapshot fallback only has the 'origin' remote");
+  const branch = currentBranch(context.py, cwd);
+  if (!branch) throw new Error("cannot push a detached HEAD");
+  const refspec = parsed.positional[1];
+  const [localRef, remoteRef] = refspec?.includes(":")
+    ? refspec.split(":", 2)
+    : [refspec || branch, refspec || branch];
+  if (localRef !== branch) throw new Error("the GitHub snapshot fallback can only push the checked-out branch");
+  retargetGitHubSnapshotBranch(context.py, cwd, branch, remoteRef);
+  if (!(await isClean(context, cwd))) throw new Error("commit or discard local changes before pushing");
+  const head = await headId(context, cwd);
+  const log = await invoke(context, ["log", "--oneline", "-n", "1"], cwd);
+  const message = log.stdout.trim().replace(/^[0-9a-f]+\s+/, "") || "Update from piodide";
+  const pushed = await runGitRemoteCommand({
+    ...context,
+    cwd,
+    args: ["git-remote", "push", head, message],
+  });
+  if (pushed.exitCode === 0 && parsed.setUpstream) await setUpstream(context, cwd, "origin", remoteRef);
+  return result(
+    pushed.exitCode,
+    new TextDecoder().decode(pushed.stdout ?? pushed.stderr ?? new Uint8Array()),
+  );
+}
+
+async function setUpstream(
+  context: HostCommandContext,
+  root: string,
+  remote: string,
+  branch = currentBranch(context.py, root) || "",
+): Promise<void> {
+  if (!branch) throw new Error("cannot set upstream for a detached HEAD");
+  const local = currentBranch(context.py, root) || branch;
+  const fs = gitFs(context);
+  await isomorphicGit.setConfig({ fs, dir: root, path: `branch.${local}.remote`, value: remote });
+  await isomorphicGit.setConfig({ fs, dir: root, path: `branch.${local}.merge`, value: `refs/heads/${branch}` });
+}
+
+async function runLsRemote(context: HostCommandContext, args: string[]): Promise<HostCommandResult> {
+  const parsed = networkArguments(args);
+  let target = parsed.positional[0] || "origin";
+  let root: string | undefined;
+  try { root = repositoryRoot(context.py, context.cwd); } catch { /* URL-only form */ }
+  const url = root && !isHttpRemote(target) ? remoteUrl(context.py, root, target) : target;
+  if (!url) throw new Error(`remote '${target}' has no URL`);
+  assertSupportedRemote(url);
+  if (root && isGitHubRemoteRepository(context.py, root) && !parsed.corsProxy) {
+    const refs = await listGitHubRemoteRefs(
+      context.py,
+      root,
+      context.getGitHubCredentials?.() ?? null,
+      context.signal,
+    );
+    const patterns = parsed.positional.slice(1);
+    const selected = patterns.length ? refs.filter(({ ref }) => patterns.some(
+      (pattern) => ref === pattern || ref.endsWith(`/${pattern}`),
+    )) : refs;
+    return result(0, selected.map(({ oid, ref }) => `${oid}\t${ref}\n`).join(""));
+  }
+  if (!isHttpRemote(url)) return render(await invoke(context, ["ls-remote", target, ...parsed.positional.slice(1)], context.cwd));
+  const refs = await smartListServerRefs({
+    py: context.py,
+    url,
+    corsProxy: parsed.corsProxy || configuredCorsProxy(context.py, root),
+    credentials: context.getGitHubCredentials?.(),
+    signal: context.signal,
+  }).catch((error) => { throw browserNetworkError(error, url); });
+  const patterns = parsed.positional.slice(1);
+  const selected = patterns.length ? refs.filter(({ ref }) => patterns.some(
+    (pattern) => ref === pattern || ref.endsWith(`/${pattern}`),
+  )) : refs;
+  return result(0, selected.flatMap(({ oid, ref, peeled }) => [
+    `${oid}\t${ref}\n`,
+    ...(peeled ? [`${peeled}\t${ref}^{}\n`] : []),
+  ]).join(""));
+}
+
+async function runConfig(context: HostCommandContext, args: string[]): Promise<HostCommandResult> {
+  const global = args.includes("--global");
+  const local = args.includes("--local");
+  if (global && local) throw new Error("--global and --local are mutually exclusive");
+  args = args.filter((arg) => arg !== "--global" && arg !== "--local");
+  let root: string | undefined;
+  try { root = repositoryRoot(context.py, context.cwd); } catch { /* global config only */ }
+  const entries = global
+    ? (fsExists(context.py, "/home/web/.gitconfig") ? parseConfig(fsReadText(context.py, "/home/web/.gitconfig")) : [])
+    : configEntries(context.py, root);
+  if (args.length === 0 || args[0] === "--list" || args[0] === "-l") {
+    return result(0, entries.map(({ key, value }) => `${key}=${value}\n`).join(""));
+  }
+  const valuesOnly = args[0] === "--get";
+  const effective = valuesOnly ? args.slice(1) : args;
+  if (effective.length === 1) {
+    const key = effective[0].toLowerCase();
+    const values = entries.filter((entry) => entry.key.toLowerCase() === key);
+    return values.length ? result(0, `${values.at(-1)!.value}\n`) : result(1, "");
+  }
+  if (effective.length === 2) {
+    if (global) appendConfig(context.py, "/home/web/.gitconfig", effective[0], effective[1]);
+    else {
+      if (!root) throw new Error("not a Git repository (use --global outside one)");
+      await isomorphicGit.setConfig({ fs: gitFs(context), dir: root, path: effective[0], value: effective[1] });
+    }
+    return result(0, "");
+  }
+  throw new Error("usage: git config [--list] | git config [--get] name | git config name value");
+}
+
+function appendConfig(py: Pyodide, path: string, key: string, value: string): void {
+  const parts = key.split(".");
+  if (parts.length < 2 || parts.some((part) => !part || /[\r\n\[\]]/.test(part))) {
+    throw new Error(`invalid config key: ${key}`);
+  }
+  if (/[\r\n]/.test(value)) throw new Error("config value must be one line");
+  const section = parts.shift()!;
+  const name = parts.pop()!;
+  const subsection = parts.join(".");
+  const previous = fsExists(py, path) ? fsReadText(py, path).trimEnd() : "";
+  const header = subsection ? `[${section} "${subsection.replaceAll("\"", "\\\"")}"]` : `[${section}]`;
+  fsWriteText(py, path, `${previous}${previous ? "\n" : ""}${header}\n\t${name} = ${value}\n`);
+}
+
+async function runRemote(context: HostCommandContext, args: string[]): Promise<HostCommandResult> {
+  const root = repositoryRoot(context.py, context.cwd);
+  const fs = gitFs(context);
+  const verbose = args[0] === "-v" || args[0] === "--verbose";
+  if (args.length === 0 || verbose) {
+    const remotes = await isomorphicGit.listRemotes({ fs, dir: root });
+    return result(0, remotes.map(({ remote, url }) => verbose
+      ? `${remote}\t${url} (fetch)\n${remote}\t${url} (push)\n`
+      : `${remote}\n`).join(""));
+  }
+  if (args[0] === "get-url" && args.length === 2) {
+    const url = remoteUrl(context.py, root, args[1]);
+    return url ? result(0, `${url}\n`) : result(2, `error: No such remote '${args[1]}'\n`);
+  }
+  if (args[0] === "add" && args.length === 3) {
+    await isomorphicGit.addRemote({ fs, dir: root, remote: args[1], url: args[2] });
+    return result(0, "");
+  }
+  if ((args[0] === "remove" || args[0] === "rm") && args.length === 2) {
+    await isomorphicGit.deleteRemote({ fs, dir: root, remote: args[1] });
+    return result(0, "");
+  }
+  throw new Error("usage: git remote [-v] | git remote add <name> <url> | git remote remove <name>");
+}
+
+async function runRestore(context: HostCommandContext, args: string[]): Promise<HostCommandResult> {
+  const root = repositoryRoot(context.py, context.cwd);
+  let source = "HEAD";
+  let staged = false;
+  let worktree = false;
+  const paths: string[] = [];
+  for (let index = 0; index < args.length; index++) {
+    const value = args[index];
+    if (value === "--staged" || value === "-S") staged = true;
+    else if (value === "--worktree" || value === "-W") worktree = true;
+    else if (value === "--source" || value === "-s") {
+      source = args[++index];
+      if (!source) throw new Error(`${value} requires a ref`);
+    } else if (value.startsWith("--source=")) source = value.slice(9);
+    else if (value === "--") paths.push(...args.slice(index + 1));
+    else if (value.startsWith("-")) throw new Error(`unsupported restore option: ${value}`);
+    else paths.push(value);
+  }
+  if (!paths.length) throw new Error("restore requires at least one path");
+  const filepaths = paths.map((path) => pathFromRepository(root, context.cwd, path));
+  const fs = gitFs(context);
+  if (staged) {
+    for (const filepath of filepaths) {
+      await isomorphicGit.resetIndex({ fs, dir: root, filepath, ref: source });
+    }
+  }
+  if (worktree || !staged) {
+    await isomorphicGit.checkout({
+      fs,
+      dir: root,
+      ref: source,
+      filepaths,
+      noUpdateHead: true,
+      force: true,
+    });
+  }
+  return result(0, "");
+}
+
+async function runClean(context: HostCommandContext, args: string[]): Promise<HostCommandResult> {
+  const root = repositoryRoot(context.py, context.cwd);
+  const force = args.includes("-f") || args.includes("--force");
+  const dryRun = args.includes("-n") || args.includes("--dry-run");
+  const directories = args.includes("-d");
+  if (!force && !dryRun) throw new Error("clean requires -n (preview) or -f");
+  for (const arg of args) {
+    if (!["-f", "--force", "-n", "--dry-run", "-d"].includes(arg)) {
+      throw new Error(`unsupported clean option: ${arg}`);
+    }
+  }
+  const matrix = await isomorphicGit.statusMatrix({ fs: gitFs(context), dir: root });
+  const untracked = matrix.filter(([, head, workdir, stage]) => head === 0 && workdir === 2 && stage === 0)
+    .map(([filepath]) => filepath).sort();
+  for (const filepath of untracked) {
+    const absolute = `${root}/${filepath}`;
+    if (!directories && fsIsDir(context.py, absolute)) continue;
+    if (!dryRun) {
+      if (fsIsDir(context.py, absolute)) removeDirectory(context.py, absolute);
+      else context.py.FS.unlink(absolute);
+    }
+  }
+  return result(0, untracked.map((path) => `Would remove ${path}\n`).join("").replaceAll(
+    "Would remove ", dryRun ? "Would remove " : "Removing ",
+  ));
+}
+
+function removeDirectory(py: Pyodide, path: string): void {
+  for (const name of py.FS.readdir(path)) {
+    if (name === "." || name === "..") continue;
+    const child = `${path}/${name}`;
+    if (py.FS.isDir(py.FS.lstat(child).mode)) removeDirectory(py, child);
+    else py.FS.unlink(child);
+  }
+  py.FS.rmdir(path);
+}
+
+async function runCherryPick(context: HostCommandContext, args: string[]): Promise<HostCommandResult> {
+  const root = repositoryRoot(context.py, context.cwd);
+  if (args.length !== 1 || args[0].startsWith("-")) throw new Error("usage: git cherry-pick <commit>");
+  const oid = await isomorphicGit.resolveRef({ fs: gitFs(context), dir: root, ref: args[0] });
+  try {
+    const created = await isomorphicGit.cherryPick({
+      fs: gitFs(context),
+      dir: root,
+      oid,
+      committer: author(context),
+      abortOnConflict: false,
+    });
+    return result(0, `[${currentBranch(context.py, root) || "detached"} ${created.slice(0, 7)}] cherry-pick\n`);
+  } catch (error) {
+    return result(1, `git: ${error instanceof Error ? error.message : String(error)}\n`);
+  }
+}
+
+async function runGc(context: HostCommandContext): Promise<HostCommandResult> {
+  const root = repositoryRoot(context.py, context.cwd);
+  const objects = `${root}/.git/objects`;
+  const oids: string[] = [];
+  if (fsExists(context.py, objects)) {
+    for (const prefix of context.py.FS.readdir(objects)) {
+      if (!/^[0-9a-f]{2}$/.test(prefix)) continue;
+      for (const suffix of context.py.FS.readdir(`${objects}/${prefix}`)) {
+        if (/^[0-9a-f]{38}$/.test(suffix)) oids.push(`${prefix}${suffix}`);
+      }
+    }
+  }
+  if (!oids.length) return result(0, "Nothing to pack.\n");
+  const packed = await isomorphicGit.packObjects({ fs: gitFs(context), dir: root, oids, write: true });
+  return result(0, `Packed ${oids.length} object(s) into ${packed.filename}.\n`);
+}
+
+function looseRefs(py: Pyodide, root: string): string[] {
+  const refs: string[] = [];
+  const visit = (directory: string, prefix: string) => {
+    if (!fsExists(py, directory)) return;
+    for (const name of py.FS.readdir(directory)) {
+      if (name === "." || name === "..") continue;
+      const path = `${directory}/${name}`;
+      const ref = prefix ? `${prefix}/${name}` : name;
+      if (py.FS.isDir(py.FS.lstat(path).mode)) visit(path, ref);
+      else refs.push(ref);
+    }
+  };
+  visit(`${root}/.git/refs`, "refs");
+  return refs;
+}
+
+async function runFsck(context: HostCommandContext): Promise<HostCommandResult> {
+  const root = repositoryRoot(context.py, context.cwd);
+  const fs = gitFs(context);
+  const refs = new Set(["HEAD", ...looseRefs(context.py, root)]);
+  const packed = `${root}/.git/packed-refs`;
+  if (fsExists(context.py, packed)) {
+    for (const line of fsReadText(context.py, packed).split(/\r?\n/)) {
+      const match = /^[0-9a-f]{40}\s+(refs\/\S+)$/.exec(line);
+      if (match) refs.add(match[1]);
+    }
+  }
+  const pending: string[] = [];
+  const failures: string[] = [];
+  for (const ref of refs) {
+    try { pending.push(await isomorphicGit.resolveRef({ fs, dir: root, ref })); }
+    catch (error) { failures.push(`${ref}: ${error instanceof Error ? error.message : String(error)}`); }
+  }
+  const seen = new Set<string>();
+  while (pending.length) {
+    const oid = pending.pop()!;
+    if (seen.has(oid)) continue;
+    if (seen.size >= 100_000) throw new Error("fsck object limit exceeded (100000)");
+    seen.add(oid);
+    try {
+      const object = await isomorphicGit.readObject({ fs, dir: root, oid, format: "parsed" }) as any;
+      if (object.type === "commit") pending.push(object.object.tree, ...object.object.parent);
+      else if (object.type === "tree") pending.push(...object.object.map((entry: { oid: string }) => entry.oid));
+      else if (object.type === "tag") pending.push(object.object.object);
+    } catch (error) {
+      failures.push(`${oid}: ${error instanceof Error ? error.message : String(error)}`);
+    }
+  }
+  if (failures.length) return result(1, failures.map((line) => `error: ${line}\n`).join(""));
+  return result(0, `Checked ${seen.size} reachable object(s); no errors.\n`);
+}
+
+async function runLsFiles(context: HostCommandContext, args: string[]): Promise<HostCommandResult> {
+  const root = repositoryRoot(context.py, context.cwd);
+  const stage = args.includes("--stage") || args.includes("-s");
+  for (const arg of args) {
+    if (!["--stage", "-s"].includes(arg)) throw new Error(`unsupported ls-files option: ${arg}`);
+  }
+  const fs = gitFs(context);
+  if (!stage) {
+    const files = await isomorphicGit.listFiles({ fs, dir: root });
+    return result(0, files.map((path) => `${path}\n`).join(""));
+  }
+  const entries = await isomorphicGit.walk({
+    fs,
+    dir: root,
+    trees: [isomorphicGit.STAGE()],
+    map: async (filepath, [entry]) => {
+      if (filepath === "." || !entry || await entry.type() === "tree") return undefined;
+      return `${(await entry.mode()).toString(8).padStart(6, "0")} ${await entry.oid()} 0\t${filepath}\n`;
+    },
+  });
+  return result(0, (entries as Array<string | undefined>).filter(Boolean).join(""));
+}
+
+async function runLog(context: HostCommandContext, args: string[]): Promise<HostCommandResult> {
+  const supported = args.some((arg) => ["--all", "--graph", "--stat"].includes(arg));
+  if (!supported) return runLibgitCommand(context, context.cwd, ["log", ...args]);
+  const root = repositoryRoot(context.py, context.cwd);
+  const fs = gitFs(context);
+  let depth = 100;
+  let oneline = false;
+  let graph = false;
+  let stat = false;
+  let all = false;
+  for (let index = 0; index < args.length; index++) {
+    const arg = args[index];
+    if (arg === "--all") all = true;
+    else if (arg === "--graph") graph = true;
+    else if (arg === "--stat") stat = true;
+    else if (arg === "--oneline") oneline = true;
+    else if (arg === "-n" || arg === "--max-count") depth = Number(args[++index]);
+    else if (arg.startsWith("--max-count=")) depth = Number(arg.slice(12));
+    else if (/^-[0-9]+$/.test(arg)) depth = Number(arg.slice(1));
+    else throw new Error(`unsupported browser log option: ${arg}`);
+  }
+  if (!Number.isSafeInteger(depth) || depth < 1 || depth > 10_000) throw new Error("invalid log count");
+  const refs = all
+    ? [
+        ...(await isomorphicGit.listBranches({ fs, dir: root })),
+        ...(await isomorphicGit.listTags({ fs, dir: root })).map((tag) => `refs/tags/${tag}`),
+        ...(await isomorphicGit.listBranches({ fs, dir: root, remote: "origin" }).catch(() => []))
+          .map((branch) => `refs/remotes/origin/${branch}`),
+      ]
+    : ["HEAD"];
+  const commits = new Map<string, Awaited<ReturnType<typeof isomorphicGit.log>>[number]>();
+  for (const ref of refs.length ? refs : ["HEAD"]) {
+    for (const entry of await isomorphicGit.log({
+      fs,
+      dir: root,
+      ref,
+      depth,
+      includeChanges: stat,
+    }).catch(() => [])) commits.set(entry.oid, entry);
+  }
+  const ordered = [...commits.values()].sort(
+    (a, b) => b.commit.committer.timestamp - a.commit.committer.timestamp,
+  ).slice(0, depth);
+  return result(0, ordered.map(({ oid, commit }) => {
+    const prefix = graph ? "* " : "";
+    const subject = commit.message.split(/\r?\n/, 1)[0];
+    if (oneline) return `${prefix}${oid.slice(0, 7)} ${subject}\n`;
+    let text = `${prefix}commit ${oid}\nAuthor: ${commit.author.name} <${commit.author.email}>\n` +
+      `Date:   ${new Date(commit.author.timestamp * 1000).toISOString()}\n\n    ${subject}\n`;
+    if (stat && commit.changes?.length) {
+      text += `${commit.changes.map((change) => ` ${change[2]} | changed\n`).join("")}` +
+        ` ${commit.changes.length} file(s) changed\n`;
+    }
+    return `${text}\n`;
+  }).join(""));
+}
+
+async function runMerge(context: HostCommandContext, args: string[]): Promise<HostCommandResult> {
+  const root = repositoryRoot(context.py, context.cwd);
+  if (args.length === 1 && args[0] === "--abort") {
+    if (!fsExists(context.py, `${root}/.git/MERGE_HEAD`)) throw new Error("there is no merge to abort");
+    await isomorphicGit.abortMerge({ fs: gitFs(context), dir: root });
+    for (const name of ["MERGE_HEAD", "MERGE_MODE", "MERGE_MSG"]) {
+      const path = `${root}/.git/${name}`;
+      if (fsExists(context.py, path)) context.py.FS.unlink(path);
+    }
+    return result(0, "");
+  }
+  if (args.length === 1 && args[0] === "--continue") {
+    if (!fsExists(context.py, `${root}/.git/MERGE_HEAD`)) throw new Error("there is no merge in progress");
+    const status = await runLibgitCommand(context, root, ["status", "--porcelain"]);
+    const output = new TextDecoder().decode(status.stdout ?? new Uint8Array());
+    if (/^UU /m.test(output)) throw new Error("resolve conflicts and stage the files before continuing");
+    const message = fsReadText(context.py, `${root}/.git/MERGE_MSG`).trim() || "Merge commit";
+    const committed = await invoke(context, ["commit", "-m", message], root);
+    return render(committed);
+  }
+  return runLibgitCommand(context, root, ["merge", ...args]);
+}
+
+function translate(py: Pyodide, cwd: string, args: string[]): string[] {
+  if (args[0] === "add" && args.includes("-A")) return ["add", "."];
+  if (args[0] === "add") {
+    const root = repositoryRoot(py, cwd);
+    return args.map((arg, index) => index > 0 && !arg.startsWith("-")
+      ? pathFromRepository(root, cwd, arg)
+      : arg);
+  }
+  if (args[0] === "diff" || args[0] === "checkout") {
+    const root = repositoryRoot(py, cwd);
+    const separator = args.indexOf("--");
+    return args.map((arg, index) => {
+      if (arg === "--staged") return "--cached";
+      return separator >= 0 && index > separator ? pathFromRepository(root, cwd, arg) : arg;
+    });
+  }
+  if (args[0] === "status") {
+    return args.map((arg) => arg === "--porcelain=v1" ? "--porcelain" : arg);
+  }
+  if (args[0] === "switch") {
+    const create = args[1] === "-c" || args[1] === "--create";
+    const name = args[create ? 2 : 1];
+    if (!name) throw new Error("switch requires a branch name");
+    assertBranchName(name);
+    return create ? ["checkout", "-b", name, "HEAD"] : ["checkout", name];
+  }
+  if (args[0] === "checkout" && args[1] === "-b" && args.length === 3) {
+    assertBranchName(args[2]);
+    return ["checkout", "-b", args[2], "HEAD"];
+  }
+  return args;
+}
+
+function normalizeStatus(py: Pyodide, root: string, args: string[], output: string): string {
+  const porcelain = args.some((arg) => arg === "--porcelain" || arg === "--porcelain=v1");
+  const conflicts = [...output.matchAll(/^conflict:\s+a:(\S+)\s+o:(\S+)\s+t:(\S+)$/gm)].map(
+    (match) => [match[1], match[2], match[3]].find((path) => path !== "NULL")!,
+  );
+  let normalized = output.replace(/^conflict:.*(?:\n|$)/gm, "");
+  if (porcelain && !args.some((arg) => arg === "--branch" || arg === "-b" || arg === "-sb")) {
+    normalized = normalized.replace(/^# .*\n?/gm, "");
+  }
+  for (const path of conflicts) {
+    normalized = normalized.replace(new RegExp(`^ {3}${path.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}\\n?`, "m"), "");
+  }
+  if (conflicts.length) {
+    normalized += porcelain
+      ? conflicts.map((path) => `UU ${path}\n`).join("")
+      : `Unmerged paths:\n${conflicts.map((path) => `\tboth modified: ${path}\n`).join("")}`;
+  }
+  const branch = currentBranch(py, root);
+  if (branch && !fsExists(py, branchRef(root, branch)) && !packedBranches(py, root).has(branch)) {
+    normalized = normalized.replace(/^error: reference 'refs\/heads\/[^']+' not found\n?/gm, "");
+    normalized = normalized.replace(/Not currently on any branch\.?/g, branch);
+    normalized = normalized.replace(/HEAD \(no branch\)/g, branch);
+  }
+  return normalized;
+}
+
+async function runLibgitCommand(
+  context: HostCommandContext,
+  cwd: string,
+  args: string[],
+): Promise<HostCommandResult> {
+  const value = await invoke(context, translate(context.py, cwd, args), cwd);
+  let output = `${value.stdout}${value.stderr}`;
+  if (args[0] === "status") {
+    output = normalizeStatus(context.py, repositoryRoot(context.py, cwd), args, output);
+  }
+  if (args[0] === "checkout" || args[0] === "switch") {
+    output = output.replace(/^Branch '.*' set up to track remote branch 'origin\/.*'\.?\n?/gm, "");
+  }
+  let exitCode = value.exitCode;
+  if (args[0] === "merge") {
+    const root = repositoryRoot(context.py, cwd);
+    if (fsExists(context.py, `${root}/.git/MERGE_HEAD`) || /^conflict:/m.test(output)) exitCode = 1;
+  }
+  return result(exitCode, output);
+}
+
+export async function runGitEngineCommand(context: HostCommandContext): Promise<HostCommandResult> {
+  try {
+    let cwd = context.cwd;
+    const args = context.args.slice(1);
+    if (args[0] === "-C") {
+      if (!args[1]) throw new Error("-C requires a directory");
+      cwd = workspacePath(cwd, args[1]);
+      args.splice(0, 2);
+    }
+    const scoped = { ...context, cwd };
+    const command = args[0];
+    if (!command) return result(1, HELP);
+    if (command === "help" || command === "-h" || command === "--help") {
+      const topic = command === "help" ? args[1] : undefined;
+      return result(0, topic ? (COMMAND_HELP[topic] || `usage: git ${topic} [options]\n`) : HELP);
+    }
+    if (args.slice(1).some((arg) => arg === "-h" || arg === "--help")) {
+      return result(0, COMMAND_HELP[command] || `usage: git ${command} [options]\n`);
+    }
+    if (command === "--version" || command === "version") {
+      return result(0, "git version 2.0.0-piodide (libgit2 + isomorphic-git)\n");
+    }
+    if (command === "branch") return runBranch(scoped, args.slice(1));
+    if (command === "switch") return runSwitch(scoped, args.slice(1));
+    if (command === "clone") return runClone(scoped, args.slice(1));
+    if (command === "fetch") return runFetch(scoped, args.slice(1));
+    if (command === "pull") return runPull(scoped, args.slice(1));
+    if (command === "push") return runPush(scoped, args.slice(1));
+    if (command === "ls-remote") return runLsRemote(scoped, args.slice(1));
+    if (command === "config") return runConfig(scoped, args.slice(1));
+    if (command === "remote") return runRemote(scoped, args.slice(1));
+    if (command === "restore") return runRestore(scoped, args.slice(1));
+    if (command === "clean") return runClean(scoped, args.slice(1));
+    if (command === "cherry-pick") return runCherryPick(scoped, args.slice(1));
+    if (command === "gc") return runGc(scoped);
+    if (command === "fsck") return runFsck(scoped);
+    if (command === "ls-files") return runLsFiles(scoped, args.slice(1));
+    if (command === "log") return runLog(scoped, args.slice(1));
+    if (command === "merge") return runMerge(scoped, args.slice(1));
+    if (command === "init") {
+      let branch: string | undefined;
+      const target: string[] = [];
+      for (let index = 1; index < args.length; index++) {
+        if (args[index] === "-b" || args[index] === "--initial-branch") {
+          branch = args[++index];
+          if (!branch) throw new Error("initial branch name is missing");
+          assertBranchName(branch);
+        } else {
+          if (args[index].startsWith("-")) throw new Error(`unsupported init option: ${args[index]}`);
+          target.push(args[index]);
+        }
+      }
+      if (target.length > 1) throw new Error("init accepts at most one directory");
+      const initialized = await invoke(scoped, ["init", ...(target.length ? target : ["."])], cwd);
+      if (initialized.exitCode === 0 && branch) {
+        const repository = target[0] ? workspacePath(cwd, target[0]) : cwd;
+        fsWriteText(context.py, `${repository}/.git/HEAD`, `ref: refs/heads/${branch}\n`);
+      }
+      return render(initialized);
+    }
+    if (command === "commit") {
+      const committed = await invoke(scoped, args, cwd);
+      if (committed.exitCode !== 0) return render(committed);
+      const summary = await invoke(scoped, ["log", "--oneline", "-n", "1"], cwd);
+      return result(0, summary.exitCode === 0 ? summary.stdout : committed.stdout);
+    }
+    if (command === "rev-parse" && args.length === 2) {
+      const root = repositoryRoot(context.py, cwd);
+      if (args[1] === "--show-toplevel") return result(0, `${root}\n`);
+      if (args[1] === "--show-prefix") {
+        return result(0, cwd === root ? "\n" : `${cwd.slice(root.length + 1)}/\n`);
+      }
+      if (args[1] === "--is-inside-work-tree") return result(0, "true\n");
+      if (args[1] === "--git-dir") return result(0, `${root}/.git\n`);
+      if (args[1] === "--abbrev-ref") throw new Error("--abbrev-ref requires a revision");
+    }
+    if (command === "rev-parse" && args.length === 3 && args[1] === "--abbrev-ref") {
+      const root = repositoryRoot(context.py, cwd);
+      if (args[2] === "HEAD") return result(0, `${currentBranch(context.py, root) || "HEAD"}\n`);
+    }
+    if (command === "reset") {
+      const separator = args.indexOf("--");
+      const pathStart = separator >= 0 ? separator + 1 : (args.length > 2 ? 2 : -1);
+      if (pathStart >= 0 && args.length > pathStart) {
+        const root = repositoryRoot(context.py, cwd);
+        const ref = separator >= 0 ? (args[1] === "--" ? "HEAD" : args[1]) : args[1];
+        for (const path of args.slice(pathStart)) {
+          await isomorphicGit.resetIndex({
+            fs: gitFs(context),
+            dir: root,
+            filepath: pathFromRepository(root, cwd, path),
+            ref,
+          });
+        }
+        return result(0, "");
+      }
+    }
+    return runLibgitCommand(scoped, cwd, args);
+  } catch (error) {
+    return result(1, `git: ${error instanceof Error ? error.message : String(error)}\n`);
+  }
+}

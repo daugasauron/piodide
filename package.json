@@ -31,13 +31,17 @@
     "@monaco-neovim-wasm/wasm-async": "0.1.28",
     "@wllama/wllama": "3.5.1",
     "@wllama/wllama-compat": "3.5.1",
+    "buffer": "6.0.3",
     "ghostty-web": "https://github.com/NimbleMarkets/ghostty-web/archive/20b270562b6829dc05d3478b7c83feb2a3054713.tar.gz",
+    "isomorphic-git": "1.40.0",
     "markdansi": "^0.3.2",
     "monaco-editor": "0.55.1",
     "string-width": "^8.2.2",
-    "typebox": "^1.1.38"
+    "typebox": "^1.1.38",
+    "wasm-git": "0.0.17"
   },
   "overrides": {
-    "dompurify": "3.4.12"
+    "dompurify": "3.4.12",
+    "postcss": "8.5.25"
   }
 }

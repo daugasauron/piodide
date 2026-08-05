@@ -17,26 +17,45 @@ import {
 } from "./wasi/browser-runner.ts";
 import { runToolchainInBrowser } from "./c-compiler.ts";
 import { runPythonEntrypoint } from "./python-entrypoint.ts";
+import {
+  runCurlCommand,
+  type HostCommandResult,
+} from "./slop-host-commands.ts";
+import {
+  runGitRemoteCommand,
+  type GitHubCredentials,
+} from "./git-remote.ts";
+import { runGitEngineCommand } from "./git-engine.ts";
 import { normalizePath } from "./wasi/abi.ts";
 import type { CompileOptions, LinkOptions } from "./wasi/toolchain.ts";
 
-const SHELL_BINARIES = ["slop", "make", "sed", "ar", "ls", "cat", "fd-find", "echo", "env", "grep"];
+const SHELL_BINARIES = ["slop", "make", "sed", "ar", "git", "ls", "cat", "fd-find", "echo", "env", "grep"];
 const COREUTILS = [
   "rm", "cp", "mv", "mkdir", "rmdir", "touch", "ln", "head", "tail", "wc", "sort",
   "cut", "tr", "tee", "basename", "dirname", "seq", "cmp", "install", "readlink", "find", "mktemp",
   "chmod", "uniq", "xargs",
 ];
 const SHELL_SOURCES = [
-  "slop.c", "make.c", "coreutils.c", "sed.c", "ar.c", "spawn_stub.c", "patch_import.py",
+  "slop.c", "make.c", "coreutils.c", "sed.c", "ar.c", "git.c", "spawn_stub.c", "patch_import.py",
   "Makefile", "README.md",
   "ls.c", "cat.c", "fd-find.c", "echo.c", "env.c", "grep.c",
 ];
 const MAX_CHILDREN = 32;
 const MAX_C_SOURCE_BYTES = 512 * 1024;
 const MAX_TOOLCHAIN_INPUTS = 32;
-const PYTHON_ENTRYPOINT_MARKER = "piodide host-backed Python entrypoint\n";
+const HOST_ENTRYPOINT_MARKER = "piodide browser-hosted command\n";
 /** Pipe captures are bounded so a runaway producer can't eat the page. */
 const MAX_CAPTURE_BYTES = 1024 * 1024;
+const CAPTURE_TRUNCATED = new TextEncoder().encode("\n[slop: output truncated at 1 MiB]\n");
+
+function truncateBytes(value: Uint8Array): Uint8Array {
+  if (value.byteLength <= MAX_CAPTURE_BYTES) return value;
+  const output = new Uint8Array(MAX_CAPTURE_BYTES);
+  const kept = MAX_CAPTURE_BYTES - CAPTURE_TRUNCATED.byteLength;
+  output.set(value.subarray(0, kept));
+  output.set(CAPTURE_TRUNCATED, kept);
+  return output;
+}
 
 function shellPreopens(cwd: string) {
   return [{ name: ".", path: cwd }, "/home/web", "/", "/bin"];
@@ -50,8 +69,9 @@ let installPromise: Promise<void> | null = null;
 export function ensureSlopInstalled(py: Pyodide, note?: (text: string) => void): Promise<void> {
   if (!installPromise) {
     installPromise = (async () => {
-      if (fsExists(py, "/bin/slop")) {
-        installPythonEntrypoints(py);
+      const nativeGitInstalled = fsExists(py, "/bin/git") && py.FS.stat("/bin/git").size > 1024;
+      if (fsExists(py, "/bin/slop") && nativeGitInstalled) {
+        installHostEntrypoints(py);
         return;
       }
       note?.("  installing slop into /bin …");
@@ -71,7 +91,7 @@ export function ensureSlopInstalled(py: Pyodide, note?: (text: string) => void):
       }
       const coreutils = new Uint8Array(await coreutilsResponse.arrayBuffer());
       for (const name of COREUTILS) py.FS.writeFile(`/bin/${name}`, coreutils);
-      installPythonEntrypoints(py);
+      installHostEntrypoints(py);
       try {
         for (const name of SHELL_SOURCES) {
           const response = await fetch(`${base}slop/src/${name}`);
@@ -89,10 +109,10 @@ export function ensureSlopInstalled(py: Pyodide, note?: (text: string) => void):
   return installPromise;
 }
 
-function installPythonEntrypoints(py: Pyodide): void {
-  for (const name of ["python", "python3"]) {
+function installHostEntrypoints(py: Pyodide): void {
+  for (const name of ["python", "python3", "curl"]) {
     const path = `/bin/${name}`;
-    if (!fsExists(py, path)) py.FS.writeFile(path, PYTHON_ENTRYPOINT_MARKER);
+    if (!fsExists(py, path)) py.FS.writeFile(path, HOST_ENTRYPOINT_MARKER);
     py.FS.chmod(path, 0o755);
   }
 }
@@ -126,6 +146,7 @@ interface SlopSpawnerDeps {
   note: (text: string) => void;
   /** Interactive stdin for children (the session's tty buffer; EOF otherwise). */
   childStdin: () => Promise<Uint8Array | null> | Uint8Array | null;
+  getGitHubCredentials?: () => GitHubCredentials | null;
   signal?: AbortSignal;
 }
 
@@ -133,6 +154,7 @@ interface SlopSpawnerDeps {
 export class SlopSpawner {
   /** The currently running direct child (for Ctrl+C kill). */
   foreground: WasiProgramHandle | null = null;
+  private hostAbort: AbortController | null = null;
   private activeChildren = 0;
   private deps: SlopSpawnerDeps;
 
@@ -147,6 +169,16 @@ export class SlopSpawner {
     } = request;
     if (["python", "python3"].includes(path.split("/").pop() ?? path)) {
       return this.python(request);
+    }
+    const command = path.split("/").pop() ?? path;
+    if (command === "curl") {
+      return this.hostCommand(request, runCurlCommand);
+    }
+    if (command === "git-remote") {
+      return this.hostCommand(request, runGitRemoteCommand);
+    }
+    if (command === "git-engine") {
+      return this.hostCommand(request, runGitEngineCommand);
     }
     if (path === "compile" || path === "cc") {
       return this.toolchain(request, "compile");
@@ -261,6 +293,90 @@ export class SlopSpawner {
       this.foreground = null;
       this.activeChildren--;
     }
+  }
+
+  /** Kill either a WASI child or an async browser-hosted command. */
+  killForeground(): boolean {
+    const active = this.foreground !== null || this.hostAbort !== null;
+    this.foreground?.kill();
+    this.hostAbort?.abort();
+    return active;
+  }
+
+  private async hostCommand(
+    request: SpawnRequest,
+    run: typeof runCurlCommand | typeof runGitRemoteCommand | typeof runGitEngineCommand,
+  ): Promise<SpawnResult> {
+    if (this.activeChildren >= MAX_CHILDREN) {
+      this.deps.writeError("slop: too many nested programs\r\n");
+      return { exitCode: 126 };
+    }
+    this.activeChildren++;
+    const controller = new AbortController();
+    this.hostAbort = controller;
+    const abort = () => controller.abort(this.deps.signal?.reason);
+    this.deps.signal?.addEventListener("abort", abort, { once: true });
+    try {
+      const result = await run({
+        py: this.deps.py,
+        args: request.args,
+        cwd: request.cwd,
+        stdin: request.stdinText,
+        signal: controller.signal,
+        getGitHubCredentials: this.deps.getGitHubCredentials,
+      });
+      return this.routeHostResult(request, result);
+    } catch (error) {
+      return this.routeHostResult(request, {
+        exitCode: controller.signal.aborted ? 130 : 1,
+        stderr: new TextEncoder().encode(
+          `${request.path}: ${error instanceof Error ? error.message : String(error)}\n`,
+        ),
+      });
+    } finally {
+      this.deps.signal?.removeEventListener("abort", abort);
+      if (this.hostAbort === controller) this.hostAbort = null;
+      this.activeChildren--;
+    }
+  }
+
+  private routeHostResult(
+    request: SpawnRequest,
+    result: HostCommandResult,
+  ): SpawnResult {
+    let stdout = result.stdout ?? new Uint8Array();
+    let stderr = result.stderr ?? new Uint8Array();
+    if (request.stderrToStdout && stderr.byteLength) {
+      const combined = new Uint8Array(stdout.byteLength + stderr.byteLength);
+      combined.set(stdout);
+      combined.set(stderr, stdout.byteLength);
+      stdout = combined;
+      stderr = new Uint8Array();
+    }
+    const writeFile = (path: string, append: boolean | undefined, value: Uint8Array) => {
+      const stream = this.deps.py.FS.open(path, append ? "a" : "w");
+      try {
+        if (value.byteLength) this.deps.py.FS.write(stream, value, 0, value.byteLength);
+      } finally {
+        this.deps.py.FS.close(stream);
+      }
+    };
+    try {
+      if (request.outFile) writeFile(request.outFile, request.append, stdout);
+      else if (!request.capture && stdout.byteLength) {
+        this.deps.writeOut(new TextDecoder().decode(stdout));
+      }
+      if (request.errFile) writeFile(request.errFile, request.errAppend, stderr);
+      else if (stderr.byteLength) this.deps.writeError(new TextDecoder().decode(stderr));
+    } catch (error) {
+      this.deps.writeError(
+        `${request.path}: ${error instanceof Error ? error.message : String(error)}\r\n`,
+      );
+      return { exitCode: 1 };
+    }
+    return request.capture
+      ? { exitCode: result.exitCode, stdout: truncateBytes(stdout) }
+      : { exitCode: result.exitCode };
   }
 
   /* ---------------------- compile / link pseudo-commands ----------------- */
@@ -385,7 +501,7 @@ export class SlopSpawner {
     }
     if (request.capture) {
       const bytes = new TextEncoder().encode(stdout);
-      return { exitCode, stdout: bytes.slice(0, MAX_CAPTURE_BYTES) };
+      return { exitCode, stdout: truncateBytes(bytes) };
     }
     return { exitCode };
   }
@@ -608,13 +724,17 @@ export class SlopSpawner {
 }
 
 function concatChunks(chunks: Uint8Array[], total: number): Uint8Array {
+  const truncated = total > MAX_CAPTURE_BYTES;
   const out = new Uint8Array(Math.min(total, MAX_CAPTURE_BYTES));
+  const limit = truncated ? MAX_CAPTURE_BYTES - CAPTURE_TRUNCATED.byteLength : out.byteLength;
   let offset = 0;
   for (const chunk of chunks) {
-    if (offset + chunk.byteLength > out.byteLength) break;
-    out.set(chunk, offset);
-    offset += chunk.byteLength;
+    if (offset >= limit) break;
+    const selected = chunk.subarray(0, Math.min(chunk.byteLength, limit - offset));
+    out.set(selected, offset);
+    offset += selected.byteLength;
   }
+  if (truncated) out.set(CAPTURE_TRUNCATED, limit);
   return out;
 }
 
@@ -626,6 +746,8 @@ export interface SlopCommandOptions {
   onStdout?: (text: string) => void;
   onStderr?: (text: string) => void;
   note?: (text: string) => void;
+  /** In-memory credentials registered by /github, used by Slop git. */
+  getGitHubCredentials?: () => GitHubCredentials | null;
   /** Worker mode only; 0 disables (default 30s). */
   timeoutMs?: number;
   signal?: AbortSignal;
@@ -648,6 +770,7 @@ export async function runSlopCommand(
     writeError: options.onStderr ?? options.onStdout ?? (() => {}),
     note: options.note ?? (() => {}),
     childStdin: () => null, // deterministic EOF for interactive reads
+    getGitHubCredentials: options.getGitHubCredentials,
     signal: options.signal,
   });
   // Pre-fed stdin works in worker and main-thread fallback modes. It closes
@@ -698,6 +821,7 @@ export interface SlopSessionDeps {
   py: Pyodide;
   writeOut: (text: string) => void;
   note: (text: string) => void;
+  getGitHubCredentials?: () => GitHubCredentials | null;
   onExit: () => void;
 }
 
@@ -716,6 +840,7 @@ export class SlopSession {
       writeError: deps.writeOut,
       note: deps.note,
       childStdin: () => this.input.next(),
+      getGitHubCredentials: deps.getGitHubCredentials,
     });
   }
 
@@ -752,7 +877,7 @@ export class SlopSession {
 
   /** Stop the shell and any foreground child. */
   stop(): void {
-    this.spawner.foreground?.kill();
+    this.spawner.killForeground();
     this.slop?.kill();
     this.slop = null;
   }
@@ -773,8 +898,7 @@ export class SlopSession {
       } else if (ch === "\x03") {
         // Ctrl+C: kill the foreground child, or cancel the line at the prompt.
         this.deps.writeOut("^C\r\n");
-        if (this.spawner.foreground) this.spawner.foreground.kill();
-        else {
+        if (!this.spawner.killForeground()) {
           this.line = "";
           this.input.push(encoder.encode("\n"));
         }

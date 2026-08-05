@@ -27,6 +27,8 @@ interface SlopRun {
   exitCode: number;
   toolchainCommands: string[][];
   pythonCommands: string[][];
+  curlCommands: string[][];
+  gitCommands: Array<{ args: string[]; cwd: string }>;
 }
 
 function installShell(fs: MemoryFs): void {
@@ -36,6 +38,8 @@ function installShell(fs: MemoryFs): void {
   fs.writeFile("/bin/sh", shellBin("slop.wasm"));
   fs.writeFile("/bin/python", "piodide host-backed Python entrypoint\n");
   fs.writeFile("/bin/python3", "piodide host-backed Python entrypoint\n");
+  fs.writeFile("/bin/git", shellBin("git.wasm"));
+  fs.writeFile("/bin/curl", "piodide browser-hosted command\n");
   const coreutils = shellBin("coreutils.wasm");
   for (const name of COREUTILS) fs.writeFile(`/bin/${name}`, coreutils);
 }
@@ -47,7 +51,7 @@ async function runSlop(
 ): Promise<SlopRun> {
   // Pre-compile child modules (instantiation itself is synchronous).
   const modules = new Map<string, WebAssembly.Module>();
-  for (const name of ["slop", "make", "sed", "ar", "cat", "ls", "fd-find", "echo", "env", "grep"] as const) {
+  for (const name of ["slop", "make", "sed", "ar", "git", "cat", "ls", "fd-find", "echo", "env", "grep"] as const) {
     modules.set(name, await WebAssembly.compile(shellBin(`${name}.wasm`) as BufferSource));
   }
   const coreutilsModule = await WebAssembly.compile(shellBin("coreutils.wasm") as BufferSource);
@@ -60,6 +64,8 @@ async function runSlop(
   const encoder = new TextEncoder();
   const toolchainCommands: string[][] = [];
   const pythonCommands: string[][] = [];
+  const curlCommands: string[][] = [];
+  const gitCommands: Array<{ args: string[]; cwd: string }> = [];
 
   interface SpawnIo {
     stdinText?: Uint8Array;
@@ -183,6 +189,24 @@ async function runSlop(
       pythonCommands.push(childArgs);
       return 0;
     }
+    if (childName === "curl") {
+      curlCommands.push(childArgs);
+      return 0;
+    }
+    if (childName === "git-engine") {
+      gitCommands.push({ args: childArgs, cwd: childCwd });
+      const value = childArgs[1] === "--version"
+        ? encoder.encode("git version 2.0.0-piodide (libgit2 + isomorphic-git)\n")
+        : new Uint8Array();
+      if (ioPtr !== 0) {
+        const capturePtr = callerHost.readUint32(ioPtr + 8);
+        const captureCap = callerHost.readUint32(ioPtr + 12);
+        const captureLenPtr = callerHost.readUint32(ioPtr + 16);
+        if (capturePtr) callerHost.writeBytes(capturePtr, value.subarray(0, captureCap));
+        if (captureLenPtr) callerHost.writeUint32(captureLenPtr, value.byteLength);
+      }
+      return 0;
+    }
 
     const io: SpawnIo = {};
     if (ioPtr !== 0) {
@@ -255,7 +279,7 @@ async function runSlop(
   });
   const slopModule = modules.get("slop")!;
   const exitCode = slopHost.start(new WebAssembly.Instance(slopModule, slopHost.getImportObject()));
-  return { stdout, exitCode, toolchainCommands, pythonCommands };
+  return { stdout, exitCode, toolchainCommands, pythonCommands, curlCommands, gitCommands };
 }
 
 test("slop: quiet one-shot mode emits only command output", async () => {
@@ -287,6 +311,25 @@ test("slop: python and /bin/python route to the Pyodide host entrypoint", async 
     ["/bin/python", "script.py", "arg"],
     ["python3", "-V"],
   ]);
+});
+
+test("slop: native git and host curl are discoverable commands", async () => {
+  const fs = new MemoryFs();
+  fs.mkdirTree("/home/web");
+  installShell(fs);
+
+  const run = await runSlop(
+    fs,
+    ["type git", "command -v curl", "git --version", "/bin/curl -I https://example.com"],
+    { quiet: true },
+  );
+
+  assert.equal(run.exitCode, 0);
+  assert.match(run.stdout, /git is \/bin\/git/);
+  assert.match(run.stdout, /\/bin\/curl/);
+  assert.match(run.stdout, /git version 2\.0\.0-piodide/);
+  assert.deepEqual(run.gitCommands, [{ args: ["git-engine", "--version"], cwd: "/home/web" }]);
+  assert.deepEqual(run.curlCommands, [["/bin/curl", "-I", "https://example.com"]]);
 });
 
 test("slop: scripts, control flow, utilities, substitution, and exported env", async () => {

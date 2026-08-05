@@ -12,8 +12,9 @@ that exported placeholder structurally with the real import.
 `sed.c` and `ar.c` implement practical, bounded subsets suitable for the
 browser workspace. Committed binaries live in `../bin/`.
 
-`/bin/python` and `/bin/python3` are marker entrypoints routed by Slop to the
-page's long-lived Pyodide CPython runtime; they are not separate WASI binaries.
+`git.c` builds the native `/bin/git` frontend. It forwards Git CLI arguments to
+the browser-hosted libgit2 Wasm engine, which shares `/home/web` directly.
+`/bin/python`, `/bin/python3`, and `/bin/curl` are host marker entrypoints.
 
 Make and coreutils use spawn ABI v3. Slop uses v4, which adds stderr file and
 stderr-to-stdout routing after the v3 environment fields.

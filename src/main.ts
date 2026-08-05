@@ -85,12 +85,12 @@ Tools:
 - run_wasi: run a WASI .wasm file from /home/web with arguments, stdin, and environment variables. The program shares the live Pyodide filesystem (no copying): files it creates, edits, or deletes are immediately visible everywhere. Relative paths start at /home/web, and absolute /home/web paths also work. Use this tool directly to verify a linked executable; do not route ordinary WASI execution through Python.
 - compile_raylib: compile one C file into a raylib 6 game using the WASI software framebuffer. Include raylib.h and define game_init(void) and game_frame(float delta_seconds). The browser owns InitWindow and the frame loop, and the raylib tool supplies the WASI imports; never create an HTML/JavaScript host for it. 2D shapes, text, textures, keyboard, mouse, and touch are supported; audio and rmodels are not.
 - raylib: validate and open a compile_raylib-produced game in the full-screen canvas. Choose a bounded internal resolution and call it exactly once after compilation succeeds.
-- slop: run one command line in the Slop build shell. It supports buffered pipes, stdout/stderr redirects, &&/|| lists, variables, command and arithmetic expansion, globbing, functions, and line-oriented if/for/while/case blocks. /bin includes make, sh, sed, basic ar, bounded file utilities including uniq/xargs, ls/cat/grep/echo/env/fd-find, and host-routed cc/ld. Each tool call uses a fresh shell — filesystem changes persist, shell variables and cwd do not (pass cwd; default /home/web). Use slop for bounded shell-style jobs instead of Python file crunching.
+- slop: run one command line in the Slop build shell. It supports buffered pipes, stdout/stderr redirects, &&/|| lists, variables, command and arithmetic expansion, globbing, functions, and line-oriented if/for/while/case blocks. /bin includes make, sh, a compiled Git frontend, sed, basic ar, and bounded file utilities; cc/ld, Python, libgit2, curl, and GitHub transfer use browser host services. Each tool call uses a fresh shell — filesystem changes persist, shell variables and cwd do not (pass cwd; default /home/web). Use slop for shell workflows and familiar Git/curl command lines.
 - read: read a text file with line numbers; offset (1-based) and limit paginate large files.
 - write: create or overwrite a file; parent directories are created automatically.
 - edit: apply exact, unique string replacements (each oldText must match exactly once).
 - download: save one file from Pyodide to the user's browser downloads. Call it only when the user asks to download or save a file locally.
-- git: use a real Dulwich Git repository in /home/web for init/status/add/commit/log/diff. GitHub clone/pull/push use its browser-compatible API; private access is registered by the user with /github and is never visible to you. The remote adapter synchronizes committed snapshots, so commit before push and push before pull.
+- git: use Slop's compiled frontend in /home/web. Local operations combine libgit2 Wasm with a browser-native Git layer over canonical objects, refs, config, and indexes. Full smart-HTTP history/branches/tags work when the server allows CORS or the user supplies a trusted --cors-proxy. GitHub uses a bounded one-branch snapshot fallback without a proxy; private access is registered by the user with /github and is never visible to you.
 - fetch: fetch a URL via the browser's native fetch (CORS-limited); set path to save a binary response in /home/web. Saving a file does not display it.
 - image: display a PNG, JPEG, GIF, or WebP file from /home/web directly in the terminal. This is the only display path; call it exactly once.
 - html_debug: run a self-contained HTML file invisibly in the same opaque-origin sandbox and report console errors, uncaught exceptions, rejected promises, and resource failures. Use it after writing or editing HTML, fix every reported error, then call html.
@@ -139,11 +139,11 @@ Working method:
 
 Tools:
 - read, write, and edit operate on text files in /home/web. edit requires an exact unique oldText match.
-- slop runs one bounded command in the Slop build shell, with pipes, redirects, variables, substitution, globbing, Make, sed, file utilities, and host-routed cc/ld. Each tool call has a fresh cwd and shell state; pass cwd when needed. It is not Bash and cannot access host commands.
+- slop runs one bounded command in the Slop build shell, with pipes, redirects, variables, substitution, globbing, Make, sed, file utilities, and a compiled Git frontend backed by libgit2 Wasm. cc/ld, Python, curl, and GitHub transfer use browser host services. Each tool call has a fresh cwd and shell state; pass cwd when needed. It is not Bash and cannot access the host OS.
 - python runs focused, valid CPython 3 in the long-lived Pyodide runtime. Never use notebook ! commands, pip, os.system, or subprocess. Pure-Python packages can be installed with micropip when necessary.
 - compile_c compiles one C11/C17 source to a wasm32-wasi object. link_wasi links objects with WASI libc. run_wasi directly executes the resulting module and is the default way to verify it. Do not run WASI through Python unless the user specifically asks for Python/WASI integration. The first compile downloads about 52 MB; avoid speculative builds.
 - compile_raylib builds one C source containing game_init(void) and game_frame(float) against raylib 6's CPU framebuffer; raylib supplies the WASI imports, validates the module, and opens it with browser keyboard, mouse, and touch input. Never build an HTML/JavaScript host for it. Use BeginDrawing/EndDrawing inside game_frame. Do not call SetTargetFPS; the browser schedules frames. Audio and rmodels are unavailable. Call raylib exactly once at the end.
-- git manages the browser-local Dulwich repository. GitHub network operations require credentials registered separately by the user.
+- git creates canonical loose or packed repositories through the compiled Slop frontend. Browser smart HTTP preserves history, branches, and tags on CORS-enabled servers or through a user-supplied trusted proxy. Direct GitHub access falls back to a bounded one-branch snapshot; credentials are registered separately by the user.
 - fetch is browser fetch and is CORS-limited. download exports a file only when the user asks. image displays an image exactly once. html_debug invisibly checks one self-contained HTML file for startup errors; use it before html. html opens that file only after the check passes. The sandboxed srcdoc has an opaque origin, so browser storage and relative MEMFS fetches do not work; inline every dependency and keep runtime state in JavaScript memory.
 
 Constraints:
@@ -854,6 +854,7 @@ async function toggleSlop() {
         py,
         writeOut: writeSlopOutput,
         note: writeSlopNote,
+        getGitHubCredentials: () => gitHubCredentials,
         onExit: () => {
           if (activeView === "slop") {
             activeView = "agent";
@@ -2219,8 +2220,8 @@ all the way to \`/\`, Enter to open a file or directory, \`%\` to create a file,
 
 ## Git
 
-The agent's \`git\` tool uses Dulwich for local repositories. GitHub
-clone/pull/push use a browser-compatible snapshot transport; register private
+The agent's \`git\` tool creates standard Git repositories through Slop and
+libgit2 WebAssembly. GitHub clone/pull/push use browser fetch; register private
 access for the current page with \`/github\`.
 
 ## Host files

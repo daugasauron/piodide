@@ -9,7 +9,7 @@ flowchart TB
   FS[("/home/web")]
   Agent["Agent file tools"] <--> FS
   Python <--> FS
-  Git["Dulwich Git"] <--> FS
+  Git["Git · libgit2 Wasm"] <--> FS
   Neovim <--> FS
   Slop["Slop + WASI programs"] <--> FS
   Upload["Upload / download"] <--> FS
@@ -35,8 +35,10 @@ The agent can call `download` only after the user asks for a file.
 
 ## GitHub
 
-The `git` tool uses Dulwich inside MEMFS. `/github` registers a page-memory
-token for clone, pull, and push through the GitHub API.
+The compiled `git` frontend stores standard repositories in `/home/web`.
+Browser smart HTTP works with CORS-enabled servers or a user-supplied trusted
+proxy. `/github` registers a page-memory token for the direct GitHub snapshot
+fallback and pushes.
 
 ## Lifetime
 
