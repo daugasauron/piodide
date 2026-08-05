@@ -27,6 +27,7 @@ const RPC_BUFFER_BYTES = 2 * 1024 * 1024;
 const DEFAULT_TIMEOUT_MS = 30_000;
 const MAX_CAPTURE_CHARS = 100_000;
 const MAX_SPAWN_DEPTH = 4;
+const MAX_SPAWN_CAPTURE_BYTES = 1024 * 1024;
 
 export const WASI_PREOPENS: (string | WasiPreopen)[] = [
   { name: ".", path: "/home/web" },
@@ -70,7 +71,7 @@ export interface WasiProgramRequest {
     errAppend?: boolean;
     stderrToStdout?: boolean;
     env?: Record<string, string>;
-  }) => Promise<{ exitCode: number; stdout?: Uint8Array }>;
+  }) => Promise<{ exitCode: number; stdout?: Uint8Array; stdoutLength?: number }>;
   /** Internal: current spawn nesting depth. */
   spawnDepth?: number;
   onStdout?: (text: string) => void;
@@ -233,9 +234,10 @@ function startInWorker(
       errAppend?: boolean;
       stderrToStdout?: boolean;
       env?: Record<string, string>;
-    }): Promise<{ exitCode: number; stdout?: Uint8Array }> => {
+    }): Promise<{ exitCode: number; stdout?: Uint8Array; stdoutLength?: number }> => {
       if (spawnDepth >= MAX_SPAWN_DEPTH) return { exitCode: 126 };
       const captured: Uint8Array[] = [];
+      let capturedBytes = 0;
       const child = startWasiProgram(py, {
         executablePath: path,
         args: args.slice(1),
@@ -253,21 +255,26 @@ function startInWorker(
               };
             })()
           : undefined,
-        onStdoutBytes: capture ? (chunk) => captured.push(chunk.slice()) : undefined,
+        onStdoutBytes: capture ? (chunk) => {
+          if (capturedBytes < MAX_SPAWN_CAPTURE_BYTES) {
+            captured.push(chunk.slice(0, MAX_SPAWN_CAPTURE_BYTES - capturedBytes));
+          }
+          capturedBytes += chunk.byteLength;
+        } : undefined,
         onStdout: capture ? undefined : request.onStdout,
         onStderr: request.onStderr,
       });
       try {
         const result = await child.result;
         if (capture) {
-          const total = captured.reduce((sum, chunk) => sum + chunk.byteLength, 0);
+          const total = Math.min(capturedBytes, MAX_SPAWN_CAPTURE_BYTES);
           const stdout = new Uint8Array(total);
           let offset = 0;
           for (const chunk of captured) {
             stdout.set(chunk, offset);
             offset += chunk.byteLength;
           }
-          return { exitCode: result.exitCode, stdout };
+          return { exitCode: result.exitCode, stdout, stdoutLength: capturedBytes };
         }
         return { exitCode: result.exitCode };
       } catch {

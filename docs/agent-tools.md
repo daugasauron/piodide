@@ -36,7 +36,8 @@ Use `/upload` to import host files; it must be initiated by the user.
 ## Boundaries
 
 - No host shell, subprocesses, sockets, or host filesystem access.
-- Browser `fetch` follows CORS.
+- Browser `fetch` follows CORS. A simple request may reach its server even when
+  the response is blocked; see [Browser curl](curl.md).
 - HTML previews have no browser storage or relative `/home/web` URLs; inline assets and state.
 - The wasm32 heap has a hard ceiling near 4 GiB.
 - Prefer bounded reads, output, and allocations.

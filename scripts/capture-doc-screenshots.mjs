@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 
 import { spawn } from "node:child_process";
+import { createServer } from "node:http";
 import {
   existsSync,
   mkdirSync,
@@ -42,6 +43,80 @@ void game_frame(float delta_seconds) {
 
 const sleep = (milliseconds) =>
   new Promise((resolveSleep) => setTimeout(resolveSleep, milliseconds));
+
+async function startCurlFixture() {
+  const allowedOrigin = new URL(appUrl).origin;
+  let fixtureOrigin = "";
+  const server = createServer(async (request, response) => {
+    const chunks = [];
+    for await (const chunk of request) chunks.push(chunk);
+    const body = Buffer.concat(chunks);
+    const url = new URL(request.url, fixtureOrigin || "http://127.0.0.1");
+    if (url.pathname !== "/nocors") {
+      response.setHeader("Access-Control-Allow-Origin", allowedOrigin);
+      response.setHeader("Access-Control-Allow-Headers", "authorization, content-type, x-repeat");
+      response.setHeader("Access-Control-Allow-Methods", "GET, POST, HEAD, OPTIONS");
+      response.setHeader("Access-Control-Expose-Headers", "X-Curl-E2E, Content-Length");
+    }
+    if (request.method === "OPTIONS") {
+      response.writeHead(204);
+      response.end();
+      return;
+    }
+    if (url.pathname === "/redirect") {
+      response.writeHead(302, { Location: `${fixtureOrigin}/final` });
+      response.end("REDIRECT");
+      return;
+    }
+    if (url.pathname === "/final") {
+      response.setHeader("X-Curl-E2E", "final");
+      response.end("FINAL");
+      return;
+    }
+    if (url.pathname === "/nocors") {
+      response.end("NO CORS");
+      return;
+    }
+    if (url.pathname === "/binary") {
+      response.setHeader("Content-Type", "application/octet-stream");
+      response.end(Buffer.from([0, 1, 2, 255, 10]));
+      return;
+    }
+    if (url.pathname === "/large") {
+      response.end(Buffer.alloc(1024 * 1024 + 64, 65));
+      return;
+    }
+    if (url.pathname === "/cookie") {
+      response.setHeader("Set-Cookie", "curl_e2e=hidden; SameSite=Lax");
+      response.end("SET");
+      return;
+    }
+    if (url.pathname === "/echo") {
+      response.setHeader("Content-Type", "application/json");
+      response.end(JSON.stringify({
+        method: request.method,
+        headers: request.headers,
+        body: [...body],
+      }));
+      return;
+    }
+    response.writeHead(404);
+    response.end("missing");
+  });
+  await new Promise((resolveListen, rejectListen) => {
+    server.once("error", rejectListen);
+    server.listen(0, "127.0.0.1", resolveListen);
+  });
+  const address = server.address();
+  fixtureOrigin = `http://127.0.0.1:${address.port}`;
+  return {
+    url: fixtureOrigin,
+    close: () => new Promise((resolveClose, rejectClose) => {
+      server.closeAllConnections?.();
+      server.close((error) => error ? rejectClose(error) : resolveClose());
+    }),
+  };
+}
 
 async function waitForFile(path, timeout = 15_000) {
   const deadline = Date.now() + timeout;
@@ -364,7 +439,7 @@ async function exerciseSlopChannels(client) {
   }
 }
 
-async function exerciseSlopGitAndCurl(client) {
+async function exerciseSlopGitAndCurl(client, curlFixtureUrl = "") {
   const evaluation = await client.send("Runtime.evaluate", {
     expression: `(async () => {
       const tool = window.__pi.agent.state.tools.find(({ name }) => name === "slop");
@@ -374,6 +449,46 @@ async function exerciseSlopGitAndCurl(client) {
         "e2e-slop-curl",
         { command: "curl -fsS " + url + " | grep '<title>piodide</title>' > curl-pipe.txt && curl -fsS -o curl-e2e.txt " + url + " && cat curl-pipe.txt" }
       );
+      let curlBrowser = null;
+      const fixture = ${JSON.stringify(curlFixtureUrl)};
+      if (fixture) {
+        const run = async (name, command) => {
+          const result = await tool.execute("e2e-curl-" + name, { command });
+          return {
+            exit: result.details?.exitCode,
+            stdout: result.details?.stdout ?? "",
+            stderr: result.details?.stderr ?? ""
+          };
+        };
+        curlBrowser = {};
+        curlBrowser.cors = await run(
+          "cors",
+          "curl -sS -H 'Authorization: Bearer browser-test' -H 'X-Repeat: one' " +
+            "-H 'X-Repeat: two' --json '{\\\"ok\\\":true}' " + fixture + "/echo"
+        );
+        curlBrowser.noCors = await run("nocors", "curl -sS " + fixture + "/nocors");
+        curlBrowser.redirect = await run("redirect", "curl -sS " + fixture + "/redirect");
+        curlBrowser.follow = await run("follow", "curl -sSL " + fixture + "/redirect");
+        curlBrowser.binary = await run(
+          "binary",
+          "curl -fsS -o browser-curl.bin " + fixture + "/binary"
+        );
+        curlBrowser.cookie = await run(
+          "cookie",
+          "curl -sS " + fixture + "/cookie > /dev/null && curl -sS " + fixture + "/echo"
+        );
+        curlBrowser.overflow = await run(
+          "overflow",
+          "curl -sS " + fixture + "/large | wc -c"
+        );
+        curlBrowser.forbidden = await run(
+          "forbidden",
+          "curl -sS -H 'User-Agent: hidden' " + fixture + "/echo"
+        );
+        curlBrowser.binaryFile = [
+          ...window.__pi.py.FS.readFile("/home/web/browser-curl.bin")
+        ];
+      }
       const git = await tool.execute(
         "e2e-slop-git",
         { command: "mkdir -p git-e2e/src && cd git-e2e && git init -b main && echo browser-git > src/file.txt && cd src && git add . && git commit -m initial && git switch -c feature && echo feature > file.txt && git add file.txt && git commit -m feature && git switch main && cat file.txt && git switch feature && git status --porcelain && git log --oneline -1 && git rev-parse --show-toplevel" }
@@ -419,6 +534,7 @@ async function exerciseSlopGitAndCurl(client) {
         gitOut: git.details?.stdout ?? "",
         gitErr: git.details?.stderr ?? "",
         curlFile: new TextDecoder().decode(window.__pi.py.FS.readFile("/home/web/curl-e2e.txt")),
+        curlBrowser,
         gitHead: new TextDecoder().decode(window.__pi.py.FS.readFile("/home/web/git-e2e/.git/HEAD")),
         gitMain: decode("/home/web/git-e2e/src/file.txt"),
         cloneOut: clone.content?.[0]?.text ?? "",
@@ -435,11 +551,29 @@ async function exerciseSlopGitAndCurl(client) {
     );
   }
   const state = evaluation.result.value;
+  const browser = state.curlBrowser;
+  const browserValid = !browser || (
+    browser.cors.exit === 0 &&
+    browser.cors.stdout.includes('"authorization":"Bearer browser-test"') &&
+    browser.cors.stdout.includes('"x-repeat":"one, two"') &&
+    browser.cors.stdout.includes('"content-type":"application/json"') &&
+    browser.noCors.exit === 7 &&
+    browser.noCors.stderr.includes("CORS") &&
+    browser.redirect.exit === 47 &&
+    browser.redirect.stderr.includes("rerun with -L") &&
+    browser.follow.exit === 0 && browser.follow.stdout === "FINAL" &&
+    browser.binary.exit === 0 && browser.binaryFile.join(",") === "0,1,2,255,10" &&
+    browser.cookie.exit === 0 && !browser.cookie.stdout.includes('"cookie"') &&
+    browser.overflow.exit === 23 && browser.overflow.stdout === "" &&
+    browser.overflow.stderr.includes("write it to a file") &&
+    browser.forbidden.exit === 2 && browser.forbidden.stderr.includes("browser controls")
+  );
   if (
     state.curlExit !== 0 ||
     !state.curlOut.includes("<title>piodide</title>") ||
     state.curlErr !== "" ||
     !state.curlFile.includes("<title>piodide</title>") ||
+    !browserValid ||
     state.gitExit !== 0 ||
     !state.gitOut.includes("initial") ||
     !state.gitOut.includes("browser-git") ||
@@ -593,6 +727,12 @@ async function main() {
   mkdirSync(outputDir, { recursive: true });
   const profile = mkdtempSync(join(tmpdir(), "piodide-docs-chrome-"));
   const devToolsFile = join(profile, "DevToolsActivePort");
+  const appLocation = new URL(appUrl);
+  const curlFixture =
+    appLocation.protocol === "http:" &&
+    ["127.0.0.1", "localhost"].includes(appLocation.hostname)
+      ? await startCurlFixture()
+      : null;
   const chrome = spawn(
     chromeBin,
     [
@@ -627,7 +767,7 @@ async function main() {
     await waitForPython(client);
     await exerciseHtmlDebug(client);
     await exerciseSlopChannels(client);
-    await exerciseSlopGitAndCurl(client);
+    await exerciseSlopGitAndCurl(client, curlFixture?.url ?? "");
     await exerciseRaylibPreview(client, viewport.width, viewport.height);
     await exerciseHtmlPreview(client, viewport.width, viewport.height, false);
     await focusTerminal(client);
@@ -1053,6 +1193,7 @@ async function main() {
   } finally {
     client?.close();
     chrome.kill("SIGTERM");
+    await curlFixture?.close();
     await sleep(300);
     rmSync(profile, { recursive: true, force: true });
   }

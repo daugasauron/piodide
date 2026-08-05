@@ -48,6 +48,7 @@ Open <http://localhost:5173/piodide/>, run `/provider`, then `/model`.
 | [Local models](docs/local-models.md) | WebLLM, Wllama, GPU setup, model cache |
 | [Agent tools](docs/agent-tools.md) | Python, files, Git, previews, C toolchain |
 | [Slop build shell](docs/slop.md) | Scripts, Make, utilities, pipes, and compilation |
+| [Browser curl](docs/curl.md) | HTTP requests, CORS, redirects, files, limits |
 | [WASI runtime](docs/wasi.md) | Host design, execution modes, Python bridge |
 | [Raylib framebuffer](docs/raylib.md) | C games, canvas output, browser input |
 | [Development](docs/development.md) | Scripts, tests, Pages, screenshots |

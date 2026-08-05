@@ -191,6 +191,13 @@ async function runSlop(
     }
     if (childName === "curl") {
       curlCommands.push(childArgs);
+      if (childArgs.includes("https://large.example") && ioPtr !== 0) {
+        const capturePtr = callerHost.readUint32(ioPtr + 8);
+        const captureCap = callerHost.readUint32(ioPtr + 12);
+        const captureLenPtr = callerHost.readUint32(ioPtr + 16);
+        if (capturePtr) callerHost.writeBytes(capturePtr, new Uint8Array(captureCap).fill(65));
+        if (captureLenPtr) callerHost.writeUint32(captureLenPtr, captureCap + 1);
+      }
       return 0;
     }
     if (childName === "git-engine") {
@@ -330,6 +337,24 @@ test("slop: native git and host curl are discoverable commands", async () => {
   assert.match(run.stdout, /git version 2\.0\.0-piodide/);
   assert.deepEqual(run.gitCommands, [{ args: ["git-engine", "--version"], cwd: "/home/web" }]);
   assert.deepEqual(run.curlCommands, [["/bin/curl", "-I", "https://example.com"]]);
+});
+
+test("slop: oversized host and WASI output fail before a pipeline consumer runs", async () => {
+  const fs = new MemoryFs();
+  fs.mkdirTree("/home/web");
+  installShell(fs);
+  fs.writeFile("/home/web/large.bin", new Uint8Array(1024 * 1024 + 1).fill(66));
+
+  const run = await runSlop(
+    fs,
+    ["curl https://large.example | wc -c", "cat large.bin | wc -c"],
+    { quiet: true },
+  );
+
+  assert.equal(run.exitCode, 23);
+  assert.equal(run.stdout.match(/command output exceeds 1048576 bytes/g)?.length, 2);
+  assert.doesNotMatch(run.stdout, /1048576\s*$/);
+  assert.deepEqual(run.curlCommands, [["curl", "https://large.example"]]);
 });
 
 test("slop: scripts, control flow, utilities, substitution, and exported env", async () => {

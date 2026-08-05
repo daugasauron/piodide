@@ -142,23 +142,23 @@ GPL-2.0 linking-exception license ships as `wasm-git-COPYING.txt`.
 
 ## Curl
 
-`curl` wraps browser `fetch` and works with shell pipes and redirects:
+`curl` is a bounded, browser-fetch HTTP client:
 
 ```sh
 curl -fsS https://example.com/data.json | grep name
-curl -H "Authorization: Bearer …" --json '{"ok":true}' https://example.com/api
-curl -o result.bin https://example.com/result.bin
+curl --json '{"ok":true}' https://example.com/api
+curl -L -o result.bin https://example.com/result.bin
 ```
 
-Common request, header, data, output, failure, timeout, and write-out flags are
-supported. Responses are capped at 32 MiB. CORS still applies; the browser owns
-TLS, cookies, proxies, `User-Agent`, and forbidden headers.
+See [Browser curl](curl.md) for supported flags, CORS and redirect behavior,
+exit codes, and limits.
 
 ## Controls and limits
 
 - `Ctrl+C`: stop the foreground program or clear the line.
 - `Ctrl+D`: send EOF or exit an empty shell.
-- Pipelines execute sequentially and buffer at most 1 MiB per stage.
+- Pipelines execute sequentially and buffer at most 1 MiB per stage. Overflow
+  fails before the consumer runs; write large output directly to a file.
 - `/bin/git` is WASI-native; libgit2 and GitHub transfer are browser-hosted Wasm/JS.
 - Background jobs, process groups, streaming pipelines, and heredocs are not
   implemented.

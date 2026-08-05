@@ -724,7 +724,8 @@ export function createSlopTool(
       "$VAR/${VAR}/$?/$(command)/$((arithmetic)) expansion, globbing, and quotes. " +
       "$PATH is exactly /bin and includes bounded file utilities, uniq, and xargs. Host-routed " +
       "cc/ld compile and link WASI programs; libgit2 provides Git-compatible repositories, " +
-      "with GitHub clone/pull/push over browser fetch; curl is also CORS-limited. " +
+      "with GitHub clone/pull/push over browser fetch; browser curl is CORS-limited, follows " +
+      "redirects only with -L, and requires -o for output above the 1 MiB pipeline limit. " +
       "Each call is a fresh " +
       "shell: cwd does not persist between calls (pass cwd instead), but every file " +
       "change does. stdout, stderr, and the exit code are returned.",

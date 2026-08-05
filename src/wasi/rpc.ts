@@ -144,7 +144,7 @@ export class RpcFsClient implements WasiFs {
     errAppend?: boolean;
     stderrToStdout?: boolean;
     env?: Record<string, string>;
-  }): { exitCode: number; stdout?: Uint8Array } {
+  }): { exitCode: number; stdout?: Uint8Array; stdoutLength?: number } {
     const { response, blob } = this.request(
       "spawn",
       {
@@ -162,7 +162,9 @@ export class RpcFsClient implements WasiFs {
       request.stdinText,
     );
     const exitCode = response.exitCode as number;
-    return request.capture ? { exitCode, stdout: blob } : { exitCode };
+    return request.capture
+      ? { exitCode, stdout: blob, stdoutLength: response.stdoutLength as number }
+      : { exitCode };
   }
 
   open(path: string, options: WasiOpenOptions, mode: number): WasiHandle {
@@ -300,7 +302,7 @@ export interface RpcFsServerOptions {
     errAppend?: boolean;
     stderrToStdout?: boolean;
     env?: Record<string, string>;
-  }) => Promise<{ exitCode: number; stdout?: Uint8Array }>;
+  }) => Promise<{ exitCode: number; stdout?: Uint8Array; stdoutLength?: number }>;
   signal?: AbortSignal;
 }
 
@@ -464,7 +466,11 @@ export function serveWasiFsRpc(options: RpcFsServerOptions): RpcFsServer {
             stderrToStdout: args.stderrToStdout === true,
             env: (args.env as Record<string, string>) ?? undefined,
           });
-          respond({ errno: 0, exitCode: result.exitCode }, result.stdout);
+          respond({
+            errno: 0,
+            exitCode: result.exitCode,
+            stdoutLength: result.stdoutLength ?? result.stdout?.byteLength ?? 0,
+          }, result.stdout);
         } catch (error) {
           respond({
             errno: 0,

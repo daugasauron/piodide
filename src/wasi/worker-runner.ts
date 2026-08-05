@@ -95,7 +95,9 @@ function createSpawnImport(
     if (capture && result.stdout) {
       const copied = Math.min(captureCap, result.stdout.byteLength);
       host.writeBytes(capturePtr, result.stdout.subarray(0, copied));
-      if (captureLenPtr !== 0) host.writeUint32(captureLenPtr, result.stdout.byteLength);
+      if (captureLenPtr !== 0) {
+        host.writeUint32(captureLenPtr, result.stdoutLength ?? result.stdout.byteLength);
+      }
     }
     return result.exitCode;
   };

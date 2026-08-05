@@ -46,15 +46,14 @@ const MAX_TOOLCHAIN_INPUTS = 32;
 const HOST_ENTRYPOINT_MARKER = "piodide browser-hosted command\n";
 /** Pipe captures are bounded so a runaway producer can't eat the page. */
 const MAX_CAPTURE_BYTES = 1024 * 1024;
-const CAPTURE_TRUNCATED = new TextEncoder().encode("\n[slop: output truncated at 1 MiB]\n");
 
-function truncateBytes(value: Uint8Array): Uint8Array {
-  if (value.byteLength <= MAX_CAPTURE_BYTES) return value;
-  const output = new Uint8Array(MAX_CAPTURE_BYTES);
-  const kept = MAX_CAPTURE_BYTES - CAPTURE_TRUNCATED.byteLength;
-  output.set(value.subarray(0, kept));
-  output.set(CAPTURE_TRUNCATED, kept);
-  return output;
+function boundedBytes(value: Uint8Array): { stdout: Uint8Array; stdoutLength: number } {
+  return {
+    stdout: value.byteLength <= MAX_CAPTURE_BYTES
+      ? value
+      : value.subarray(0, MAX_CAPTURE_BYTES).slice(),
+    stdoutLength: value.byteLength,
+  };
 }
 
 function shellPreopens(cwd: string) {
@@ -137,6 +136,8 @@ interface SpawnRequest {
 interface SpawnResult {
   exitCode: number;
   stdout?: Uint8Array;
+  /** Original size before RPC-safe truncation; lets the guest reject overflow. */
+  stdoutLength?: number;
 }
 
 interface SlopSpawnerDeps {
@@ -146,6 +147,8 @@ interface SlopSpawnerDeps {
   note: (text: string) => void;
   /** Interactive stdin for children (the session's tty buffer; EOF otherwise). */
   childStdin: () => Promise<Uint8Array | null> | Uint8Array | null;
+  /** Resolve a pending interactive read when the host command is aborted. */
+  cancelChildStdin?: () => void;
   getGitHubCredentials?: () => GitHubCredentials | null;
   signal?: AbortSignal;
 }
@@ -282,7 +285,11 @@ export class SlopSpawner {
       if (fileStream !== null) this.deps.py.FS.close(fileStream);
       if (errorStream !== null) this.deps.py.FS.close(errorStream);
       if (capture) {
-        return { exitCode: result.exitCode, stdout: concatChunks(captured, capturedBytes) };
+        return {
+          exitCode: result.exitCode,
+          stdout: concatChunks(captured, capturedBytes),
+          stdoutLength: capturedBytes,
+        };
       }
       return { exitCode: result.exitCode };
     } catch {
@@ -300,6 +307,7 @@ export class SlopSpawner {
     const active = this.foreground !== null || this.hostAbort !== null;
     this.foreground?.kill();
     this.hostAbort?.abort();
+    if (this.hostAbort) this.deps.cancelChildStdin?.();
     return active;
   }
 
@@ -314,7 +322,10 @@ export class SlopSpawner {
     this.activeChildren++;
     const controller = new AbortController();
     this.hostAbort = controller;
-    const abort = () => controller.abort(this.deps.signal?.reason);
+    const abort = () => {
+      controller.abort(this.deps.signal?.reason);
+      this.deps.cancelChildStdin?.();
+    };
     this.deps.signal?.addEventListener("abort", abort, { once: true });
     try {
       const result = await run({
@@ -322,6 +333,7 @@ export class SlopSpawner {
         args: request.args,
         cwd: request.cwd,
         stdin: request.stdinText,
+        readStdin: this.deps.childStdin,
         signal: controller.signal,
         getGitHubCredentials: this.deps.getGitHubCredentials,
       });
@@ -374,9 +386,8 @@ export class SlopSpawner {
       );
       return { exitCode: 1 };
     }
-    return request.capture
-      ? { exitCode: result.exitCode, stdout: truncateBytes(stdout) }
-      : { exitCode: result.exitCode };
+    if (!request.capture) return { exitCode: result.exitCode };
+    return { exitCode: result.exitCode, ...boundedBytes(stdout) };
   }
 
   /* ---------------------- compile / link pseudo-commands ----------------- */
@@ -436,7 +447,11 @@ export class SlopSpawner {
         stderr,
       });
       return request.capture
-        ? { exitCode, stdout: concatChunks(captured, capturedBytes) }
+        ? {
+            exitCode,
+            stdout: concatChunks(captured, capturedBytes),
+            stdoutLength: capturedBytes,
+          }
         : { exitCode };
     } catch (error) {
       this.deps.writeError(
@@ -501,7 +516,7 @@ export class SlopSpawner {
     }
     if (request.capture) {
       const bytes = new TextEncoder().encode(stdout);
-      return { exitCode, stdout: truncateBytes(bytes) };
+      return { exitCode, ...boundedBytes(bytes) };
     }
     return { exitCode };
   }
@@ -724,9 +739,8 @@ export class SlopSpawner {
 }
 
 function concatChunks(chunks: Uint8Array[], total: number): Uint8Array {
-  const truncated = total > MAX_CAPTURE_BYTES;
   const out = new Uint8Array(Math.min(total, MAX_CAPTURE_BYTES));
-  const limit = truncated ? MAX_CAPTURE_BYTES - CAPTURE_TRUNCATED.byteLength : out.byteLength;
+  const limit = out.byteLength;
   let offset = 0;
   for (const chunk of chunks) {
     if (offset >= limit) break;
@@ -734,7 +748,6 @@ function concatChunks(chunks: Uint8Array[], total: number): Uint8Array {
     out.set(selected, offset);
     offset += selected.byteLength;
   }
-  if (truncated) out.set(CAPTURE_TRUNCATED, limit);
   return out;
 }
 
@@ -815,6 +828,10 @@ class SharedInput {
     if (queued !== undefined) return queued;
     return new Promise((resolve) => this.waiting.push(resolve));
   }
+
+  cancelNext(): void {
+    this.waiting.shift()?.(null);
+  }
 }
 
 export interface SlopSessionDeps {
@@ -840,6 +857,7 @@ export class SlopSession {
       writeError: deps.writeOut,
       note: deps.note,
       childStdin: () => this.input.next(),
+      cancelChildStdin: () => this.input.cancelNext(),
       getGitHubCredentials: deps.getGitHubCredentials,
     });
   }

@@ -1190,9 +1190,17 @@ static int run_pipeline(Command *cmds, int ncmd) {
       }
 
       if (capture) {
-        previous_len = (int)ftell(out); fclose(out);
+        int overflow = fflush(out) == EOF || ferror(out);
+        previous_len = (int)ftell(out);
+        if (fclose(out) == EOF) overflow = 1;
+        if (overflow || previous_len > PIPE_CAP) {
+          fprintf(stderr, "slop: command output exceeds %d bytes; write it to a file instead\n", PIPE_CAP);
+          if (efile && err != out) fclose(err);
+          restore_assignments(&assignments);
+          return 23;
+        }
         if (last && capture_active) {
-          capture_length = previous_len > PIPE_CAP ? PIPE_CAP : previous_len;
+          capture_length = previous_len;
           memcpy(capture_buffer, cur, (size_t)capture_length); previous = NULL; previous_len = 0;
         } else previous = cur;
       } else { if (out_file) fclose(out); previous = NULL; previous_len = 0; }
@@ -1219,7 +1227,11 @@ static int run_pipeline(Command *cmds, int ncmd) {
       else if (!last || capture_active) { io.capture = cur; io.capture_cap = PIPE_CAP; io.capture_len = &captured; }
       io.err_file = efile; io.err_append = c->err_append; io.err_to_out = c->err_to_out;
       code = piodide_spawn(spawn_path, blob, cwd, &io);
-      if (captured > PIPE_CAP) { fprintf(stderr, "slop: output truncated at %d bytes\n", PIPE_CAP); captured = PIPE_CAP; }
+      if (captured > PIPE_CAP) {
+        fprintf(stderr, "slop: command output exceeds %d bytes; write it to a file instead\n", PIPE_CAP);
+        restore_assignments(&assignments);
+        return 23;
+      }
       if (out_file) { previous = NULL; previous_len = 0; }
       else if (!last) { previous = cur; previous_len = captured; }
       else if (capture_active) {
