@@ -49,6 +49,10 @@ import { getLocalProviderBinding } from "./local-provider.ts";
 import type { LocalModelRuntime, LocalModelStatus } from "./local-model.ts";
 import { browserModelRuntime } from "./browser-model-runtime.ts";
 import { webLLMRuntime } from "./webllm-runtime.ts";
+import {
+  estimateWebLLMVramBytes,
+  getWebLLMModel,
+} from "./webllm-models.ts";
 import { createAllTools, createHtmlTool, createImageTool } from "./tools.ts";
 import type { NeovimController } from "./neovim.ts";
 import {
@@ -428,6 +432,23 @@ function currentLocalProvider() {
   return getLocalProviderBinding(provider);
 }
 
+function selectedLocalContextSize(modelId: string): number | undefined {
+  if (provider?.api === "browser-webllm") return webLLMRuntime.contextSize(modelId);
+  if (provider?.api === "browser-wllama") return browserModelRuntime.contextSize(modelId);
+  return undefined;
+}
+
+async function setLocalContextSize(
+  modelId: string,
+  contextSize: number,
+): Promise<void> {
+  if (provider?.api === "browser-webllm") {
+    await webLLMRuntime.setContextSize(modelId, contextSize);
+  } else if (provider?.api === "browser-wllama") {
+    await browserModelRuntime.setContextSize(modelId, contextSize);
+  }
+}
+
 function currentSystemPrompt() {
   const base = provider?.transport === "browser"
     ? LOCAL_SYSTEM_PROMPT
@@ -650,11 +671,12 @@ function applyConfigToAgent() {
   if (agent && provider) {
     const modelId = currentModelId();
     const loadedInfo = getLoadedModelInfo(provider.name, modelId);
+    const selectedContext = selectedLocalContextSize(modelId);
     const info =
-      provider.api === "browser-wllama" && loadedInfo
+      selectedContext !== undefined && loadedInfo
         ? {
             ...loadedInfo,
-            contextWindow: browserModelRuntime.contextSize(modelId),
+            contextWindow: selectedContext,
           }
         : loadedInfo;
     const model = makeModel({
@@ -1054,41 +1076,49 @@ async function activateModel(modelId: string, contextSize?: number) {
   ) {
     await localProvider.runtime.unload();
   }
-  if (provider?.api === "browser-wllama" && contextSize !== undefined) {
-    await browserModelRuntime.setContextSize(modelId, contextSize);
+  if (localProvider && contextSize !== undefined) {
+    await setLocalContextSize(modelId, contextSize);
   }
   modelOverride = modelId === provider?.defaultModel ? null : modelId;
   applyConfigToAgent();
-  const context =
-    provider?.api === "browser-wllama"
-      ? `   context: ${formatContextSize(browserModelRuntime.contextSize(modelId))}`
-      : "";
+  const selectedContext = selectedLocalContextSize(modelId);
+  const context = selectedContext
+    ? `   context: ${formatContextSize(selectedContext)}`
+    : "";
   say(cyan(`  ◇ model: ${modelId}${context}`));
 }
 
 async function selectBrowserContextSize(modelId: string): Promise<number | null> {
-  const model = getBrowserModel(modelId);
-  if (!model) throw new Error(`Unknown Wllama model: ${modelId}`);
+  const webLLMModel =
+    provider?.api === "browser-webllm" ? getWebLLMModel(modelId) : undefined;
+  const wllamaModel =
+    provider?.api === "browser-wllama" ? getBrowserModel(modelId) : undefined;
+  const model = webLLMModel ?? wllamaModel;
+  if (!model) throw new Error(`Unknown local model: ${modelId}`);
+  const contextOptions = webLLMModel?.contextOptions ?? wllamaModel!.contextOptions;
+  const defaultContext = webLLMModel?.contextWindow ?? wllamaModel!.load.contextSize;
   return prompt.select({
     title: `Select context / KV cache · ${model.label}`,
-    active: browserModelRuntime.contextSize(modelId),
-    options: model.contextOptions.map((contextSize) => {
-      const estimate = estimateWebGpuKvCacheBytes(model, contextSize);
+    active: selectedLocalContextSize(modelId),
+    options: contextOptions.map((contextSize) => {
+      const memory = webLLMModel
+        ? `${formatModelBytes(estimateWebLLMVramBytes(webLLMModel, contextSize))} estimated VRAM`
+        : (() => {
+            const estimate = estimateWebGpuKvCacheBytes(wllamaModel!, contextSize);
+            return estimate === undefined
+              ? ""
+              : `~${formatModelBytes(estimate)} WebGPU KV cache`;
+          })();
       const sizeHint =
-        contextSize === model.load.contextSize
+        contextSize === defaultContext
           ? "recommended · default"
-          : contextSize < model.load.contextSize
+          : contextSize < defaultContext
             ? "lower memory"
             : "larger working context";
       return {
         value: contextSize,
         label: `${formatContextSize(contextSize)} context`,
-        description: [
-          sizeHint,
-          estimate === undefined
-            ? ""
-            : `~${formatModelBytes(estimate)} WebGPU KV cache`,
-        ]
+        description: [sizeHint, memory]
           .filter(Boolean)
           .join(" · "),
       };
@@ -1109,10 +1139,10 @@ async function showBrowserModels(): Promise<void> {
   for (const model of localProvider.models) {
     const active = model.id === currentModelId() ? cyan("active") : "";
     const details = localProvider.describeModel(model, cached.has(model.id));
-    const context =
-      provider?.api === "browser-wllama"
-        ? `${formatContextSize(browserModelRuntime.contextSize(model.id))} selected context`
-        : "";
+    const selectedContext = selectedLocalContextSize(model.id);
+    const context = selectedContext
+      ? `${formatContextSize(selectedContext)} selected context`
+      : "";
     say(`  ${model.label.padEnd(24)} ${model.id}`);
     say(
       dim(
@@ -1543,7 +1573,7 @@ async function runSlash(input: string) {
         });
         if (modelId) {
           const contextSize =
-            provider.api === "browser-wllama"
+            provider.transport === "browser"
               ? await selectBrowserContextSize(modelId)
               : undefined;
           if (contextSize !== null) await activateModel(modelId, contextSize);

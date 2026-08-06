@@ -43,7 +43,13 @@ class WebLLMRuntime {
   private engine: WebWorkerMLCEngine | null = null;
   private worker: Worker | null = null;
   private loadedModelId: string | null = null;
-  private loading: { modelId: string; promise: Promise<void> } | null = null;
+  private loadedContextSize: number | null = null;
+  private loading: {
+    modelId: string;
+    contextSize: number;
+    promise: Promise<void>;
+  } | null = null;
+  private contextSizeByModel = new Map<string, number>();
   private listeners = new Set<StatusListener>();
   private currentStatus: LocalModelStatus = { phase: "idle" };
 
@@ -55,6 +61,30 @@ class WebLLMRuntime {
     this.listeners.add(listener);
     listener(this.status);
     return () => this.listeners.delete(listener);
+  }
+
+  contextSize(modelId: string): number {
+    const model = getWebLLMModel(modelId);
+    if (!model) throw new Error(`Unknown WebLLM model: ${modelId}`);
+    return this.contextSizeByModel.get(modelId) ?? model.contextWindow;
+  }
+
+  async setContextSize(modelId: string, contextSize: number): Promise<boolean> {
+    const model = getWebLLMModel(modelId);
+    if (!model) throw new Error(`Unknown WebLLM model: ${modelId}`);
+    if (!model.contextOptions.includes(contextSize)) {
+      throw new Error(
+        `Unsupported context size for ${modelId}: ${contextSize}. ` +
+          `Choose one of ${model.contextOptions.join(", ")}.`,
+      );
+    }
+    if (this.contextSize(modelId) === contextSize) return false;
+    if (this.loading?.modelId === modelId) {
+      await this.loading.promise.catch(() => {});
+    }
+    if (this.loadedModelId === modelId) await this.unload();
+    this.contextSizeByModel.set(modelId, contextSize);
+    return true;
   }
 
   async isCached(modelId: string): Promise<boolean> {
@@ -87,18 +117,34 @@ class WebLLMRuntime {
 
   async ensureLoaded(modelId: string, signal?: AbortSignal): Promise<void> {
     if (!getWebLLMModel(modelId)) throw new Error(`Unknown WebLLM model: ${modelId}`);
-    if (this.loadedModelId === modelId && this.engine) return;
-    if (this.loading?.modelId === modelId) {
+    const contextSize = this.contextSize(modelId);
+    if (
+      this.loadedModelId === modelId &&
+      this.loadedContextSize === contextSize &&
+      this.engine
+    ) {
+      return;
+    }
+    if (
+      this.loading?.modelId === modelId &&
+      this.loading.contextSize === contextSize
+    ) {
       await this.loading.promise;
       return;
     }
     if (this.loading) {
       await this.loading.promise;
-      if (this.loadedModelId === modelId && this.engine) return;
+      if (
+        this.loadedModelId === modelId &&
+        this.loadedContextSize === contextSize &&
+        this.engine
+      ) {
+        return;
+      }
     }
 
-    const promise = this.loadModel(modelId, signal);
-    this.loading = { modelId, promise };
+    const promise = this.loadModel(modelId, contextSize, signal);
+    this.loading = { modelId, contextSize, promise };
     try {
       await promise;
     } finally {
@@ -115,7 +161,12 @@ class WebLLMRuntime {
     const engine = this.engine;
     if (!engine) throw new Error("WebLLM failed to initialize.");
 
-    this.setStatus({ phase: "generating", modelId, backend: "webgpu" });
+    this.setStatus({
+      phase: "generating",
+      modelId,
+      backend: "webgpu",
+      contextSize: this.loadedContextSize ?? this.contextSize(modelId),
+    });
     const interrupt = () => engine.interruptGenerate();
     signal?.addEventListener("abort", interrupt, { once: true });
     try {
@@ -129,16 +180,27 @@ class WebLLMRuntime {
         }
         yield chunk;
       }
-      this.setStatus({ phase: "ready", modelId, backend: "webgpu" });
+      this.setStatus({
+        phase: "ready",
+        modelId,
+        backend: "webgpu",
+        contextSize: this.loadedContextSize ?? this.contextSize(modelId),
+      });
     } catch (error) {
       if (signal?.aborted || isAbortError(error)) {
-        this.setStatus({ phase: "ready", modelId, backend: "webgpu" });
+        this.setStatus({
+          phase: "ready",
+          modelId,
+          backend: "webgpu",
+          contextSize: this.loadedContextSize ?? this.contextSize(modelId),
+        });
         throw new DOMException("WebLLM generation was cancelled.", "AbortError");
       }
       this.setStatus({
         phase: "error",
         modelId,
         backend: "webgpu",
+        contextSize: this.loadedContextSize ?? this.contextSize(modelId),
         message: error instanceof Error ? error.message : String(error),
       });
       throw error;
@@ -152,14 +214,20 @@ class WebLLMRuntime {
     const worker = this.worker;
     if (!engine && !worker) {
       this.loadedModelId = null;
+      this.loadedContextSize = null;
       this.setStatus({ phase: "idle" });
       return;
     }
 
-    this.setStatus({ phase: "unloading", modelId: this.loadedModelId ?? undefined });
+    this.setStatus({
+      phase: "unloading",
+      modelId: this.loadedModelId ?? undefined,
+      contextSize: this.loadedContextSize ?? undefined,
+    });
     this.engine = null;
     this.worker = null;
     this.loadedModelId = null;
+    this.loadedContextSize = null;
     try {
       await engine?.unload();
     } finally {
@@ -203,6 +271,7 @@ class WebLLMRuntime {
         loadedBytes,
         totalBytes: plan.bytes,
         backend: "webgpu",
+        contextSize: this.contextSize(modelId),
       });
     const openedCaches = new Map<string, Cache>();
     const openCache = async (scope: string): Promise<Cache> => {
@@ -254,7 +323,13 @@ class WebLLMRuntime {
     } catch (error) {
       await removeEntries().catch(() => {});
       const message = error instanceof Error ? error.message : String(error);
-      this.setStatus({ phase: "error", modelId, backend: "webgpu", message });
+      this.setStatus({
+        phase: "error",
+        modelId,
+        backend: "webgpu",
+        contextSize: this.contextSize(modelId),
+        message,
+      });
       throw error;
     }
   }
@@ -274,22 +349,38 @@ class WebLLMRuntime {
     );
   }
 
-  private async loadModel(modelId: string, signal?: AbortSignal): Promise<void> {
+  private async loadModel(
+    modelId: string,
+    contextSize: number,
+    signal?: AbortSignal,
+  ): Promise<void> {
     const model = getWebLLMModel(modelId)!;
     if (!("gpu" in navigator)) {
       throw new Error("WebLLM requires WebGPU. Use a browser with WebGPU enabled.");
     }
-    this.setStatus({ phase: "preparing", modelId, backend: "webgpu" });
+    this.setStatus({ phase: "preparing", modelId, backend: "webgpu", contextSize });
     if (this.engine || this.worker) await this.unload();
 
-    const cached = await this.isCached(modelId);
+    const module = await this.loadModule();
+    const appConfig = this.appConfig(module);
+    const record = findWebLLMModelRecord(modelId, appConfig);
+    await cacheBundledWebLLMConfig(
+      model,
+      record,
+      new URL(
+        `${import.meta.env.BASE_URL}webllm-config/${encodeURIComponent(modelId)}.json`,
+        location.origin,
+      ).href,
+      { signal },
+    );
+
+    const cached = await module.hasModelInCache(modelId, appConfig);
     if (!cached) {
       await this.removeReplacedCachedModel(modelId);
       await this.assertStorageCapacity(model.bytes);
     }
     if (signal?.aborted) throw abortError("WebLLM model loading was cancelled.");
 
-    const module = await this.loadModule();
     const worker = new Worker(new URL("./webllm-worker.ts", import.meta.url), {
       type: "module",
       name: "piodide-webllm",
@@ -301,6 +392,7 @@ class WebLLMRuntime {
       loadedBytes: cached ? model.bytes : 0,
       totalBytes: model.bytes,
       backend: "webgpu",
+      contextSize,
     });
 
     try {
@@ -308,7 +400,7 @@ class WebLLMRuntime {
         worker,
         modelId,
         {
-          appConfig: this.appConfig(module),
+          appConfig,
           initProgressCallback: (progress) => {
             this.setStatus({
               phase: progress.progress >= 1 ? "loading" : cached ? "loading" : "downloading",
@@ -316,13 +408,14 @@ class WebLLMRuntime {
               loadedBytes: Math.min(model.bytes, Math.round(model.bytes * progress.progress)),
               totalBytes: model.bytes,
               backend: "webgpu",
+              contextSize,
               message: progress.text,
             });
           },
           logLevel: "WARN",
         },
         {
-          context_window_size: model.contextWindow,
+          context_window_size: contextSize,
         },
       );
       const engine = await abortable(create, signal, () => worker.terminate());
@@ -332,12 +425,19 @@ class WebLLMRuntime {
       }
       this.engine = engine;
       this.loadedModelId = modelId;
-      this.setStatus({ phase: "ready", modelId, backend: "webgpu" });
+      this.loadedContextSize = contextSize;
+      this.setStatus({
+        phase: "ready",
+        modelId,
+        backend: "webgpu",
+        contextSize,
+      });
     } catch (error) {
       worker.terminate();
       if (this.worker === worker) this.worker = null;
       this.engine = null;
       this.loadedModelId = null;
+      this.loadedContextSize = null;
       if (signal?.aborted || isAbortError(error)) {
         this.setStatus({ phase: "idle" });
         throw abortError("WebLLM model loading was cancelled.");
@@ -346,6 +446,7 @@ class WebLLMRuntime {
         phase: "error",
         modelId,
         backend: "webgpu",
+        contextSize,
         message: error instanceof Error ? error.message : String(error),
       });
       throw error;
@@ -389,6 +490,69 @@ class WebLLMRuntime {
     this.currentStatus = status;
     for (const listener of this.listeners) listener(this.status);
   }
+}
+
+interface CacheBundledWebLLMConfigOptions {
+  signal?: AbortSignal;
+  fetchImpl?: typeof fetch;
+  cacheStorage?: {
+    open(name: string): Promise<Pick<Cache, "match" | "put">>;
+  };
+}
+
+/**
+ * Seed WebLLM's config cache from a same-origin asset. Hugging Face serves the
+ * tiny config through redirecting endpoints whose CORS behavior is less
+ * reliable than the large model-file CDN. The model weights remain remote.
+ */
+export async function cacheBundledWebLLMConfig(
+  model: WebLLMModelDef,
+  record: ModelRecord,
+  bundledUrl: string,
+  options: CacheBundledWebLLMConfigOptions = {},
+): Promise<void> {
+  const cacheStorage = options.cacheStorage ?? caches;
+  const cache = await cacheStorage.open("webllm/config");
+  const configUrl = new URL(
+    "mlc-chat-config.json",
+    cleanWebLLMModelUrl(record.model),
+  ).href;
+  if (await cache.match(configUrl)) return;
+
+  const fetchImpl = options.fetchImpl ?? fetch;
+  let response: Response;
+  try {
+    response = await fetchImpl(bundledUrl, { signal: options.signal });
+  } catch (error) {
+    if (options.signal?.aborted || isAbortError(error)) {
+      throw abortError("WebLLM model loading was cancelled.");
+    }
+    throw new Error(
+      `Could not load the bundled WebLLM config for ${model.label}: ${errorMessage(error)}`,
+    );
+  }
+  if (!response.ok) {
+    throw new Error(
+      `Could not load the bundled WebLLM config for ${model.label} (HTTP ${response.status}).`,
+    );
+  }
+
+  const data = await response.arrayBuffer();
+  if (data.byteLength > 32 * 1024 * 1024) {
+    throw new Error(`The bundled WebLLM config for ${model.label} is unexpectedly large.`);
+  }
+  let parsed: Record<string, unknown>;
+  try {
+    parsed = recordObject(JSON.parse(new TextDecoder().decode(data)));
+  } catch {
+    throw new Error(`The bundled WebLLM config for ${model.label} is not valid JSON.`);
+  }
+  validateModelConfig(model, parsed);
+
+  await cache.put(
+    new Request(configUrl),
+    new Response(data, { headers: { "Content-Type": "application/json" } }),
+  );
 }
 
 export async function validateWebLLMModelFiles(
@@ -610,6 +774,10 @@ function recordObject(value: unknown): Record<string, unknown> {
 function recordArray(value: unknown): unknown[] {
   if (!Array.isArray(value)) throw new Error("Invalid WebLLM model metadata.");
   return value;
+}
+
+function errorMessage(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
 }
 
 function abortable<T>(

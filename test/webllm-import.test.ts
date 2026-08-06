@@ -1,9 +1,11 @@
 import assert from "node:assert/strict";
+import { readFile } from "node:fs/promises";
 import { test } from "node:test";
 import { prebuiltAppConfig } from "@mlc-ai/web-llm";
 
-import { getWebLLMModel } from "../src/webllm-models.ts";
+import { WEBLLM_MODELS, getWebLLMModel } from "../src/webllm-models.ts";
 import {
+  cacheBundledWebLLMConfig,
   validateWebLLMModelFiles,
   webLLMRuntime,
 } from "../src/webllm-runtime.ts";
@@ -99,6 +101,48 @@ function qwen2BRecord() {
     (record) => record.model_id === "Qwen3.5-2B-q4f16_1-MLC",
   )!;
 }
+
+test("bundled WebLLM configs seed the exact cache keys without a cross-origin fetch", async () => {
+  const cache = new MemoryCache();
+  let fetches = 0;
+  const cacheStorage = {
+    open: async (name: string) => {
+      assert.equal(name, "webllm/config");
+      return cache;
+    },
+  };
+
+  for (const model of WEBLLM_MODELS) {
+    const record = prebuiltAppConfig.model_list.find(
+      (candidate) => candidate.model_id === model.id,
+    )!;
+    const config = await readFile(
+      new URL(`../public/webllm-config/${model.id}.json`, import.meta.url),
+    );
+    const bundledUrl = `https://app.test/piodide/webllm-config/${model.id}.json`;
+    const fetchImpl = (async (input: RequestInfo | URL) => {
+      assert.equal(String(input), bundledUrl);
+      fetches += 1;
+      return new Response(config, {
+        headers: { "Content-Type": "application/json" },
+      });
+    }) as typeof fetch;
+
+    await cacheBundledWebLLMConfig(model, record, bundledUrl, {
+      cacheStorage,
+      fetchImpl,
+    });
+    const expectedKey = `${record.model}/resolve/main/mlc-chat-config.json`;
+    assert.ok(await cache.match(expectedKey));
+
+    await cacheBundledWebLLMConfig(model, record, bundledUrl, {
+      cacheStorage,
+      fetchImpl,
+    });
+  }
+
+  assert.equal(fetches, WEBLLM_MODELS.length);
+});
 
 test("WebLLM local import validates and maps a complete MLC directory", async () => {
   const model = getWebLLMModel("Qwen3.5-2B-q4f16_1-MLC")!;

@@ -29,8 +29,10 @@ import {
   REPLACED_WEBLLM_MODEL_IDS,
   WEBLLM_MODELS,
   describeWebLLMModel,
+  estimateWebLLMVramBytes,
   getWebLLMModel,
 } from "../src/webllm-models.ts";
+import { webLLMRuntime } from "../src/webllm-runtime.ts";
 import { createBrowserChatRequest } from "../src/browser-model-stream.ts";
 import { makeModel } from "../src/model.ts";
 
@@ -313,9 +315,9 @@ test("WebLLM is an independent WebGPU catalogue with tool support marked", async
   assert.ok(WEBLLM_MODELS.some((model) => !model.tools));
 
   const qwenModels = [
-    ["Qwen3.5-4B-q4f16_1-MLC", 2_390_497_405, 3_867_820_000],
-    ["Qwen3.5-9B-q4f16_1-MLC", 5_061_443_935, 6_433_010_000],
-    ["Qwen3.5-2B-q4f16_1-MLC", 1_082_564_401, 2_245_440_000],
+    ["Qwen3.5-4B-q4f16_1-MLC", 2_390_497_405, 4_002_040_000],
+    ["Qwen3.5-9B-q4f16_1-MLC", 5_061_443_935, 6_567_230_000],
+    ["Qwen3.5-2B-q4f16_1-MLC", 1_082_564_401, 2_379_660_000],
   ] as const;
   for (const [id, bytes, vramRequiredBytes] of qwenModels) {
     const model = getWebLLMModel(id);
@@ -330,6 +332,13 @@ test("WebLLM is an independent WebGPU catalogue with tool support marked", async
     assert.equal(getWebLLMModel(model.id), model);
     assert.ok(model.bytes > 0);
     assert.ok(model.vramRequiredBytes > 0);
+    assert.deepEqual(model.contextOptions, [8_192, 16_384, 32_768]);
+    assert.equal(model.contextWindow, 8_192);
+    assert.equal(
+      estimateWebLLMVramBytes(model, model.contextWindow),
+      model.vramRequiredBytes,
+    );
+    assert.ok(estimateWebLLMVramBytes(model, 16_384) > model.vramRequiredBytes);
     assert.match(describeWebLLMModel(model), /VRAM.*download required/);
 
     const info = getLoadedModelInfo(provider.name, model.id);
@@ -339,6 +348,19 @@ test("WebLLM is an independent WebGPU catalogue with tool support marked", async
     assert.equal(info.maxTokens, model.maxTokens);
     assert.deepEqual(info.input, ["text"]);
   }
+});
+
+test("WebLLM context selection is per-model and rejects unusable sizes", async () => {
+  const modelId = "Qwen3.5-2B-q4f16_1-MLC";
+  assert.equal(webLLMRuntime.contextSize(modelId), 8_192);
+  assert.equal(await webLLMRuntime.setContextSize(modelId, 16_384), true);
+  assert.equal(webLLMRuntime.contextSize(modelId), 16_384);
+  assert.equal(await webLLMRuntime.setContextSize(modelId, 16_384), false);
+  await assert.rejects(
+    webLLMRuntime.setContextSize(modelId, 4_096),
+    /Unsupported context size/,
+  );
+  assert.equal(await webLLMRuntime.setContextSize(modelId, 8_192), true);
 });
 
 test("browser-local providers are the first choices", () => {

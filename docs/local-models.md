@@ -21,14 +21,21 @@ Wllama can run smaller models on multithreaded WASM when it is absent.
 
 | Model | Download | VRAM | Context | Tools |
 | --- | ---: | ---: | ---: | --- |
-| Qwen3.5 4B q4f16 | 2.23 GiB | 3.60 GiB | 4K | Yes |
-| Qwen3.5 9B q4f16 | 4.71 GiB | 5.99 GiB | 4K | Yes |
-| Qwen3.5 2B q4f16 | 1.01 GiB | 2.09 GiB | 4K | Yes |
+| Qwen3.5 4B q4f16 | 2.23 GiB | 3.73 GiB | 8K | Yes |
+| Qwen3.5 9B q4f16 | 4.71 GiB | 6.12 GiB | 8K | Yes |
+| Qwen3.5 2B q4f16 | 1.01 GiB | 2.22 GiB | 8K | Yes |
 | Hermes 3 Llama 3.1 8B q4f16 | 4.22 GiB | 5.04 GiB | 8K | Yes |
-| Hermes 3 Llama 3.2 3B q4f16 | 1.69 GiB | 2.11 GiB | 4K | No |
+| Hermes 3 Llama 3.2 3B q4f16 | 1.69 GiB | 2.55 GiB | 8K | No |
 
 Qwen3.5 uses Piodide's schema-constrained tool bridge. The generated call is
 limited to the tools and argument schemas available to the agent.
+
+Piodide serves each small WebLLM chat config from its own origin to avoid
+Hugging Face metadata-redirect CORS failures. Model weights still come from
+the upstream MLC repositories and remain in WebLLM's browser cache.
+
+WebLLM offers 8K, 16K, and 32K contexts during model selection. The 8K
+default is the smallest size that fits Piodide's agent prompt and tool schemas.
 
 ## Wllama catalogue
 

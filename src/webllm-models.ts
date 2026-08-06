@@ -1,8 +1,10 @@
 import type { LocalModelDef } from "./local-model.ts";
-import { formatModelBytes } from "./browser-models.ts";
+import { formatContextSize, formatModelBytes } from "./browser-models.ts";
 
 export interface WebLLMModelDef extends LocalModelDef {
   vramRequiredBytes: number;
+  contextOptions: readonly number[];
+  webGpuKvBytesPerToken: number;
   localFiles: {
     modelType: string;
     hiddenSize: number;
@@ -32,12 +34,14 @@ export const WEBLLM_MODELS: readonly WebLLMModelDef[] = [
     id: "Qwen3.5-4B-q4f16_1-MLC",
     label: "Qwen3.5 4B",
     bytes: 2_390_497_405,
-    vramRequiredBytes: 3_867_820_000,
+    vramRequiredBytes: 4_002_040_000,
     quantization: "q4f16",
-    contextWindow: 4_096,
+    contextWindow: 8_192,
     maxTokens: 1_024,
     tools: true,
     license: "Apache-2.0",
+    contextOptions: [8_192, 16_384, 32_768],
+    webGpuKvBytesPerToken: 32_768,
     localFiles: {
       modelType: "qwen3_5",
       hiddenSize: 2_560,
@@ -56,12 +60,14 @@ export const WEBLLM_MODELS: readonly WebLLMModelDef[] = [
     id: "Qwen3.5-9B-q4f16_1-MLC",
     label: "Qwen3.5 9B",
     bytes: 5_061_443_935,
-    vramRequiredBytes: 6_433_010_000,
+    vramRequiredBytes: 6_567_230_000,
     quantization: "q4f16",
-    contextWindow: 4_096,
+    contextWindow: 8_192,
     maxTokens: 1_024,
     tools: true,
     license: "Apache-2.0",
+    contextOptions: [8_192, 16_384, 32_768],
+    webGpuKvBytesPerToken: 32_768,
     localFiles: {
       modelType: "qwen3_5",
       hiddenSize: 4_096,
@@ -80,12 +86,14 @@ export const WEBLLM_MODELS: readonly WebLLMModelDef[] = [
     id: "Qwen3.5-2B-q4f16_1-MLC",
     label: "Qwen3.5 2B",
     bytes: 1_082_564_401,
-    vramRequiredBytes: 2_245_440_000,
+    vramRequiredBytes: 2_379_660_000,
     quantization: "q4f16",
-    contextWindow: 4_096,
+    contextWindow: 8_192,
     maxTokens: 1_024,
     tools: true,
     license: "Apache-2.0",
+    contextOptions: [8_192, 16_384, 32_768],
+    webGpuKvBytesPerToken: 32_768,
     localFiles: {
       modelType: "qwen3_5",
       hiddenSize: 2_048,
@@ -110,6 +118,8 @@ export const WEBLLM_MODELS: readonly WebLLMModelDef[] = [
     maxTokens: 1_024,
     tools: true,
     license: "Llama 3.1",
+    contextOptions: [8_192, 16_384, 32_768],
+    webGpuKvBytesPerToken: 131_072,
     localFiles: {
       modelType: "llama",
       hiddenSize: 4_096,
@@ -128,12 +138,14 @@ export const WEBLLM_MODELS: readonly WebLLMModelDef[] = [
     id: "Hermes-3-Llama-3.2-3B-q4f16_1-MLC",
     label: "Hermes 3 Llama 3.2 3B",
     bytes: 1_816_806_576,
-    vramRequiredBytes: 2_263_690_000,
+    vramRequiredBytes: 2_733_450_000,
     quantization: "q4f16",
-    contextWindow: 4_096,
+    contextWindow: 8_192,
     maxTokens: 1_024,
     tools: false,
     license: "Llama 3.2",
+    contextOptions: [8_192, 16_384, 32_768],
+    webGpuKvBytesPerToken: 114_688,
     localFiles: {
       modelType: "llama",
       hiddenSize: 3_072,
@@ -161,7 +173,18 @@ export function describeWebLLMModel(model: WebLLMModelDef, cached = false): stri
     model.quantization,
     formatModelBytes(model.bytes),
     `${formatModelBytes(model.vramRequiredBytes)} VRAM`,
+    `${formatContextSize(model.contextWindow)} default context`,
     model.tools ? "tools" : "text only",
     cached ? "cached" : "download required",
   ].join(" · ");
+}
+
+export function estimateWebLLMVramBytes(
+  model: WebLLMModelDef,
+  contextSize: number,
+): number {
+  return (
+    model.vramRequiredBytes +
+    (contextSize - model.contextWindow) * model.webGpuKvBytesPerToken
+  );
 }
