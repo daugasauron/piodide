@@ -40,6 +40,9 @@ export async function verifyApiKey(
   apiKey: string,
   fetchImpl: FetchLike = fetch,
 ): Promise<ApiKeyVerification> {
+  if (provider.name === "openrouter") {
+    return verifyBearerEndpoint(provider, apiKey, "key", fetchImpl);
+  }
   if (!GLM_PROVIDERS.has(provider.name)) return "not-supported";
   if (!apiKey.includes(".")) {
     throw new Error(
@@ -74,4 +77,32 @@ export async function verifyApiKey(
   throw new Error(
     `${provider.label} key check returned HTTP ${response.status}${suffix}`,
   );
+}
+
+async function verifyBearerEndpoint(
+  provider: Pick<ProviderDef, "label" | "baseUrl">,
+  apiKey: string,
+  path: string,
+  fetchImpl: FetchLike,
+): Promise<"verified"> {
+  let response: Response;
+  try {
+    response = await fetchImpl(`${provider.baseUrl.replace(/\/+$/, "")}/${path}`, {
+      headers: { Authorization: `Bearer ${apiKey}` },
+    });
+  } catch (error) {
+    throw new Error(
+      `could not verify ${provider.label}: ${
+        error instanceof Error ? error.message : String(error)
+      }`,
+    );
+  }
+  if (response.ok) return "verified";
+
+  const detail = responseMessage(await response.text().catch(() => ""));
+  const suffix = detail ? `: ${detail}` : "";
+  if (response.status === 401 || response.status === 403) {
+    throw new Error(`${provider.label} rejected this API key${suffix}`);
+  }
+  throw new Error(`${provider.label} key check returned HTTP ${response.status}${suffix}`);
 }

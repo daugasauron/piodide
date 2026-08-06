@@ -22,6 +22,7 @@ export interface UploadResult {
 }
 
 let uploadInput: HTMLInputElement | null = null;
+let directoryInput: HTMLInputElement | null = null;
 
 export function downloadPyodideFile(py: Pyodide, value: string): DownloadResult {
   const path = fsResolve(py, value.trim());
@@ -50,7 +51,14 @@ export function downloadPyodideFile(py: Pyodide, value: string): DownloadResult 
 }
 
 export function pickHostFiles(): Promise<File[]> {
-  const input = getUploadInput();
+  return pickFromInput(getUploadInput());
+}
+
+export function pickHostDirectoryFiles(): Promise<File[]> {
+  return pickFromInput(getDirectoryInput());
+}
+
+function pickFromInput(input: HTMLInputElement): Promise<File[]> {
   input.value = "";
   return new Promise<File[]>((resolve, reject) => {
     let settled = false;
@@ -151,6 +159,19 @@ function getUploadInput(): HTMLInputElement {
   uploadInput.setAttribute("aria-hidden", "true");
   document.body.appendChild(uploadInput);
   return uploadInput;
+}
+
+function getDirectoryInput(): HTMLInputElement {
+  if (directoryInput) return directoryInput;
+  directoryInput = document.createElement("input");
+  directoryInput.type = "file";
+  directoryInput.multiple = true;
+  directoryInput.hidden = true;
+  directoryInput.setAttribute("webkitdirectory", "");
+  directoryInput.setAttribute("directory", "");
+  directoryInput.setAttribute("aria-hidden", "true");
+  document.body.appendChild(directoryInput);
+  return directoryInput;
 }
 
 function safeUploadName(value: string): string {

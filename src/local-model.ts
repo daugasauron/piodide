@@ -2,6 +2,7 @@ export type LocalModelPhase =
   | "idle"
   | "preparing"
   | "downloading"
+  | "importing"
   | "loading"
   | "ready"
   | "generating"

@@ -8,6 +8,12 @@ const glmGeneral = {
   baseUrl: "https://open.bigmodel.cn/api/paas/v4/",
 };
 
+const openRouter = {
+  name: "openrouter",
+  label: "OpenRouter",
+  baseUrl: "https://openrouter.ai/api/v1/",
+};
+
 test("API key normalization removes common copy/paste artifacts", () => {
   assert.equal(normalizeApiKey("  Bearer abc.def  \n"), "abc.def");
   assert.equal(normalizeApiKey('"abc.def"'), "abc.def");
@@ -41,6 +47,30 @@ test("general GLM rejects invalid keys during login", async () => {
       ),
     ),
     /智谱 GLM \(通用\) rejected this API key: token expired or incorrect/,
+  );
+});
+
+test("OpenRouter keys are verified without spending model credits", async () => {
+  let request: { input: RequestInfo | URL; init?: RequestInit } | undefined;
+  const result = await verifyApiKey(openRouter, "sk-or-v1-test", async (input, init) => {
+    request = { input, init };
+    return Response.json({ data: { label: "test" } });
+  });
+
+  assert.equal(result, "verified");
+  assert.equal(String(request?.input), "https://openrouter.ai/api/v1/key");
+  assert.equal(
+    new Headers(request?.init?.headers).get("Authorization"),
+    "Bearer sk-or-v1-test",
+  );
+});
+
+test("OpenRouter rejects invalid keys during login", async () => {
+  await assert.rejects(
+    verifyApiKey(openRouter, "invalid", async () =>
+      Response.json({ error: { message: "User not found" } }, { status: 401 }),
+    ),
+    /OpenRouter rejected this API key: User not found/,
   );
 });
 

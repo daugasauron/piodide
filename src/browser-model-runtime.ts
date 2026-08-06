@@ -132,6 +132,65 @@ export function hasWllamaWebGpuFeatures(
   return features?.has("shader-f16") === true;
 }
 
+function printableWllamaLogValue(value: unknown): string {
+  if (typeof value === "string") return value;
+  try {
+    return JSON.stringify(value);
+  } catch {
+    return String(value);
+  }
+}
+
+export function describeWllamaLoadFailure(
+  error: unknown,
+  nativeLogs: readonly string[],
+): string {
+  const errorMessage =
+    error instanceof Error ? error.message.trim() : String(error).trim();
+  const significant = nativeLogs.filter((line) =>
+    /error|failed|cannot|unsupported|out of memory|allocat|buffer|device lost/i.test(line),
+  );
+  const candidates = [errorMessage, ...significant.slice(-4)]
+    .map((line) => line.replace(/\s+/g, " ").trim())
+    .filter(Boolean);
+  return [...new Set(candidates)].join(" · ").slice(0, 1_000);
+}
+
+export function describeWllamaDownloadFailure(
+  label: string,
+  loadedBytes: number,
+  totalBytes: number,
+  error: unknown,
+): string {
+  const detail = error instanceof Error ? error.message : String(error);
+  return (
+    `Download failed for ${label} after ${formatBytes(loadedBytes)} of ` +
+    `${formatBytes(totalBytes)}: ${detail}. Retry to download the model again.`
+  );
+}
+
+export async function validateWllamaModelFile(
+  model: (typeof BROWSER_MODELS)[number],
+  file: Pick<Blob, "size" | "slice">,
+): Promise<void> {
+  if (file.size !== model.bytes) {
+    throw new Error(
+      `${model.label} requires exactly ${formatBytes(model.bytes)}; ` +
+        `the selected file is ${formatBytes(file.size)}.`,
+    );
+  }
+  const magic = new Uint8Array(await file.slice(0, 4).arrayBuffer());
+  if (
+    magic.length !== 4 ||
+    magic[0] !== 0x47 ||
+    magic[1] !== 0x47 ||
+    magic[2] !== 0x55 ||
+    magic[3] !== 0x46
+  ) {
+    throw new Error("The selected file is not a GGUF model.");
+  }
+}
+
 export async function drainWllamaResponseTail(
   readResult: () => Promise<WllamaResultChunk>,
   decode: (value: string) => unknown,
@@ -198,6 +257,7 @@ class BrowserModelRuntime {
   private loadedModelId: string | null = null;
   private loadedContextSize: number | null = null;
   private loadedBackend: "wasm" | "webgpu" | null = null;
+  private nativeLogLines: string[] = [];
   private loading: {
     modelId: string;
     contextSize: number;
@@ -421,6 +481,62 @@ class BrowserModelRuntime {
     await (await this.getCacheManager()).delete(model.sourceUrl);
   }
 
+  async importModelFile(modelId: string, file: File): Promise<void> {
+    const model = getBrowserModel(modelId);
+    if (!model) throw new Error(`Unknown browser model: ${modelId}`);
+    await validateWllamaModelFile(model, file);
+    if (this.loadedModelId === modelId) await this.unload();
+    await this.assertStorageCapacity(model.bytes);
+
+    const cacheManager = await this.getCacheManager();
+    const name = await cacheManager.getNameFromURL(model.sourceUrl);
+    await cacheManager.delete(name);
+    let loadedBytes = 0;
+    let lastProgressAt = 0;
+    const reportProgress = () =>
+      this.setStatus({
+        phase: "importing",
+        modelId,
+        loadedBytes,
+        totalBytes: model.bytes,
+        contextSize: this.contextSize(modelId),
+      });
+    const progressStream = new TransformStream<Uint8Array, Uint8Array>({
+      transform(chunk, controller) {
+        loadedBytes += chunk.byteLength;
+        const now = Date.now();
+        if (now - lastProgressAt > 100) {
+          lastProgressAt = now;
+          reportProgress();
+        }
+        controller.enqueue(chunk);
+      },
+      flush: reportProgress,
+    });
+    reportProgress();
+    try {
+      await cacheManager.write(name, file.stream().pipeThrough(progressStream), {
+        originalURL: model.sourceUrl,
+        originalSize: model.bytes,
+        etag: "local-import",
+      });
+      if (!(await this.isCached(modelId))) {
+        throw new Error("The browser cache did not retain the complete model file.");
+      }
+      this.setStatus({ phase: "idle" });
+    } catch (error) {
+      await cacheManager.delete(name).catch(() => {});
+      const message = error instanceof Error ? error.message : String(error);
+      this.setStatus({
+        phase: "error",
+        modelId,
+        contextSize: this.contextSize(modelId),
+        message,
+      });
+      throw error;
+    }
+  }
+
   async clearCache(): Promise<void> {
     await this.unload();
     await (await this.getCacheManager()).clear();
@@ -470,12 +586,35 @@ class BrowserModelRuntime {
     });
 
     try {
+      if (!cached) {
+        try {
+          await this.downloadModelToCache(modelId, backend, contextSize, signal);
+          this.setStatus({
+            phase: "loading",
+            modelId,
+            loadedBytes: model.bytes,
+            totalBytes: model.bytes,
+            backend,
+            contextSize,
+          });
+        } catch (error) {
+          if (signal?.aborted || isAbortError(error)) throw error;
+          throw new Error(
+            describeWllamaDownloadFailure(
+              model.label,
+              this.currentStatus.loadedBytes ?? 0,
+              model.bytes,
+              error,
+            ),
+            { cause: error },
+          );
+        }
+      }
       try {
         await this.loadIntoEngine(
           engine,
           modelId,
           contextSize,
-          cached,
           backend,
           signal,
         );
@@ -484,10 +623,14 @@ class BrowserModelRuntime {
           throw error;
         }
         if (model.bytes >= WASM32_MODEL_LIMIT) {
+          const detail = describeWllamaLoadFailure(error, this.nativeLogLines);
           throw new Error(
             `WebGPU initialization failed for ${model.label}, and its ` +
               `${formatBytes(model.bytes)} model cannot fit in Wllama's ` +
-              `wasm32 CPU backend. ${CHROME_WEBGPU_LAUNCH}`,
+              `wasm32 CPU backend.` +
+              `${detail ? ` WebGPU reported: ${detail}.` : ""} ` +
+              `Try a 4K context or a smaller model; the Chrome launch flags ` +
+              `were already detected.`,
             { cause: error },
           );
         }
@@ -508,7 +651,6 @@ class BrowserModelRuntime {
           engine,
           modelId,
           contextSize,
-          true,
           backend,
           signal,
         );
@@ -549,12 +691,26 @@ class BrowserModelRuntime {
 
   private createEngine(module: WllamaModule, assets: RuntimeAssets): Wllama {
     this.cacheManager ??= this.createCacheManager(module);
+    this.nativeLogLines = [];
+    const capture = (level: string, values: unknown[]) => {
+      const line = values.map(printableWllamaLogValue).join(" ").trim();
+      if (!line) return;
+      this.nativeLogLines.push(`[${level}] ${line}`);
+      if (this.nativeLogLines.length > 80) this.nativeLogLines.shift();
+    };
     const engine = new module.Wllama(
       { default: assets.primaryWasmUrl },
       {
         cacheManager: this.cacheManager,
-        suppressNativeLog: true,
-        logger: module.LoggerWithoutDebug,
+        // Keep a bounded private log so WebGPU load failures can report the
+        // actual Dawn/llama.cpp error instead of incorrectly blaming flags.
+        suppressNativeLog: false,
+        logger: {
+          debug: (...values: unknown[]) => capture("debug", values),
+          log: (...values: unknown[]) => capture("info", values),
+          warn: (...values: unknown[]) => capture("warn", values),
+          error: (...values: unknown[]) => capture("error", values),
+        },
         parallelDownloads: 3,
       },
     );
@@ -589,9 +745,9 @@ class BrowserModelRuntime {
       if (!model) return nativeDownload(url, options);
 
       const name = await cacheManager.getNameFromURL(url);
-      let metadata = await cacheManager.getMetadata(name);
-      let storedBytes = await cacheManager.getSize(name);
-      let state = knownWllamaCacheState(model.bytes, metadata, storedBytes);
+      const metadata = await cacheManager.getMetadata(name);
+      const storedBytes = await cacheManager.getSize(name);
+      const state = knownWllamaCacheState(model.bytes, metadata, storedBytes);
 
       if (state === "complete") {
         if (metadata?.originalURL !== url || metadata.originalSize !== model.bytes) {
@@ -608,23 +764,43 @@ class BrowserModelRuntime {
 
       if (state === "incomplete") {
         await cacheManager.delete(name);
-        await this.downloadKnownModelToOpfs(cacheManager, model, options);
-        return;
       }
-
-      // Preserve Wllama's normal content-addressed-store reuse for a genuinely
-      // missing entry, but validate the result. Its 3.5.1 implementation also
-      // accepts an interrupted COS object merely because it exists.
-      await nativeDownload(url, options);
-      metadata = await cacheManager.getMetadata(name);
-      storedBytes = await cacheManager.getSize(name);
-      state = knownWllamaCacheState(model.bytes, metadata, storedBytes);
-      if (state === "complete") return;
-
-      await cacheManager.delete(name);
+      // Wllama's experimental content-addressed browser path can leave a
+      // partial large object and throw before its OPFS fallback runs. Stream
+      // known catalogue models directly into OPFS, where sizes are verifiable.
       await this.downloadKnownModelToOpfs(cacheManager, model, options);
     };
     return cacheManager;
+  }
+
+  private async downloadModelToCache(
+    modelId: string,
+    backend: "wasm" | "webgpu",
+    contextSize: number,
+    signal?: AbortSignal,
+  ): Promise<void> {
+    const model = getBrowserModel(modelId)!;
+    const cacheManager = await this.getCacheManager();
+    await cacheManager.download(model.sourceUrl, {
+      signal,
+      metadataAdditional: {
+        originalURL: model.sourceUrl,
+        originalSize: model.bytes,
+      },
+      progressCallback: ({ loaded, total }) => {
+        this.setStatus({
+          phase: "downloading",
+          modelId,
+          loadedBytes: loaded,
+          totalBytes: total || model.bytes,
+          backend,
+          contextSize,
+        });
+      },
+    });
+    if (!(await this.isCached(modelId))) {
+      throw new Error("The browser cache did not retain the complete model file");
+    }
   }
 
   private async downloadKnownModelToOpfs(
@@ -672,16 +848,21 @@ class BrowserModelRuntime {
     });
 
     const name = await cacheManager.getNameFromURL(model.sourceUrl);
-    await cacheManager.write(
-      name,
-      response.body.pipeThrough(progressStream),
-      {
-        ...options.metadataAdditional,
-        originalURL: model.sourceUrl,
-        originalSize: totalBytes,
-        etag,
-      },
-    );
+    try {
+      await cacheManager.write(
+        name,
+        response.body.pipeThrough(progressStream),
+        {
+          ...options.metadataAdditional,
+          originalURL: model.sourceUrl,
+          originalSize: model.bytes,
+          etag,
+        },
+      );
+    } catch (error) {
+      await cacheManager.delete(name).catch(() => {});
+      throw error;
+    }
     const storedBytes = await cacheManager.getSize(name);
     if (storedBytes !== model.bytes) {
       await cacheManager.delete(name);
@@ -696,7 +877,6 @@ class BrowserModelRuntime {
     engine: Wllama,
     modelId: string,
     contextSize: number,
-    cached: boolean,
     backend: "wasm" | "webgpu",
     signal?: AbortSignal,
   ): Promise<void> {
@@ -705,7 +885,7 @@ class BrowserModelRuntime {
       signal,
       progressCallback: ({ loaded, total }) => {
         this.setStatus({
-          phase: cached || loaded >= total ? "loading" : "downloading",
+          phase: "loading",
           modelId,
           loadedBytes: loaded,
           totalBytes: total || model.bytes,

@@ -58,6 +58,7 @@ import {
 } from "./git-tool.ts";
 import {
   downloadPyodideFile,
+  pickHostDirectoryFiles,
   pickHostFiles,
   resolveUploadDirectory,
   uploadConflicts,
@@ -534,7 +535,9 @@ function renderFooter() {
         : "/home/web";
   const browserProgress =
     provider?.transport === "browser" &&
-    (browserStatus.phase === "downloading" || browserStatus.phase === "loading")
+    (browserStatus.phase === "downloading" ||
+      browserStatus.phase === "importing" ||
+      browserStatus.phase === "loading")
       ? ` · model ${formatBrowserStatus(browserStatus)}`
       : "";
   footerLocationEl.textContent = location + browserProgress;
@@ -615,7 +618,7 @@ function formatTokenCount(value: number): string {
 
 function formatBrowserStatus(status: LocalModelStatus): string {
   if (
-    status.phase === "downloading" &&
+    (status.phase === "downloading" || status.phase === "importing") &&
     status.loadedBytes !== undefined &&
     status.totalBytes
   ) {
@@ -633,6 +636,7 @@ function onBrowserModelStatus(runtime: LocalModelRuntime, status: LocalModelStat
     agent?.state.isStreaming &&
     (status.phase === "preparing" ||
       status.phase === "downloading" ||
+      status.phase === "importing" ||
       status.phase === "loading")
   ) {
     spinner.start(`local model · ${formatBrowserStatus(status)}`);
@@ -659,6 +663,7 @@ function applyConfigToAgent() {
       api: provider.api,
       provider: provider.name,
       extraBody: provider.extraBody,
+      headers: provider.headers,
       info,
     });
     agent.state.model = model;
@@ -1375,7 +1380,7 @@ async function runSlash(input: string) {
   switch (cmd) {
     case "help":
       say(dim("  /provider  /model  /login  /logout       provider configuration"));
-      say(dim("  /model status|unload|remove|clear-cache   local model storage"));
+      say(dim("  /model status|import|unload|remove|clear-cache   local model storage"));
       say(dim("  /github [api-url|status|logout]           session-only GitHub access"));
       say(dim("  /new  /tree  /resume  /fork  /clone     page-local sessions"));
       say(dim("  /name  /session  /copy  /export          session utilities"));
@@ -1451,6 +1456,35 @@ async function runSlash(input: string) {
       } else if (provider.transport === "browser" && arg.toLowerCase() === "unload") {
         await localProvider!.runtime.unload();
         say(green("  ◆ local model unloaded; its browser cache was kept"));
+      } else if (provider.transport === "browser" && /^import(?:\s|$)/i.test(arg)) {
+        const modelId = arg.replace(/^import\s*/i, "") || currentModelId();
+        const descriptor = localProvider!.getModel(modelId);
+        if (!descriptor) {
+          say(red(`  unknown browser model: ${modelId}`));
+          break;
+        }
+        const webLLM = provider.api === "browser-webllm";
+        const files = webLLM
+          ? await pickHostDirectoryFiles()
+          : await pickHostFiles();
+        if (files.length === 0) {
+          say(yellow("  model import cancelled"));
+          break;
+        }
+        if (!webLLM && files.length > 1) {
+          say(red("  select exactly one GGUF model file"));
+          break;
+        }
+        if (webLLM) {
+          say(dim(`  validating and importing ${files.length} local WebLLM files…`));
+          await webLLMRuntime.importModelFiles(modelId, files);
+        } else {
+          say(dim(`  importing ${files[0].name} into the browser model cache…`));
+          await browserModelRuntime.importModelFile(modelId, files[0]);
+        }
+        say(
+          green(`  ◆ imported ${descriptor.label}; the original host files were kept`),
+        );
       } else if (provider.transport === "browser" && arg.toLowerCase() === "clear-cache") {
         const answer = await prompt.ask(
           "  Unload local inference and remove every downloaded model? [y/N] ",

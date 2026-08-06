@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import { getSupportedThinkingLevels } from "@earendil-works/pi-ai";
+import { prebuiltAppConfig } from "@mlc-ai/web-llm";
 
 import {
   BROWSER_MODELS,
@@ -11,10 +12,13 @@ import {
 } from "../src/browser-models.ts";
 import {
   browserModelRuntime,
+  describeWllamaDownloadFailure,
+  describeWllamaLoadFailure,
   drainWllamaResponseTail,
   hasWllamaWebGpuFeatures,
   knownWllamaCacheState,
   repairKnownWllamaCacheEntries,
+  validateWllamaModelFile,
 } from "../src/browser-model-runtime.ts";
 import {
   getLoadedModelInfo,
@@ -22,6 +26,7 @@ import {
   PROVIDERS,
 } from "../src/providers.ts";
 import {
+  REPLACED_WEBLLM_MODEL_IDS,
   WEBLLM_MODELS,
   describeWebLLMModel,
   getWebLLMModel,
@@ -95,6 +100,31 @@ test("Qwen3 8B exposes a binary thinking toggle and changes its request preset",
   assert.equal(high.temperature, descriptor.thinkingGeneration?.temperature);
   assert.equal(high.top_p, descriptor.thinkingGeneration?.topP);
   assert.equal(high.top_k, descriptor.thinkingGeneration?.topK);
+});
+
+test("Wllama includes the practical Qwen3.5 4B and 9B GGUF models", () => {
+  const expected = [
+    {
+      id: "qwen3.5-9b-q4km",
+      bytes: 5_680_522_464,
+      revision: "3885219b6810b007914f3a7950a8d1b469d598a5",
+    },
+    {
+      id: "qwen3.5-4b-q4km",
+      bytes: 2_740_937_888,
+      revision: "e87f176479d0855a907a41277aca2f8ee7a09523",
+    },
+  ];
+
+  for (const item of expected) {
+    const descriptor = getBrowserModel(item.id);
+    assert.ok(descriptor);
+    assert.equal(descriptor.bytes, item.bytes);
+    assert.match(descriptor.sourceUrl, new RegExp(`/resolve/${item.revision}/`));
+    assert.equal(descriptor.quantization, "Q4_K_M");
+    assert.equal(descriptor.load.contextSize, 8_192);
+    assert.equal(descriptor.tools, true);
+  }
 });
 
 test("Wllama models expose validated per-model context and KV-cache sizes", async () => {
@@ -194,6 +224,45 @@ test("Wllama WebGPU requires shader-f16, not merely navigator.gpu", () => {
   );
 });
 
+test("Wllama load failures retain useful native WebGPU diagnostics", () => {
+  assert.equal(
+    describeWllamaLoadFailure(new Error("Runtime aborted"), [
+      "[debug] ordinary model metadata",
+      "[error] WebGPU buffer allocation failed: out of memory",
+    ]),
+    "Runtime aborted · [error] WebGPU buffer allocation failed: out of memory",
+  );
+  assert.equal(
+    describeWllamaDownloadFailure(
+      "Qwen3.5 9B",
+      934_508_495,
+      5_680_522_464,
+      new Error("network connection was interrupted"),
+    ),
+    "Download failed for Qwen3.5 9B after 892 MiB of 5.29 GiB: " +
+      "network connection was interrupted. Retry to download the model again.",
+  );
+});
+
+test("Wllama local imports require the exact model size and GGUF header", async () => {
+  const model = getBrowserModel("qwen3.5-9b-q4km")!;
+  const file = (size: number, magic: string) =>
+    ({
+      size,
+      slice: () => new Blob([magic]),
+    }) as Pick<Blob, "size" | "slice">;
+
+  await validateWllamaModelFile(model, file(model.bytes, "GGUF"));
+  await assert.rejects(
+    validateWllamaModelFile(model, file(108 * 1024 ** 2, "GGUF")),
+    /requires exactly 5\.29 GiB; the selected file is 108 MiB/,
+  );
+  await assert.rejects(
+    validateWllamaModelFile(model, file(model.bytes, "nope")),
+    /not a GGUF model/,
+  );
+});
+
 test("Wllama drains a queued finish chunk after native has_more becomes false", async () => {
   const results = [
     {
@@ -230,11 +299,32 @@ test("WebLLM is an independent WebGPU catalogue with tool support marked", async
 
   const modelIds = await provider.loadModels();
   assert.deepEqual(modelIds, WEBLLM_MODELS.map((model) => model.id));
+  const prebuiltIds = new Set(
+    prebuiltAppConfig.model_list.map((model) => model.model_id),
+  );
+  assert.ok(WEBLLM_MODELS.every((model) => prebuiltIds.has(model.id)));
+  assert.ok(
+    Object.values(REPLACED_WEBLLM_MODEL_IDS).every((id) => prebuiltIds.has(id)),
+  );
   assert.equal(provider.defaultModel, WEBLLM_MODELS[0].id);
-  assert.equal(provider.defaultModel, "Hermes-3-Llama-3.1-8B-q4f32_1-MLC");
+  assert.equal(provider.defaultModel, "Qwen3.5-4B-q4f16_1-MLC");
   assert.equal(WEBLLM_MODELS[0].tools, true);
   assert.ok(WEBLLM_MODELS.some((model) => model.tools));
   assert.ok(WEBLLM_MODELS.some((model) => !model.tools));
+
+  const qwenModels = [
+    ["Qwen3.5-4B-q4f16_1-MLC", 2_390_497_405, 3_867_820_000],
+    ["Qwen3.5-9B-q4f16_1-MLC", 5_061_443_935, 6_433_010_000],
+    ["Qwen3.5-2B-q4f16_1-MLC", 1_082_564_401, 2_245_440_000],
+  ] as const;
+  for (const [id, bytes, vramRequiredBytes] of qwenModels) {
+    const model = getWebLLMModel(id);
+    assert.ok(model);
+    assert.equal(model.bytes, bytes);
+    assert.equal(model.vramRequiredBytes, vramRequiredBytes);
+    assert.equal(model.quantization, "q4f16");
+    assert.equal(model.tools, true);
+  }
 
   for (const model of WEBLLM_MODELS) {
     assert.equal(getWebLLMModel(model.id), model);

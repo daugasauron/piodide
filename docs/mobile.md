@@ -21,4 +21,5 @@ model and usage rows on narrow screens. API keys stay in page memory
 and are cleared on refresh. General GLM keys are checked without running a
 completion. Coding Plan keys are validated by the first real request because
 the Coding endpoint has no compatible non-billable key check. A GLM value
-without the dot in `id.secret` is rejected as an incomplete copy.
+without the dot in `id.secret` is rejected as an incomplete copy. OpenRouter
+keys are checked through its key endpoint without running a paid completion.

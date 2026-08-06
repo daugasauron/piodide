@@ -6,6 +6,7 @@
 import type { Model } from "@earendil-works/pi-ai";
 import { BROWSER_MODELS } from "./browser-models.ts";
 import type { LocalModelDef } from "./local-model.ts";
+import { fetchOpenRouterModels } from "./openrouter-provider.ts";
 import { WEBLLM_MODELS } from "./webllm-models.ts";
 
 export type ApiKind =
@@ -34,6 +35,8 @@ export interface ProviderDef {
   note?: string;
   /** Extra fields merged into the chat-completions request body. */
   extraBody?: Record<string, unknown>;
+  /** Extra non-secret headers sent with provider requests. */
+  headers?: Record<string, string>;
   /** Authenticates through the opt-in loopback Codex subscription proxy. */
   localCodexProxy?: boolean;
 }
@@ -48,7 +51,7 @@ export const PROVIDERS: Record<string, ProviderDef> = {
     baseUrl: "browser://webllm",
     defaultModel: WEBLLM_MODELS[0].id,
     loadModels: localModelCatalogue("webllm", "browser-webllm", WEBLLM_MODELS),
-    note: "GPU-only MLC models · private Web Worker inference · 1.69 GiB+ download",
+    note: "GPU-only MLC models · private Web Worker inference · 1.01 GiB+ download",
   },
   wllama: {
     name: "wllama",
@@ -95,13 +98,10 @@ export const PROVIDERS: Record<string, ProviderDef> = {
     transport: "http",
     auth: "api-key",
     baseUrl: "https://openrouter.ai/api/v1",
-    defaultModel: "anthropic/claude-sonnet-4.5",
-    loadModels: modelCatalogue("openrouter", "anthropic/claude-sonnet-4.5", () =>
-      import("@earendil-works/pi-ai/providers/openrouter.models").then(
-        (module) => module.OPENROUTER_MODELS,
-      ),
-    ),
-    note: "any model via OpenAI-compatible API",
+    defaultModel: "anthropic/claude-sonnet-4.6",
+    loadModels: openRouterModelCatalogue("anthropic/claude-sonnet-4.6"),
+    headers: { "X-OpenRouter-Title": "Piodide" },
+    note: "live tool-capable catalogue · direct browser API",
   },
   groq: {
     name: "groq",
@@ -350,5 +350,35 @@ function modelCatalogue(
   return async () => {
     cached ??= modelIds(providerName, defaultModel, await load());
     return cached;
+  };
+}
+
+function openRouterModelCatalogue(defaultModel: string): () => Promise<readonly string[]> {
+  let successful: readonly string[] | null = null;
+  let fallback: readonly string[] | null = null;
+  return async () => {
+    if (successful) return successful;
+
+    const bundled = await import("@earendil-works/pi-ai/providers/openrouter.models").then(
+      (module) => module.OPENROUTER_MODELS,
+    );
+    fallback ??= modelIds("openrouter", defaultModel, bundled);
+
+    try {
+      const live = await fetchOpenRouterModels(PROVIDERS.openrouter.baseUrl);
+      for (const model of live) {
+        const key = `openrouter\0${model.id}`;
+        // Keep pi-ai's richer compatibility metadata for bundled models while
+        // registering newly released OpenRouter models immediately.
+        if (!MODEL_INFO.has(key)) MODEL_INFO.set(key, model.info);
+      }
+      const ids = live.map((model) => model.id);
+      successful = [defaultModel, ...ids.filter((id) => id !== defaultModel)];
+      return successful;
+    } catch {
+      // Model selection remains usable offline, and another /model invocation
+      // retries the live public endpoint instead of caching a network failure.
+      return fallback;
+    }
   };
 }

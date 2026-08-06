@@ -34,6 +34,9 @@ warning but do not change the transfer's exit code.
 
 - Cross-origin responses require CORS. Authorization and JSON commonly trigger
   a preflight.
+- For trusted local development, `npm run chrome:unrestricted` launches a
+  dedicated Chrome profile with CORS disabled. It can also read local-network
+  HTTP responses; do not browse unrelated sites in that window.
 - A simple request can reach the server even when CORS later hides its response.
   Do not blindly retry a side-effecting request after exit `7`.
 - Redirects are followed only with `-L`. When Fetch hides a manual redirect,

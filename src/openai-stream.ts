@@ -25,7 +25,14 @@ import { clampThinkingLevel } from "@earendil-works/pi-ai";
 type ContentBlock =
   | { kind: "text"; text: string }
   | { kind: "thinking"; text: string }
-  | { kind: "tool"; idx: number; id: string; name: string; args: string };
+  | {
+      kind: "tool";
+      idx: number;
+      id: string;
+      name: string;
+      args: string;
+      thoughtSignature?: string;
+    };
 
 export interface OaiChoiceDelta {
   role?: string;
@@ -39,6 +46,7 @@ export interface OaiChoiceDelta {
     type?: string;
     function?: { name?: string; arguments?: string };
   }> | null;
+  reasoning_details?: unknown[] | null;
 }
 export interface OaiChunk {
   choices?: Array<{ delta?: OaiChoiceDelta; finish_reason?: string | null }>;
@@ -128,6 +136,7 @@ export class OpenAIEventAdapter {
   private readonly stream: EventQueue;
   private readonly blocks: ContentBlock[] = [];
   private readonly toolPosByIndex = new Map<number, number>();
+  private readonly pendingReasoningByToolId = new Map<string, string>();
   private textStarted = false;
   private textPos = -1;
   private reasoningStarted = false;
@@ -216,6 +225,13 @@ export class OpenAIEventAdapter {
       }
       const block = this.blocks[position] as Extract<ContentBlock, { kind: "tool" }>;
       if (toolCall.id) block.id = toolCall.id;
+      if (block.id) {
+        const pending = this.pendingReasoningByToolId.get(block.id);
+        if (pending) {
+          block.thoughtSignature = pending;
+          this.pendingReasoningByToolId.delete(block.id);
+        }
+      }
       if (toolCall.function?.name) block.name = toolCall.function.name;
       const fragment = toolCall.function?.arguments ?? "";
       if (fragment) {
@@ -227,6 +243,16 @@ export class OpenAIEventAdapter {
           partial: this.snapshot(),
         });
       }
+    }
+
+    for (const detail of delta.reasoning_details ?? []) {
+      if (!isEncryptedReasoningDetail(detail)) continue;
+      const serialized = JSON.stringify(detail);
+      const block = [...this.toolPosByIndex.values()]
+        .map((position) => this.blocks[position] as Extract<ContentBlock, { kind: "tool" }>)
+        .find((candidate) => candidate.id === detail.id);
+      if (block) block.thoughtSignature = serialized;
+      else this.pendingReasoningByToolId.set(detail.id, serialized);
     }
 
     if (choice.finish_reason) {
@@ -266,6 +292,7 @@ export class OpenAIEventAdapter {
         id: block.id || `call_${position}`,
         name: block.name,
         arguments: tryParseJson(block.args),
+        ...(block.thoughtSignature ? { thoughtSignature: block.thoughtSignature } : {}),
       };
       this.stream.push({
         type: "toolcall_end",
@@ -306,6 +333,7 @@ async function run(
     resp = await fetch(url, {
       method: "POST",
       headers: {
+        ...(model as unknown as { headers?: Record<string, string> }).headers,
         "Content-Type": "application/json",
         Authorization: `Bearer ${apiKey}`,
       },
@@ -370,7 +398,7 @@ function buildRequestBody(
 ) {
   const messages: unknown[] = [];
   if (context.systemPrompt) messages.push({ role: "system", content: context.systemPrompt });
-  for (const m of context.messages) messages.push(toOpenAIMessage(m));
+  for (const m of context.messages) messages.push(toOpenAIMessage(m, model));
 
   const body: Record<string, unknown> = {
     model: model.id,
@@ -476,7 +504,7 @@ function applyThinking(
   }
 }
 
-function toOpenAIMessage(m: Message): unknown {
+function toOpenAIMessage(m: Message, model: Model<Api>): unknown {
   switch (m.role) {
     case "user": {
       if (typeof m.content === "string") return { role: "user", content: m.content };
@@ -495,14 +523,33 @@ function toOpenAIMessage(m: Message): unknown {
         .map((c) => c.text)
         .join("");
       const toolCalls = m.content.filter((c): c is ToolCall => c.type === "toolCall");
+      const reasoning = m.content
+        .filter((c): c is ThinkingContent => c.type === "thinking")
+        .map((c) => c.thinking)
+        .join("");
       const out: Record<string, unknown> = { role: "assistant" };
       out.content = textParts.length > 0 ? textParts : null;
+      // OpenRouter asks clients to replay reasoning alongside tool calls so a
+      // reasoning model can continue the same turn after receiving results.
+      if (model.provider === "openrouter" && reasoning) out.reasoning = reasoning;
       if (toolCalls.length > 0) {
         out.tool_calls = toolCalls.map((tc) => ({
           id: tc.id,
           type: "function",
           function: { name: tc.name, arguments: JSON.stringify(tc.arguments) },
         }));
+      }
+      const reasoningDetails = toolCalls.flatMap((toolCall) => {
+        if (!toolCall.thoughtSignature) return [];
+        try {
+          return [JSON.parse(toolCall.thoughtSignature) as unknown];
+        } catch {
+          return [];
+        }
+      });
+      if (model.provider === "openrouter" && reasoningDetails.length > 0) {
+        delete out.reasoning;
+        out.reasoning_details = reasoningDetails;
       }
       return out;
     }
@@ -514,6 +561,17 @@ function toOpenAIMessage(m: Message): unknown {
       return { role: "tool", tool_call_id: m.toolCallId, content: text };
     }
   }
+}
+
+function isEncryptedReasoningDetail(
+  value: unknown,
+): value is { type: "reasoning.encrypted"; id: string } & Record<string, unknown> {
+  return (
+    typeof value === "object" &&
+    value !== null &&
+    (value as { type?: unknown }).type === "reasoning.encrypted" &&
+    typeof (value as { id?: unknown }).id === "string"
+  );
 }
 
 /* ------------------------------ snapshots ------------------------------- */
@@ -536,6 +594,7 @@ function snapshot(
               id: b.id || `call_${b.idx}`,
               name: b.name,
               arguments: b.args ? tryParseJson(b.args) : {},
+              ...(b.thoughtSignature ? { thoughtSignature: b.thoughtSignature } : {}),
             } as ToolCall),
     ),
     api: model.api,

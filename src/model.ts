@@ -12,6 +12,7 @@ export interface ModelConfig {
   api: ApiKind;
   provider: string;
   extraBody?: Record<string, unknown>;
+  headers?: Record<string, string>;
   info?: ProviderModelInfo;
 }
 
@@ -34,5 +35,6 @@ export function makeModel(cfg: ModelConfig): Model<ApiKind> {
   // the streamFn to merge into the body. Model's type doesn't carry it, so we
   // attach it as a runtime property.
   if (cfg.extraBody) (model as unknown as { extraBody: Record<string, unknown> }).extraBody = cfg.extraBody;
+  if (cfg.headers) (model as unknown as { headers: Record<string, string> }).headers = cfg.headers;
   return model;
 }

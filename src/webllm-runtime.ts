@@ -2,16 +2,41 @@ import type {
   AppConfig,
   ChatCompletionChunk,
   ChatCompletionRequestStreaming,
+  ModelRecord,
   WebWorkerMLCEngine,
 } from "@mlc-ai/web-llm";
 
 import type { LocalModelStatus } from "./local-model.ts";
-import { WEBLLM_MODELS, getWebLLMModel } from "./webllm-models.ts";
+import {
+  REPLACED_WEBLLM_MODEL_IDS,
+  WEBLLM_MODELS,
+  type WebLLMModelDef,
+  getWebLLMModel,
+} from "./webllm-models.ts";
 
 type WebLLMModule = typeof import("@mlc-ai/web-llm");
 type StatusListener = (status: LocalModelStatus) => void;
 
 export type WebLLMChatRequest = Omit<ChatCompletionRequestStreaming, "stream">;
+
+type WebLLMLocalFile = Pick<
+  File,
+  "name" | "size" | "slice" | "stream" | "text"
+>;
+
+interface WebLLMCacheEntry {
+  scope: "webllm/model" | "webllm/config" | "webllm/wasm";
+  url: string;
+  file: WebLLMLocalFile;
+  contentType: string;
+}
+
+export interface WebLLMLocalImportPlan {
+  entries: readonly WebLLMCacheEntry[];
+  bytes: number;
+  selectedFiles: number;
+  ignoredFiles: number;
+}
 
 class WebLLMRuntime {
   private modulePromise: Promise<WebLLMModule> | null = null;
@@ -150,13 +175,101 @@ class WebLLMRuntime {
     await module.deleteModelAllInfoInCache(modelId, this.appConfig(module));
   }
 
+  async importModelFiles(modelId: string, files: readonly File[]): Promise<void> {
+    const model = getWebLLMModel(modelId);
+    if (!model) throw new Error(`Unknown WebLLM model: ${modelId}`);
+    if (typeof caches === "undefined") {
+      throw new Error("WebLLM local import requires the browser Cache API.");
+    }
+
+    const module = await this.loadModule();
+    const appConfig = this.appConfig(module);
+    const record = findWebLLMModelRecord(modelId, appConfig);
+    const plan = await validateWebLLMModelFiles(model, record, files);
+    if (this.loadedModelId === modelId) await this.unload();
+
+    const alreadyCached = await module.hasModelInCache(modelId, appConfig);
+    if (!alreadyCached) {
+      await this.removeReplacedCachedModel(modelId);
+      await this.assertStorageCapacity(plan.bytes);
+    }
+
+    let loadedBytes = 0;
+    let lastProgressAt = 0;
+    const reportProgress = () =>
+      this.setStatus({
+        phase: "importing",
+        modelId,
+        loadedBytes,
+        totalBytes: plan.bytes,
+        backend: "webgpu",
+      });
+    const openedCaches = new Map<string, Cache>();
+    const openCache = async (scope: string): Promise<Cache> => {
+      const existing = openedCaches.get(scope);
+      if (existing) return existing;
+      const cache = await caches.open(scope);
+      openedCaches.set(scope, cache);
+      return cache;
+    };
+    const removeEntries = async () => {
+      await Promise.all(
+        plan.entries.map(async (entry) => {
+          const cache = await openCache(entry.scope);
+          await cache.delete(entry.url);
+        }),
+      );
+    };
+
+    reportProgress();
+    try {
+      await removeEntries();
+      for (const entry of plan.entries) {
+        const progressStream = new TransformStream<Uint8Array, Uint8Array>({
+          transform(chunk, controller) {
+            loadedBytes += chunk.byteLength;
+            const now = Date.now();
+            if (now - lastProgressAt > 100) {
+              lastProgressAt = now;
+              reportProgress();
+            }
+            controller.enqueue(chunk);
+          },
+        });
+        const response = new Response(entry.file.stream().pipeThrough(progressStream), {
+          headers: { "Content-Type": entry.contentType },
+        });
+        await (await openCache(entry.scope)).put(new Request(entry.url), response);
+      }
+      reportProgress();
+      const retained = await Promise.all(
+        plan.entries.map(async (entry) =>
+          Boolean(await (await openCache(entry.scope)).match(entry.url)),
+        ),
+      );
+      if (retained.some((value) => !value) || !(await this.isCached(modelId))) {
+        throw new Error("The browser cache did not retain the complete WebLLM model.");
+      }
+      this.setStatus({ phase: "idle" });
+    } catch (error) {
+      await removeEntries().catch(() => {});
+      const message = error instanceof Error ? error.message : String(error);
+      this.setStatus({ phase: "error", modelId, backend: "webgpu", message });
+      throw error;
+    }
+  }
+
   async clearCache(): Promise<void> {
     await this.unload();
     const module = await this.loadModule();
     const appConfig = this.appConfig(module);
+    const modelIds = new Set([
+      ...WEBLLM_MODELS.map((model) => model.id),
+      ...Object.values(REPLACED_WEBLLM_MODEL_IDS),
+    ]);
     await Promise.all(
-      WEBLLM_MODELS.map((model) =>
-        module.deleteModelAllInfoInCache(model.id, appConfig),
+      [...modelIds].map((modelId) =>
+        module.deleteModelAllInfoInCache(modelId, appConfig),
       ),
     );
   }
@@ -170,7 +283,10 @@ class WebLLMRuntime {
     if (this.engine || this.worker) await this.unload();
 
     const cached = await this.isCached(modelId);
-    if (!cached) await this.assertStorageCapacity(model.bytes);
+    if (!cached) {
+      await this.removeReplacedCachedModel(modelId);
+      await this.assertStorageCapacity(model.bytes);
+    }
     if (signal?.aborted) throw abortError("WebLLM model loading was cancelled.");
 
     const module = await this.loadModule();
@@ -246,6 +362,16 @@ class WebLLMRuntime {
     }
   }
 
+  private async removeReplacedCachedModel(modelId: string): Promise<void> {
+    const replacedModelId = REPLACED_WEBLLM_MODEL_IDS[modelId];
+    if (!replacedModelId) return;
+    const module = await this.loadModule();
+    const appConfig = this.appConfig(module);
+    if (await module.hasModelInCache(replacedModelId, appConfig)) {
+      await module.deleteModelAllInfoInCache(replacedModelId, appConfig);
+    }
+  }
+
   private loadModule(): Promise<WebLLMModule> {
     this.modulePromise ??= import("@mlc-ai/web-llm");
     return this.modulePromise;
@@ -263,6 +389,227 @@ class WebLLMRuntime {
     this.currentStatus = status;
     for (const listener of this.listeners) listener(this.status);
   }
+}
+
+export async function validateWebLLMModelFiles(
+  model: WebLLMModelDef,
+  record: ModelRecord,
+  files: readonly WebLLMLocalFile[],
+): Promise<WebLLMLocalImportPlan> {
+  if (files.length === 0) throw new Error("Select a WebLLM model directory.");
+
+  const byName = new Map<string, WebLLMLocalFile>();
+  for (const file of files) {
+    const name = localFileName(file.name);
+    if (byName.has(name)) {
+      throw new Error(`The selected directory contains duplicate ${name} files.`);
+    }
+    byName.set(name, file);
+  }
+
+  const configFile = requireLocalFile(byName, "mlc-chat-config.json");
+  const tensorCacheFile = requireLocalFile(byName, "tensor-cache.json");
+  const config = await parseLocalJson(configFile, "mlc-chat-config.json");
+  const tensorCache = await parseLocalJson(tensorCacheFile, "tensor-cache.json");
+  validateModelConfig(model, config);
+
+  const tokenizerFiles = recordArray(config.tokenizer_files);
+  const tokenizerName = tokenizerFiles.includes("tokenizer.json")
+    ? "tokenizer.json"
+    : tokenizerFiles.includes("tokenizer.model")
+      ? "tokenizer.model"
+      : undefined;
+  if (!tokenizerName) {
+    throw new Error("The WebLLM config does not declare a supported tokenizer file.");
+  }
+  const tokenizerFile = requireLocalFile(byName, tokenizerName);
+
+  const metadata = recordObject(tensorCache.metadata);
+  if (metadata.ParamBytes !== model.localFiles.parameterBytes) {
+    throw new Error(
+      `The parameter manifest does not match ${model.label} ` +
+        `(expected ${model.localFiles.parameterBytes} bytes).`,
+    );
+  }
+  const shards = recordArray(tensorCache.records);
+  if (shards.length !== model.localFiles.shardCount) {
+    throw new Error(
+      `The parameter manifest has ${shards.length} shards; ` +
+        `${model.label} requires ${model.localFiles.shardCount}.`,
+    );
+  }
+
+  const modelUrl = cleanWebLLMModelUrl(record.model);
+  const entries: WebLLMCacheEntry[] = [];
+  let shardBytes = 0;
+  const shardNames = new Set<string>();
+  for (const value of shards) {
+    const shard = recordObject(value);
+    const dataPath = shard.dataPath;
+    const nbytes = shard.nbytes;
+    if (
+      typeof dataPath !== "string" ||
+      !/^[A-Za-z0-9][A-Za-z0-9._-]*$/.test(dataPath) ||
+      !Number.isSafeInteger(nbytes) ||
+      (nbytes as number) <= 0
+    ) {
+      throw new Error("The parameter manifest contains an invalid shard entry.");
+    }
+    if (shardNames.has(dataPath)) {
+      throw new Error(`The parameter manifest repeats ${dataPath}.`);
+    }
+    shardNames.add(dataPath);
+    const file = requireLocalFile(byName, dataPath);
+    if (file.size !== nbytes) {
+      throw new Error(
+        `${dataPath} is ${file.size} bytes; the manifest requires ${nbytes}.`,
+      );
+    }
+    shardBytes += nbytes as number;
+    entries.push({
+      scope: "webllm/model",
+      url: new URL(dataPath, modelUrl).href,
+      file,
+      contentType: "application/octet-stream",
+    });
+  }
+  if (Math.abs(shardBytes - model.localFiles.parameterBytes) > 4_096) {
+    throw new Error("The parameter shard sizes do not match the selected model.");
+  }
+
+  const wasmName = decodeURIComponent(
+    new URL(record.model_lib).pathname.split("/").pop() ?? "",
+  );
+  const wasmFile = byName.get(wasmName);
+  if (wasmFile) {
+    if (wasmFile.size !== model.localFiles.wasmBytes) {
+      throw new Error(
+        `${wasmName} is ${wasmFile.size} bytes; ${model.label} requires ` +
+          `${model.localFiles.wasmBytes}.`,
+      );
+    }
+    const wasmMagic = new Uint8Array(await wasmFile.slice(0, 4).arrayBuffer());
+    if (
+      wasmMagic.length !== 4 ||
+      wasmMagic[0] !== 0x00 ||
+      wasmMagic[1] !== 0x61 ||
+      wasmMagic[2] !== 0x73 ||
+      wasmMagic[3] !== 0x6d
+    ) {
+      throw new Error(`${wasmName} is not a WebAssembly module.`);
+    }
+  }
+
+  entries.push(
+    {
+      scope: "webllm/model",
+      url: new URL(tokenizerName, modelUrl).href,
+      file: tokenizerFile,
+      contentType:
+        tokenizerName.endsWith(".json") ? "application/json" : "application/octet-stream",
+    },
+    {
+      scope: "webllm/config",
+      url: new URL("mlc-chat-config.json", modelUrl).href,
+      file: configFile,
+      contentType: "application/json",
+    },
+    ...(wasmFile
+      ? [
+          {
+            scope: "webllm/wasm" as const,
+            url: record.model_lib,
+            file: wasmFile,
+            contentType: "application/wasm",
+          },
+        ]
+      : []),
+    // The manifest is stored last so WebLLM cannot consider a partial import cached.
+    {
+      scope: "webllm/model",
+      url: new URL("tensor-cache.json", modelUrl).href,
+      file: tensorCacheFile,
+      contentType: "application/json",
+    },
+  );
+
+  return {
+    entries,
+    bytes: entries.reduce((total, entry) => total + entry.file.size, 0),
+    selectedFiles: files.length,
+    ignoredFiles: files.length - entries.length,
+  };
+}
+
+function findWebLLMModelRecord(modelId: string, appConfig: AppConfig): ModelRecord {
+  const record = appConfig.model_list.find((candidate) => candidate.model_id === modelId);
+  if (!record) throw new Error(`WebLLM has no prebuilt record for ${modelId}.`);
+  return record;
+}
+
+function cleanWebLLMModelUrl(value: string): string {
+  let url = value.endsWith("/") ? value : `${value}/`;
+  if (!/.+\/resolve\/.+\//.test(url)) url += "resolve/main/";
+  return new URL(url).href;
+}
+
+function localFileName(value: string): string {
+  const name = value.replaceAll("\\", "/").split("/").pop() ?? "";
+  if (!name || name === "." || name === ".." || /[\u0000-\u001f\u007f]/.test(name)) {
+    throw new Error(`Unsafe local model filename: ${value}`);
+  }
+  return name;
+}
+
+function requireLocalFile(
+  files: ReadonlyMap<string, WebLLMLocalFile>,
+  name: string,
+): WebLLMLocalFile {
+  const file = files.get(name);
+  if (!file) throw new Error(`The selected directory is missing ${name}.`);
+  return file;
+}
+
+async function parseLocalJson(
+  file: WebLLMLocalFile,
+  label: string,
+): Promise<Record<string, unknown>> {
+  if (file.size > 32 * 1024 * 1024) throw new Error(`${label} is unexpectedly large.`);
+  try {
+    return recordObject(JSON.parse(await file.text()));
+  } catch (error) {
+    if (error instanceof Error && error.message.startsWith(`${label} `)) throw error;
+    throw new Error(`${label} is not valid JSON.`);
+  }
+}
+
+function validateModelConfig(
+  model: WebLLMModelDef,
+  value: Record<string, unknown>,
+): void {
+  const config = recordObject(value.model_config);
+  const expected = model.localFiles;
+  if (
+    value.model_type !== expected.modelType ||
+    value.quantization !== `${model.quantization}_1` ||
+    config.hidden_size !== expected.hiddenSize ||
+    config.num_hidden_layers !== expected.layers ||
+    config.vocab_size !== expected.vocabSize
+  ) {
+    throw new Error(`mlc-chat-config.json does not describe ${model.label}.`);
+  }
+}
+
+function recordObject(value: unknown): Record<string, unknown> {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) {
+    throw new Error("Invalid WebLLM model metadata.");
+  }
+  return value as Record<string, unknown>;
+}
+
+function recordArray(value: unknown): unknown[] {
+  if (!Array.isArray(value)) throw new Error("Invalid WebLLM model metadata.");
+  return value;
 }
 
 function abortable<T>(

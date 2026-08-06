@@ -15,6 +15,7 @@
 | `npm run build:raylib` | Rebuild pinned raylib 6 framebuffer objects |
 | `npm run check:raylib` | Verify committed raylib objects and hashes |
 | `npm run chrome:webgpu` | Launch Linux Chrome with NVIDIA WebGPU flags |
+| `npm run chrome:unrestricted` | Same, with CORS disabled in a dedicated profile |
 | `npm run codex-proxy` | Start the optional loopback Codex bridge |
 | `npm run docs:screenshots` | Capture current UI screenshots with Chrome |
 
