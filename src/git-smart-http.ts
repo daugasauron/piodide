@@ -52,6 +52,22 @@ function millis(value: number | Date): number {
   return value instanceof Date ? value.getTime() : Number(value);
 }
 
+/**
+ * Emscripten MEMFS resolves symlink targets to absolute paths internally. Node
+ * filesystems (and Git) expect readlink to return the link text instead. Turn
+ * an in-workspace absolute target back into a path relative to the link's
+ * parent. This preserves portable Git symlinks across add/checkout/status.
+ */
+function gitSymlinkTarget(linkPath: string, target: string): string {
+  if (!target.startsWith("/")) return target;
+  const parent = linkPath.slice(0, linkPath.lastIndexOf("/")) || "/";
+  const from = parent.split("/").filter(Boolean);
+  const to = target.split("/").filter(Boolean);
+  let common = 0;
+  while (common < from.length && common < to.length && from[common] === to[common]) common++;
+  return [...from.slice(common).map(() => ".."), ...to.slice(common)].join("/") || ".";
+}
+
 function stats(py: Pyodide, value: PyodideFSStat, symbolicLink: boolean) {
   const fs = py.FS;
   return {
@@ -110,7 +126,7 @@ export function createIsomorphicGitFs(py: Pyodide): NodeFs {
       const value = fs.lstat(path);
       return stats(py, value, Boolean(fs.isLink?.(value.mode)));
     }),
-    readlink: (path: string) => call(() => fs.readlink(path)),
+    readlink: (path: string) => call(() => gitSymlinkTarget(path, fs.readlink(path))),
     symlink: (target: string, path: string) => call(() => fs.symlink(target, path)),
     chmod: (path: string, mode: number) => call(() => fs.chmod(path, mode)),
     rename: (from: string, to: string) => call(() => fs.rename(from, to)),

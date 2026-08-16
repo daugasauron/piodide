@@ -261,10 +261,39 @@ async function headId(context: HostCommandContext, cwd: string): Promise<string>
   return resolved.stdout.trim();
 }
 
+async function statusMatrix(context: HostCommandContext, cwd: string) {
+  return isomorphicGit.statusMatrix({ fs: gitFs(context), dir: cwd });
+}
+
 async function isClean(context: HostCommandContext, cwd: string): Promise<boolean> {
-  const status = await invoke(context, ["status", "--porcelain"], cwd);
-  if (status.exitCode !== 0) throw new Error(`${status.stdout}${status.stderr}`.trim());
-  return status.stdout.length === 0;
+  return (await statusMatrix(context, cwd)).every(([, head, workdir, stage]) =>
+    head === workdir && workdir === stage
+  );
+}
+
+async function hasStagedChanges(context: HostCommandContext, cwd: string): Promise<boolean> {
+  return (await statusMatrix(context, cwd)).some(([, head, , stage]) => head !== stage);
+}
+
+async function runAdd(context: HostCommandContext, args: string[]): Promise<HostCommandResult> {
+  const root = repositoryRoot(context.py, context.cwd);
+  const paths: string[] = [];
+  for (const arg of args) {
+    if (arg === "-A" || arg === "--all" || arg === "--") continue;
+    if (arg.startsWith("-")) throw new Error(`unsupported add option: ${arg}`);
+    paths.push(pathFromRepository(root, context.cwd, arg));
+  }
+  const requested = paths.length ? paths : ["."];
+  const selected = (filepath: string) => requested.some((path) =>
+    path === "." || filepath === path || filepath.startsWith(`${path}/`)
+  );
+  const fs = gitFs(context);
+  for (const [filepath, , workdir] of await statusMatrix(context, root)) {
+    if (!selected(filepath)) continue;
+    if (workdir === 0) await isomorphicGit.remove({ fs, dir: root, filepath });
+    else await isomorphicGit.add({ fs, dir: root, filepath });
+  }
+  return result(0, "");
 }
 
 function branchRef(cwd: string, name: string): string {
@@ -459,8 +488,8 @@ async function runSnapshot(context: HostCommandContext, args: string[]): Promise
   if (fetched.exitCode !== 0) return fetched.stderr
     ? { exitCode: fetched.exitCode, stderr: fetched.stderr }
     : errorResult(fetched.exitCode, fetchedText);
-  const added = await invoke(context, ["add", "."], root);
-  if (added.exitCode !== 0) return render(added);
+  const added = await runAdd({ ...context, cwd: root }, ["."]);
+  if (added.exitCode !== 0) return added;
   const message = readGitRemoteMarker(context.py, root, "remote-message") || `Import snapshot branch ${branch}`;
   const committed = await invoke(context, ["commit", "-m", message], root);
   if (committed.exitCode !== 0) return render(committed);
@@ -628,8 +657,8 @@ async function runClone(context: HostCommandContext, args: string[]): Promise<Ho
   });
   const fetchedText = new TextDecoder().decode(fetched.stdout ?? fetched.stderr ?? new Uint8Array());
   if (fetched.exitCode !== 0) return fetched;
-  const added = await invoke(context, ["add", "."], parsed.destination);
-  if (added.exitCode !== 0) return render(added);
+  const added = await runAdd({ ...context, cwd: parsed.destination }, ["."]);
+  if (added.exitCode !== 0) return added;
   const message = readGitRemoteMarker(context.py, parsed.destination, "remote-message") || "Import repository";
   const committed = await invoke(context, ["commit", "-m", message], parsed.destination);
   if (committed.exitCode !== 0) return render(committed);
@@ -755,8 +784,8 @@ async function runPull(context: HostCommandContext, args: string[]): Promise<Hos
   const output = new TextDecoder().decode(pulled.stdout ?? pulled.stderr ?? new Uint8Array());
   if (pulled.exitCode !== 0) return pulled;
   if (output.startsWith("Already up to date")) return result(0, output);
-  const added = await invoke(context, ["add", "."], cwd);
-  if (added.exitCode !== 0) return render(added);
+  const added = await runAdd({ ...context, cwd }, ["."]);
+  if (added.exitCode !== 0) return added;
   const message = readGitRemoteMarker(context.py, cwd, "remote-message") || "Pull remote snapshot";
   const committed = await invoke(context, ["commit", "-m", message], cwd);
   if (committed.exitCode !== 0) return render(committed);
@@ -772,8 +801,17 @@ async function runPush(context: HostCommandContext, args: string[]): Promise<Hos
     const url = remoteUrl(context.py, cwd, remote);
     if (url) assertSupportedRemote(url);
     if (!url || !isHttpRemote(url)) {
-      const pushed = await invoke(context, ["push", ...parsed.positional], cwd);
-      if (pushed.exitCode === 0 && parsed.setUpstream) await setUpstream(context, cwd, remote, parsed.positional[1]);
+      // wasm-git's local transport only accepts the configured default push.
+      // Treat an explicit `origin <current-branch>` (as emitted by the agent
+      // tool) as that default instead of forwarding unsupported arguments.
+      const branch = currentBranch(context.py, cwd);
+      const explicitDefault = parsed.positional.length > 0 && remote === "origin" &&
+        parsed.positional.length <= 2 && (!parsed.positional[1] || parsed.positional[1] === branch);
+      if (parsed.positional.length && !explicitDefault) {
+        throw new Error("local push only supports origin and the checked-out branch");
+      }
+      const pushed = await invoke(context, ["push"], cwd);
+      if (pushed.exitCode === 0 && parsed.setUpstream) await setUpstream(context, cwd, remote, branch || undefined);
       return render(pushed);
     }
     const branch = currentBranch(context.py, cwd);
@@ -1154,8 +1192,26 @@ async function runGc(context: HostCommandContext): Promise<HostCommandResult> {
     }
   }
   if (!oids.length) return result(0, "Nothing to pack.\n");
-  const packed = await isomorphicGit.packObjects({ fs: gitFs(context), dir: root, oids, write: true });
-  return result(0, `Packed ${oids.length} object(s) into ${packed.filename}.\n`);
+  const fs = gitFs(context);
+  const packed = await isomorphicGit.packObjects({ fs, dir: root, oids, write: true });
+  const packPath = `.git/objects/pack/${packed.filename}`;
+  await isomorphicGit.indexPack({ fs, dir: root, filepath: packPath });
+  const indexName = packed.filename.replace(/\.pack$/, ".idx");
+  if (!fsExists(context.py, `${root}/.git/objects/pack/${indexName}`)) {
+    throw new Error(`failed to index ${packed.filename}; loose objects were retained`);
+  }
+  // Only prune after the companion index exists and the pack can serve reads.
+  await isomorphicGit.readObject({ fs, dir: root, oid: oids[0] });
+  for (const oid of oids) {
+    const directory = `${objects}/${oid.slice(0, 2)}`;
+    context.py.FS.unlink(`${directory}/${oid.slice(2)}`);
+    try {
+      if (context.py.FS.readdir(directory).every((name) => name === "." || name === "..")) {
+        context.py.FS.rmdir(directory);
+      }
+    } catch { /* another loose object still uses the directory */ }
+  }
+  return result(0, `Packed and pruned ${oids.length} object(s) into ${packed.filename}.\n`);
 }
 
 function looseRefs(py: Pyodide, root: string): string[] {
@@ -1233,6 +1289,62 @@ async function runLsFiles(context: HostCommandContext, args: string[]): Promise<
   return result(0, (entries as Array<string | undefined>).filter(Boolean).join(""));
 }
 
+const EMPTY_TREE_OID = "4b825dc642cb6eb9a060e54bf8d69288fbee4904";
+
+function quoteDiffPath(path: string): string {
+  const bytes = encoder.encode(path);
+  if ([...bytes].every((byte) => byte >= 0x20 && byte < 0x7f && byte !== 0x22 && byte !== 0x5c)) {
+    return path;
+  }
+  let quoted = '"';
+  for (const byte of bytes) {
+    if (byte === 0x22 || byte === 0x5c) quoted += `\\${String.fromCharCode(byte)}`;
+    else if (byte >= 0x20 && byte < 0x7f) quoted += String.fromCharCode(byte);
+    else quoted += `\\${byte.toString(8).padStart(3, "0")}`;
+  }
+  return `${quoted}"`;
+}
+
+function filterDiffPaths(output: string, paths: string[]): string {
+  if (!paths.length || !output) return output;
+  const starts = [...output.matchAll(/^diff --git /gm)].map((match) => match.index!);
+  if (!starts.length) return output;
+  starts.push(output.length);
+  const wanted = new Set(paths.flatMap((path) => [quoteDiffPath(`a/${path}`), quoteDiffPath(`b/${path}`)]));
+  const selected: string[] = [];
+  for (let index = 0; index + 1 < starts.length; index++) {
+    const section = output.slice(starts[index], starts[index + 1]);
+    const header = section.slice(0, section.indexOf("\n") < 0 ? section.length : section.indexOf("\n"));
+    if ([...wanted].some((path) => header.includes(path))) selected.push(section);
+  }
+  return selected.join("");
+}
+
+async function runDiff(context: HostCommandContext, args: string[]): Promise<HostCommandResult> {
+  const root = repositoryRoot(context.py, context.cwd);
+  const separator = args.indexOf("--");
+  const commandArgs = (separator < 0 ? args : args.slice(0, separator)).map((arg) =>
+    arg === "--staged" ? "--cached" : arg
+  );
+  const paths = separator < 0 ? [] : args.slice(separator + 1).map((path) =>
+    pathFromRepository(root, context.cwd, path)
+  );
+  const branch = currentBranch(context.py, root);
+  const unborn = Boolean(branch && !fsExists(context.py, branchRef(root, branch)) && !packedBranches(context.py, root).has(branch));
+  if (unborn && commandArgs.includes("--cached")) {
+    const empty = await isomorphicGit.writeTree({ fs: gitFs(context), dir: root, tree: [] });
+    if (empty !== EMPTY_TREE_OID) throw new Error("failed to create the canonical empty tree");
+    commandArgs.push(empty);
+  }
+  const value = await invoke(context, ["diff", ...commandArgs], root);
+  if (value.exitCode !== 0) return render(value);
+  return {
+    exitCode: 0,
+    ...(value.stdout ? { stdout: encoder.encode(filterDiffPaths(value.stdout, paths)) } : {}),
+    ...(value.stderr ? { stderr: encoder.encode(value.stderr) } : {}),
+  };
+}
+
 async function runLog(context: HostCommandContext, args: string[]): Promise<HostCommandResult> {
   const supported = args.some((arg) => ["--all", "--graph", "--stat"].includes(arg));
   if (!supported) return runLibgitCommand(context, context.cwd, ["log", ...args]);
@@ -1290,15 +1402,43 @@ async function runLog(context: HostCommandContext, args: string[]): Promise<Host
   }).join(""));
 }
 
+async function runRevList(context: HostCommandContext, args: string[]): Promise<HostCommandResult> {
+  const root = repositoryRoot(context.py, context.cwd);
+  let depth = 10_000;
+  const positional: string[] = [];
+  for (let index = 0; index < args.length; index++) {
+    const arg = args[index];
+    if (arg === "--max-count") depth = Number(args[++index]);
+    else if (arg.startsWith("--max-count=")) depth = Number(arg.slice(12));
+    else if (arg.startsWith("-")) throw new Error(`unsupported rev-list option: ${arg}`);
+    else positional.push(arg);
+  }
+  if (positional.length !== 1) throw new Error("rev-list requires exactly one revision");
+  if (!Number.isSafeInteger(depth) || depth < 1 || depth > 10_000) throw new Error("invalid rev-list count");
+  const entries = await isomorphicGit.log({ fs: gitFs(context), dir: root, ref: positional[0], depth });
+  return result(0, entries.map(({ oid }) => `${oid}\n`).join(""));
+}
+
 async function runMerge(context: HostCommandContext, args: string[]): Promise<HostCommandResult> {
   const root = repositoryRoot(context.py, context.cwd);
   if (args.length === 1 && args[0] === "--abort") {
     if (!fsExists(context.py, `${root}/.git/MERGE_HEAD`)) throw new Error("there is no merge to abort");
-    await isomorphicGit.abortMerge({ fs: gitFs(context), dir: root });
-    for (const name of ["MERGE_HEAD", "MERGE_MODE", "MERGE_MSG"]) {
-      const path = `${root}/.git/${name}`;
-      if (fsExists(context.py, path)) context.py.FS.unlink(path);
-    }
+    // isomorphic-git's abortMerge currently decodes blobs as UTF-8 while
+    // rebuilding the worktree, corrupting arbitrary binary files. A hard
+    // restore from ORIG_HEAD uses checkout's byte-preserving object path.
+    const original = fsExists(context.py, `${root}/.git/ORIG_HEAD`)
+      ? fsReadText(context.py, `${root}/.git/ORIG_HEAD`).trim()
+      : await headId(context, root);
+    await isomorphicGit.checkout({
+      fs: gitFs(context),
+      dir: root,
+      ref: original,
+      noUpdateHead: true,
+      force: true,
+    });
+    await resetIndexPaths(context, root, original);
+    await moveHead(context, root, original);
+    clearMergeState(context.py, root);
     return result(0, "");
   }
   if (args.length === 1 && args[0] === "--continue") {
@@ -1400,7 +1540,11 @@ async function runLibgitCommand(
   let stdout = value.stdout;
   let stderr = value.stderr;
   if (args[0] === "status") {
-    stdout = normalizeStatus(context.py, repositoryRoot(context.py, cwd), args, stdout);
+    const root = repositoryRoot(context.py, cwd);
+    stdout = normalizeStatus(context.py, root, args, stdout);
+    const branch = currentBranch(context.py, root);
+    const unborn = Boolean(branch && !fsExists(context.py, branchRef(root, branch)) && !packedBranches(context.py, root).has(branch));
+    if (unborn) stderr = stderr.replace(/^error: reference 'refs\/heads\/[^']+' not found\n?/gm, "");
   }
   if (args[0] === "checkout" || args[0] === "switch") {
     stdout = stdout.replace(/^Branch '.*' set up to track remote branch 'origin\/.*'\.?\n?/gm, "");
@@ -1464,6 +1608,8 @@ export async function runGitEngineCommand(context: HostCommandContext): Promise<
     if (command === "push") return await runPush(scoped, args.slice(1));
     if (command === "ls-remote") return await runLsRemote(scoped, args.slice(1));
     if (command === "config") return await runConfig(scoped, args.slice(1));
+    if (command === "add") return await runAdd(scoped, args.slice(1));
+    if (command === "diff") return await runDiff(scoped, args.slice(1));
     if (command === "remote") return await runRemote(scoped, args.slice(1));
     if (command === "restore") return await runRestore(scoped, args.slice(1));
     if (command === "reset") return await runReset(scoped, args.slice(1));
@@ -1473,6 +1619,7 @@ export async function runGitEngineCommand(context: HostCommandContext): Promise<
     if (command === "fsck") return await runFsck(scoped);
     if (command === "ls-files") return await runLsFiles(scoped, args.slice(1));
     if (command === "log") return await runLog(scoped, args.slice(1));
+    if (command === "rev-list") return await runRevList(scoped, args.slice(1));
     if (command === "merge") return await runMerge(scoped, args.slice(1));
     if (command === "init") {
       let branch: string | undefined;
@@ -1496,6 +1643,11 @@ export async function runGitEngineCommand(context: HostCommandContext): Promise<
       return render(initialized);
     }
     if (command === "commit") {
+      const root = repositoryRoot(context.py, cwd);
+      const merging = fsExists(context.py, `${root}/.git/MERGE_HEAD`);
+      if (!merging && !(await hasStagedChanges(scoped, root))) {
+        return errorResult(1, "nothing to commit, working tree clean\n");
+      }
       const commitArgs = [...args];
       const fileIndex = commitArgs.findIndex((value) => value === "-F" || value === "--file");
       if (fileIndex >= 0 && commitArgs[fileIndex + 1] === "-") {
@@ -1522,7 +1674,6 @@ export async function runGitEngineCommand(context: HostCommandContext): Promise<
           else throw new Error(`explicit Git identity currently supports commit -m or commit -F -; unsupported option: ${value}`);
         }
         if (!messages.length) throw new Error("commit requires -m or -F -");
-        const root = repositoryRoot(context.py, cwd);
         const fallback = identity(scoped) || { name: "Piodide", email: "piodide@browser.local" };
         const configuredName = configValue(context.py, root, "user.name") || fallback.name;
         const configuredEmail = configValue(context.py, root, "user.email") || fallback.email;
@@ -1540,7 +1691,7 @@ export async function runGitEngineCommand(context: HostCommandContext): Promise<
           message: messages.join("\n\n"),
           author: authorIdentity,
           committer: committerIdentity,
-          disallowEmpty: true,
+          disallowEmpty: !merging,
         });
       } else {
         committed = await invoke(scoped, commitArgs, cwd);

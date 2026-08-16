@@ -63,6 +63,12 @@ test("native Git remote bridge clones and pushes GitHub snapshots", { timeout: 1
     if (url.endsWith("/repos/acme/demo/commits/remote2")) {
       return json({ sha: "remote2", commit: { message: "remote", tree: { sha: "tree2" } } });
     }
+    if (url.endsWith("/repos/acme/demo/commits/published")) {
+      return new Response(JSON.stringify({ message: "No commit found for SHA: published" }), {
+        status: 422,
+        headers: { "Content-Type": "application/json" },
+      });
+    }
     if (url.includes("/repos/acme/demo/git/trees/tree0?recursive=1")) {
       return json({
         sha: "tree0",

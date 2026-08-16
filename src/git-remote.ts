@@ -365,7 +365,10 @@ async function pushSnapshot(
       signal,
     );
   } catch (error) {
-    if (!/GitHub HTTP 404:/.test(error instanceof Error ? error.message : String(error))) throw error;
+    const message = error instanceof Error ? error.message : String(error);
+    // GitHub returns 422 "No commit found for SHA" (rather than 404) when
+    // resolving a not-yet-created branch through the commits endpoint.
+    if (!/GitHub HTTP (?:404:|422: No commit found for SHA:)/.test(message)) throw error;
     createBranch = true;
     remote = await getGitHubCommit(
       metadata.apiBaseUrl,

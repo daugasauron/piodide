@@ -124,7 +124,8 @@ test("libgit2 repositories interoperate with Git, including packed objects", { t
 
   await git(py, repository, "init", "-b", "main");
   py.FS.writeFile(`${repository}/value.txt`, "main\n");
-  await git(py, repository, "add", ".");
+  py.FS.symlink("value.txt", `${repository}/value-link`);
+  await git(py, repository, "add", "--", ".");
   await git(py, repository, "commit", "-m", "initial");
   await git(py, repository, "switch", "-c", "feature");
   py.FS.writeFile(`${repository}/value.txt`, "feature\n");
@@ -144,6 +145,10 @@ test("libgit2 repositories interoperate with Git, including packed objects", { t
     exportTree(py, repository, hostRepository);
     execFileSync("git", ["-C", hostRepository, "fsck", "--full"], { stdio: "pipe" });
     assert.equal(
+      execFileSync("git", ["-C", hostRepository, "show", "main:value-link"], { encoding: "utf8" }),
+      "value.txt",
+    );
+    assert.equal(
       execFileSync("git", ["-C", hostRepository, "log", "--format=%s", "main"], { encoding: "utf8" }),
       "subdirectory pathspec\ninitial\n",
     );
@@ -161,7 +166,8 @@ test("libgit2 repositories interoperate with Git, including packed objects", { t
     py.FS.writeFile("/home/web/writer/pushed.txt", "pushed\n");
     await git(py, "/home/web/writer", "add", "pushed.txt");
     await git(py, "/home/web/writer", "commit", "-m", "local push");
-    await git(py, "/home/web/writer", "push");
+    assert.equal(py.FS.readlink("/home/web/writer/value-link"), "/home/web/writer/value.txt");
+    await git(py, "/home/web/writer", "push", "origin", "main");
     await git(py, "/home/web", "clone", "bare.git", "reader");
     assert.equal(py.FS.readFile("/home/web/reader/pushed.txt", { encoding: "utf8" }), "pushed\n");
 
@@ -186,6 +192,41 @@ test("libgit2 repositories interoperate with Git, including packed objects", { t
   }
 });
 
+test("agent Git operations stage, diff, and reject empty commits", { timeout: 120_000 }, async () => {
+  const py = (await loadPyodide()) as unknown as Pyodide;
+  const repository = "/home/web/agent-audit";
+  py.FS.mkdirTree(repository);
+  await git(py, repository, "init", "-b", "main");
+  py.FS.writeFile(`${repository}/wanted.txt`, "wanted\n");
+  py.FS.writeFile(`${repository}/other.txt`, "other\n");
+
+  await git(py, repository, "add", "--", "wanted.txt");
+  assert.match((await gitResult(py, repository, "status", "--short")).output, /^A  wanted\.txt$/m);
+  const staged = await gitResult(py, repository, "diff", "--staged", "--", "wanted.txt");
+  assert.equal(staged.exitCode, 0, staged.output);
+  assert.match(staged.output, /wanted\.txt/);
+  assert.doesNotMatch(staged.output, /other\.txt/);
+  await git(py, repository, "commit", "-m", "wanted only");
+
+  const empty = await gitResult(py, repository, "commit", "-m", "must fail");
+  assert.notEqual(empty.exitCode, 0);
+  assert.match(empty.output, /nothing to commit/);
+  const revisions = await gitResult(py, repository, "rev-list", "--max-count", "1", "HEAD");
+  assert.equal(revisions.exitCode, 0, revisions.output);
+  assert.match(revisions.output, /^[0-9a-f]{40}\n$/);
+
+  const unborn = "/home/web/unborn-status";
+  py.FS.mkdirTree(unborn);
+  await git(py, unborn, "init", "-b", "main");
+  const response = await runGitEngineCommand({
+    py,
+    cwd: unborn,
+    args: ["git-engine", "status"],
+  });
+  assert.equal(response.exitCode, 0);
+  assert.doesNotMatch(new TextDecoder().decode(response.stderr ?? new Uint8Array()), /reference .* not found/);
+});
+
 test("Git audit regressions and browser smart HTTP are compatible and script-safe", { timeout: 120_000 }, async () => {
   const py = (await loadPyodide()) as unknown as Pyodide;
   const temporary = mkdtempSync(join(tmpdir(), "piodide-git-http-"));
@@ -196,6 +237,8 @@ test("Git audit regressions and browser smart HTTP are compatible and script-saf
   execFileSync("git", ["config", "user.name", "Test"], { cwd: source });
   execFileSync("git", ["config", "user.email", "test@example.com"], { cwd: source });
   writeFileSync(join(source, "value.txt"), "base\n");
+  writeFileSync(join(source, "binary.dat"), Buffer.from(Array.from({ length: 256 }, (_, index) => index)));
+  symlinkSync("value.txt", join(source, "value-link"));
   execFileSync("git", ["add", "."], { cwd: source });
   execFileSync("git", ["commit", "-m", "original history"], { cwd: source });
   execFileSync("git", ["switch", "-c", "remote-feature"], { cwd: source });
@@ -215,6 +258,8 @@ test("Git audit regressions and browser smart HTTP are compatible and script-saf
     assert.match((await gitResult(py, "/home/web/smart", "tag")).output, /v1/);
     assert.match((await gitResult(py, "/home/web/smart", "remote", "-v")).output, /remote\.git/);
     assert.match((await gitResult(py, "/home/web/smart", "ls-remote", "origin")).output, /refs\/heads\/main/);
+    assert.deepEqual(py.FS.readFile("/home/web/smart/binary.dat"), new Uint8Array(Array.from({ length: 256 }, (_, index) => index)));
+    assert.equal(py.FS.readlink("/home/web/smart/value-link"), "/home/web/smart/value.txt");
 
     const help = await gitResult(py, "/home/web/smart", "pull", "--help");
     assert.equal(help.exitCode, 0);
@@ -232,6 +277,7 @@ test("Git audit regressions and browser smart HTTP are compatible and script-saf
     assert.equal(conflict.exitCode, 1, conflict.output);
     assert.equal((await gitResult(py, "/home/web/smart", "status", "--porcelain=v1")).output, "UU value.txt\n");
     await git(py, "/home/web/smart", "merge", "--abort");
+    assert.deepEqual(py.FS.readFile("/home/web/smart/binary.dat"), new Uint8Array(Array.from({ length: 256 }, (_, index) => index)));
 
     assert.match((await gitResult(py, "/home/web/smart", "ls-files", "--stage")).output, /^100644 [0-9a-f]{40} 0\tvalue\.txt$/m);
     py.FS.writeFile("/home/web/smart/value.txt", "temporary\n");
@@ -247,7 +293,13 @@ test("Git audit regressions and browser smart HTTP are compatible and script-saf
     await git(py, "/home/web/smart", "branch", "-m", "at-main", "renamed-main");
     assert.match((await gitResult(py, "/home/web/smart", "branch")).output, /renamed-main/);
     assert.match((await gitResult(py, "/home/web/smart", "fsck")).output, /no errors/);
-    assert.match((await gitResult(py, "/home/web/smart", "gc")).output, /Packed/);
+    assert.match((await gitResult(py, "/home/web/smart", "gc")).output, /Packed and pruned/);
+    const packFiles = py.FS.readdir("/home/web/smart/.git/objects/pack");
+    assert.ok(packFiles.some((name) => name.endsWith(".pack")));
+    assert.ok(packFiles.some((name) => name.endsWith(".idx")));
+    const looseObjects = py.FS.readdir("/home/web/smart/.git/objects").filter((name) => /^[0-9a-f]{2}$/.test(name));
+    assert.equal(looseObjects.length, 0);
+    assert.match((await gitResult(py, "/home/web/smart", "fsck")).output, /no errors/);
     assert.equal((await gitResult(py, "/home/web/smart", "rev-parse", "--abbrev-ref", "HEAD")).output, "main\n");
 
     py.FS.writeFile("/home/web/smart/reset.txt", "base\n");

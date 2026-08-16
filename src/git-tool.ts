@@ -66,6 +66,12 @@ export const GitParams = Type.Object({
   delete: Type.Optional(
     Type.Boolean({ description: "Delete the named branch." }),
   ),
+  abort: Type.Optional(
+    Type.Boolean({ description: "Abort an in-progress merge." }),
+  ),
+  continue: Type.Optional(
+    Type.Boolean({ description: "Continue an in-progress merge after conflicts are staged." }),
+  ),
   staged: Type.Optional(
     Type.Boolean({ description: "For diff, compare staged changes with HEAD." }),
   ),
@@ -183,6 +189,9 @@ function gitCommand(params: GitParamsValue): { command: string; cwd: string } {
     case "push":
       return { command: `git push${params.branch ? ` origin ${shellQuote(params.branch)}` : ""}${params.corsProxy ? ` --cors-proxy ${shellQuote(params.corsProxy)}` : ""}`, cwd };
     case "merge":
+      if (params.abort && params.continue) throw new Error("merge abort and continue are mutually exclusive.");
+      if (params.abort) return { command: "git merge --abort", cwd };
+      if (params.continue) return { command: "git merge --continue", cwd };
       return { command: `git merge ${shellQuote(requireBranch(params))}`, cwd };
     case "restore":
       if (!pathArgs) throw new Error("restore requires paths.");

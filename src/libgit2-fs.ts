@@ -35,6 +35,12 @@ export function createPyodideGitFs(module: WasmGitModule, py: Pyodide) {
     return parts.reverse().join("/").replaceAll(/\/{2,}/g, "/");
   };
   const mode = (path: string): number => attempt(() => source.lstat(path).mode);
+  const toSourcePath = (path: string): string => path === "/workspace"
+    ? "/home/web"
+    : path.startsWith("/workspace/") ? `/home/web/${path.slice("/workspace/".length)}` : path;
+  const toMountedPath = (path: string): string => path === "/home/web"
+    ? "/workspace"
+    : path.startsWith("/home/web/") ? `/workspace/${path.slice("/home/web/".length)}` : path;
   const createNode = (parent: any, name: string, nodeMode: number, dev = 0) => {
     if (!FS.isDir(nodeMode) && !FS.isFile(nodeMode) && !FS.isLink(nodeMode)) {
       throw new FS.ErrnoError(28);
@@ -124,10 +130,15 @@ export function createPyodideGitFs(module: WasmGitModule, py: Pyodide) {
         ));
       },
       symlink(parent: any, newName: string, oldPath: string) {
-        return attempt(() => source.symlink(oldPath, `${realPath(parent)}/${newName}`));
+        // Emscripten resolves link targets inside the mounted /workspace tree.
+        // Translate that virtual target before creating the link in Pyodide's
+        // /home/web MEMFS or the link silently points outside the workspace.
+        return attempt(() => source.symlink(toSourcePath(oldPath), `${realPath(parent)}/${newName}`));
       },
       readlink(node: any) {
-        return attempt(() => source.readlink(realPath(node)));
+        // Present Pyodide's absolute MEMFS target in wasm-git's mounted
+        // namespace. Emscripten will relativize it for the readlink syscall.
+        return attempt(() => toMountedPath(source.readlink(realPath(node))));
       },
       statfs() {
         return {
