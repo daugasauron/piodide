@@ -24,6 +24,7 @@ import type { HostCommandContext, HostCommandResult } from "./slop-host-commands
 import { normalizePath } from "./wasi/abi.ts";
 
 const encoder = new TextEncoder();
+const MAX_FSCK_OBJECTS = 100_000;
 
 const HELP = `usage: git <command> [options]
 
@@ -122,9 +123,9 @@ async function invoke(
 
 function normalizeLibgitOutput(output: string): string {
   return output
-    .replace(/Fetching ([^\r\n]+) for repo 0x[0-9a-f]+/gi, "Fetching $1")
-    .replaceAll("(null)", "")
-    .replace(/\/workspace(?=\/|\b)/g, "/home/web");
+    .replace(/^Fetching ([^\r\n]+) for repo 0x[0-9a-f]+$/gim, "Fetching $1")
+    .replace(/^(net\s+.*\/\s+chk\s+0%\s+\([^\r\n)]*\))\(null\)$/gm, "$1")
+    .replace(/(^|[\s"'(])\/workspace(?=\/|[\s"'):]|$)/gm, "$1/home/web");
 }
 
 function render(value: Libgit2Result): HostCommandResult {
@@ -302,17 +303,15 @@ async function runAdd(context: HostCommandContext, args: string[]): Promise<Host
     paths.push(pathFromRepository(root, context.cwd, arg));
   }
   if (!all && !paths.length) throw new Error("add requires at least one path (use -A or . to stage all changes)");
-  const requested = all ? ["."] : paths;
+  const requested = paths.length ? paths : ["."];
   const selected = (filepath: string, path: string) =>
     path === "." || filepath === path || filepath.startsWith(`${path}/`);
   const matrix = await statusMatrix(context, root);
-  if (!all) {
-    for (const path of requested) {
-      if (path === "." || matrix.some(([filepath]) => selected(filepath, path))) continue;
-      const ignored = path !== "." && await isomorphicGit.isIgnored({ fs: gitFs(context), dir: root, filepath: path });
-      if (ignored) throw new Error(`path is ignored: ${path}`);
-      throw new Error(`pathspec '${path}' did not match any files`);
-    }
+  for (const path of requested) {
+    if (path === "." || matrix.some(([filepath]) => selected(filepath, path))) continue;
+    const ignored = await isomorphicGit.isIgnored({ fs: gitFs(context), dir: root, filepath: path });
+    if (ignored) throw new Error(`path is ignored: ${path}`);
+    throw new Error(`pathspec '${path}' did not match any files`);
   }
   const fs = gitFs(context);
   for (const [filepath, , workdir] of matrix) {
@@ -1325,6 +1324,7 @@ function packedObjectIds(py: Pyodide, root: string): string[] {
   const directory = `${root}/.git/objects/pack`;
   if (!fsExists(py, directory)) return [];
   const ids: string[] = [];
+  let indexedObjects = 0;
   for (const name of py.FS.readdir(directory)) {
     if (!name.endsWith(".idx")) continue;
     const bytes = py.FS.readFile(`${directory}/${name}`) as Uint8Array;
@@ -1334,7 +1334,10 @@ function packedObjectIds(py: Pyodide, root: string): string[] {
     if (version2 && view.getUint32(4) !== 2) throw new Error(`unsupported pack index version in ${name}`);
     if (bytes.length < fanout + 1024) throw new Error(`truncated pack index: ${name}`);
     const count = view.getUint32(fanout + 255 * 4);
-    if (count > 100_000) throw new Error("fsck object limit exceeded (100000)");
+    indexedObjects += count;
+    if (indexedObjects > MAX_FSCK_OBJECTS) {
+      throw new Error(`fsck object limit exceeded (${MAX_FSCK_OBJECTS})`);
+    }
     if (version2) {
       const table = fanout + 256 * 4;
       if (bytes.length < table + count * 20) throw new Error(`truncated pack index: ${name}`);
@@ -1373,11 +1376,14 @@ async function runFsck(context: HostCommandContext): Promise<HostCommandResult> 
     for (const prefix of context.py.FS.readdir(loose)) {
       if (!/^[0-9a-f]{2}$/.test(prefix)) continue;
       for (const suffix of context.py.FS.readdir(`${loose}/${prefix}`)) {
-        if (/^[0-9a-f]{38}$/.test(suffix)) objects.add(`${prefix}${suffix}`);
+        if (!/^[0-9a-f]{38}$/.test(suffix)) continue;
+        objects.add(`${prefix}${suffix}`);
+        if (objects.size > MAX_FSCK_OBJECTS) {
+          throw new Error(`fsck object limit exceeded (${MAX_FSCK_OBJECTS})`);
+        }
       }
     }
   }
-  if (objects.size > 100_000) throw new Error("fsck object limit exceeded (100000)");
   const pending = [...objects];
   const failures: string[] = [];
   for (const ref of refs) {
@@ -1388,7 +1394,9 @@ async function runFsck(context: HostCommandContext): Promise<HostCommandResult> 
   while (pending.length) {
     const oid = pending.pop()!;
     if (seen.has(oid)) continue;
-    if (seen.size >= 100_000) throw new Error("fsck object limit exceeded (100000)");
+    if (seen.size >= MAX_FSCK_OBJECTS) {
+      throw new Error(`fsck object limit exceeded (${MAX_FSCK_OBJECTS})`);
+    }
     seen.add(oid);
     try {
       const object = await isomorphicGit.readObject({ fs, dir: root, oid, format: "parsed" }) as any;

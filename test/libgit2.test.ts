@@ -168,7 +168,7 @@ test("libgit2 repositories interoperate with Git, including packed objects", { t
     py.FS.writeFile("/home/web/writer/pushed.txt", "pushed\n");
     await git(py, "/home/web/writer", "add", "pushed.txt");
     await git(py, "/home/web/writer", "commit", "-m", "local push");
-    assert.equal(py.FS.readlink("/home/web/writer/value-link"), "/home/web/writer/value.txt");
+    assert.equal(py.FS.readlink("/home/web/writer/value-link"), "value.txt");
     await git(py, "/home/web/writer", "push", "origin", "main");
     await git(py, "/home/web", "clone", "bare.git", "reader");
     assert.equal(py.FS.readFile("/home/web/reader/pushed.txt", { encoding: "utf8" }), "pushed\n");
@@ -240,6 +240,12 @@ test("agent Git operations stage, diff, and reject empty commits", { timeout: 12
     tool.execute("add-without-paths", { operation: "add", cwd: repository }, signal),
     /add requires paths/,
   );
+  await assert.rejects(
+    tool.execute("oversized-arguments", {
+      operation: "add", cwd: repository, paths: ["x".repeat(65_536)],
+    }, signal),
+    /argument list exceeds 65536 bytes/,
+  );
   assert.notEqual((await gitResult(py, repository, "add")).exitCode, 0);
   assert.match((await gitResult(py, repository, "add", "missing.txt")).output, /did not match/);
 
@@ -302,6 +308,25 @@ test("agent Git operations stage, diff, and reject empty commits", { timeout: 12
   assert.match(safeDelete.output, /not fully merged/);
   assert.match(await git(py, repository, "branch"), /unmerged-delete/);
   await git(py, repository, "branch", "-D", "unmerged-delete");
+
+  const scoped = `${repository}/scoped`;
+  py.FS.mkdirTree(scoped);
+  py.FS.writeFile(`${repository}/outside.txt`, "base\n");
+  py.FS.writeFile(`${scoped}/inside.txt`, "base\n");
+  await git(py, repository, "add", ".");
+  await git(py, repository, "commit", "-m", "add scoped files");
+  py.FS.writeFile(`${repository}/outside.txt`, "outside change\n");
+  py.FS.writeFile(`${scoped}/inside.txt`, "inside change\n");
+  await git(py, repository, "add", "-A", "scoped");
+  const scopedStatus = (await gitResult(py, repository, "status", "--short")).output;
+  assert.match(scopedStatus, /^ M outside\.txt$/m);
+  assert.match(scopedStatus, /^M  scoped\/inside\.txt$/m);
+
+  const literalNullRepository = "/home/web/(null)";
+  py.FS.mkdirTree(literalNullRepository);
+  const literalNullOutput = await git(py, literalNullRepository, "init", "-b", "main");
+  assert.match(literalNullOutput, /\/home\/web\/\(null\)\//);
+  assert.doesNotMatch(literalNullOutput, /\/workspace/);
 });
 
 test("Git audit regressions and browser smart HTTP are compatible and script-safe", { timeout: 120_000 }, async () => {
@@ -336,7 +361,7 @@ test("Git audit regressions and browser smart HTTP are compatible and script-saf
     assert.match((await gitResult(py, "/home/web/smart", "remote", "-v")).output, /remote\.git/);
     assert.match((await gitResult(py, "/home/web/smart", "ls-remote", "origin")).output, /refs\/heads\/main/);
     assert.deepEqual(py.FS.readFile("/home/web/smart/binary.dat"), new Uint8Array(Array.from({ length: 256 }, (_, index) => index)));
-    assert.equal(py.FS.readlink("/home/web/smart/value-link"), "/home/web/smart/value.txt");
+    assert.equal(py.FS.readlink("/home/web/smart/value-link"), "value.txt");
 
     const help = await gitResult(py, "/home/web/smart", "pull", "--help");
     assert.equal(help.exitCode, 0);
@@ -439,6 +464,21 @@ test("Git audit regressions and browser smart HTTP are compatible and script-saf
     assert.notEqual(corruptFsck.exitCode, 0);
     assert.match(corruptFsck.output, /object hash mismatch/);
     assert.doesNotMatch(corruptFsck.output, /isomorphic-git|report this error/);
+
+    const packDirectory = "/home/web/smart/.git/objects/pack";
+    const fakeIndex = (count: number) => {
+      const bytes = new Uint8Array(8 + 256 * 4 + count * 20);
+      const view = new DataView(bytes.buffer);
+      view.setUint32(0, 0xff744f63);
+      view.setUint32(4, 2);
+      view.setUint32(8 + 255 * 4, count);
+      return bytes;
+    };
+    py.FS.writeFile(`${packDirectory}/review-limit-a.idx`, fakeIndex(60_000));
+    py.FS.writeFile(`${packDirectory}/review-limit-b.idx`, fakeIndex(60_000));
+    const boundedFsck = await gitResult(py, "/home/web/smart", "fsck");
+    assert.notEqual(boundedFsck.exitCode, 0);
+    assert.match(boundedFsck.output, /fsck object limit exceeded \(100000\)/);
   } finally {
     await new Promise<void>((resolve) => server.close(() => resolve()));
     rmSync(temporary, { recursive: true, force: true });

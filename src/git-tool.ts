@@ -93,6 +93,9 @@ export interface GitDetails {
   exitCode: number;
 }
 
+const MAX_GIT_ARGUMENT_BYTES = 64 * 1024;
+const argumentEncoder = new TextEncoder();
+
 interface GitInvocation {
   args: string[];
   cwd: string;
@@ -105,6 +108,17 @@ function text(value: string) {
 function validateArgument(value: string): string {
   if (value.includes("\0")) throw new Error("Git arguments cannot contain NUL bytes.");
   return value;
+}
+
+function validateArgumentList(args: string[]): string[] {
+  let bytes = 1;
+  for (const arg of args) {
+    bytes += argumentEncoder.encode(arg).byteLength + 1;
+    if (bytes > MAX_GIT_ARGUMENT_BYTES) {
+      throw new Error(`Git argument list exceeds ${MAX_GIT_ARGUMENT_BYTES} bytes.`);
+    }
+  }
+  return args;
 }
 
 function workspacePath(value: string | undefined): string {
@@ -242,10 +256,11 @@ export function createGitTool(
       if (!fsExists(py, invocation.cwd) || !fsIsDir(py, invocation.cwd)) {
         throw new Error(`Not a directory: ${invocation.cwd}`);
       }
+      const args = validateArgumentList(["git-engine", ...invocation.args]);
       const response = await runGitEngineCommand({
         py,
         cwd: invocation.cwd,
-        args: ["git-engine", ...invocation.args],
+        args,
         signal,
         getGitHubCredentials: getCredentials,
       });
