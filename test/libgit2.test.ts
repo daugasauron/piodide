@@ -15,9 +15,11 @@ import {
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
+import { deflateSync, inflateSync } from "node:zlib";
 import { loadPyodide } from "pyodide";
 
 import { runGitEngineCommand } from "../src/git-engine.ts";
+import { createGitTool } from "../src/git-tool.ts";
 import type { Pyodide } from "../src/pyodide-host.ts";
 
 async function git(py: Pyodide, cwd: string, ...args: string[]): Promise<string> {
@@ -178,7 +180,12 @@ test("libgit2 repositories interoperate with Git, including packed objects", { t
     assert.equal(py.FS.readFile(`${packed}/value.txt`, { encoding: "utf8" }), "feature\n");
     assert.match(await git(py, packed, "log", "--oneline", "-n", "2"), /feature change/);
 
-    await git(py, "/home/web", "clone", "-b", "main", "packed", "cloned");
+    const missingBranch = await gitResult(py, "/home/web", "clone", "-b", "missing-branch", "packed", "failed-clone");
+    assert.notEqual(missingBranch.exitCode, 0);
+    assert.equal(py.FS.analyzePath("/home/web/failed-clone").exists, false);
+
+    const clonedOutput = await git(py, "/home/web", "clone", "-b", "main", "packed", "cloned");
+    assert.doesNotMatch(clonedOutput, /\(null\)|repo 0x|\/workspace/);
     assert.equal(py.FS.readFile("/home/web/cloned/value.txt", { encoding: "utf8" }), "main\n");
     assert.match(await git(py, "/home/web/cloned", "log", "--oneline", "-n", "2"), /subdirectory pathspec/);
     await git(py, packed, "switch", "main");
@@ -197,6 +204,7 @@ test("agent Git operations stage, diff, and reject empty commits", { timeout: 12
   const repository = "/home/web/agent-audit";
   py.FS.mkdirTree(repository);
   await git(py, repository, "init", "-b", "main");
+  assert.match(await git(py, repository, "init"), /Reinitialized existing Git repository/);
   py.FS.writeFile(`${repository}/wanted.txt`, "wanted\n");
   py.FS.writeFile(`${repository}/other.txt`, "other\n");
 
@@ -225,6 +233,75 @@ test("agent Git operations stage, diff, and reject empty commits", { timeout: 12
   });
   assert.equal(response.exitCode, 0);
   assert.doesNotMatch(new TextDecoder().decode(response.stderr ?? new Uint8Array()), /reference .* not found/);
+
+  const tool = createGitTool(py, () => null);
+  const signal = new AbortController().signal;
+  await assert.rejects(
+    tool.execute("add-without-paths", { operation: "add", cwd: repository }, signal),
+    /add requires paths/,
+  );
+  assert.notEqual((await gitResult(py, repository, "add")).exitCode, 0);
+  assert.match((await gitResult(py, repository, "add", "missing.txt")).output, /did not match/);
+
+  py.FS.writeFile(`${repository}/.gitignore`, "ignored.txt\n");
+  py.FS.writeFile(`${repository}/ignored.txt`, "ignored\n");
+  await git(py, repository, "add", ".gitignore");
+  await git(py, repository, "commit", "-m", "ignore test file");
+  assert.match((await gitResult(py, repository, "add", "ignored.txt")).output, /ignored/);
+
+  py.FS.writeFile(`${repository}/-leading.txt`, "leading\n");
+  await git(py, repository, "add", "--", "-leading.txt");
+  assert.match((await gitResult(py, repository, "status", "--short")).output, /^A  -leading\.txt$/m);
+  await git(py, repository, "commit", "-m", "leading path");
+
+  py.FS.writeFile(`${repository}/tool-message.txt`, "message\n");
+  await tool.execute("stage-message", {
+    operation: "add", cwd: repository, paths: ["tool-message.txt"],
+  }, signal);
+  const maliciousMessage = "safe'\ntouch /home/web/agent-injected\n'";
+  await tool.execute("commit-message", {
+    operation: "commit", cwd: repository, message: maliciousMessage,
+  }, signal);
+  assert.equal(py.FS.analyzePath("/home/web/agent-injected").exists, false);
+
+  py.FS.writeFile(`${repository}/wanted.txt`, "checkout change\n");
+  await tool.execute("checkout-path", {
+    operation: "checkout", cwd: repository, paths: ["wanted.txt"],
+  }, signal);
+  assert.equal(py.FS.readFile(`${repository}/wanted.txt`, { encoding: "utf8" }), "wanted\n");
+
+  py.FS.writeFile(`${repository}/wanted.txt`, "keep worktree\n");
+  await tool.execute("stage-restore", {
+    operation: "add", cwd: repository, paths: ["wanted.txt"],
+  }, signal);
+  await tool.execute("unstage-only", {
+    operation: "restore", cwd: repository, paths: ["wanted.txt"], staged: true,
+  }, signal);
+  assert.equal(py.FS.readFile(`${repository}/wanted.txt`, { encoding: "utf8" }), "keep worktree\n");
+  assert.match((await gitResult(py, repository, "status", "--short")).output, /^ M wanted\.txt$/m);
+  await tool.execute("restore-worktree", {
+    operation: "restore", cwd: repository, paths: ["wanted.txt"],
+  }, signal);
+
+  py.FS.writeFile(`${repository}/new-unstaged.txt`, "must survive\n");
+  await tool.execute("stage-new", {
+    operation: "add", cwd: repository, paths: ["new-unstaged.txt"],
+  }, signal);
+  await tool.execute("unstage-new", {
+    operation: "restore", cwd: repository, paths: ["new-unstaged.txt"], staged: true,
+  }, signal);
+  assert.equal(py.FS.readFile(`${repository}/new-unstaged.txt`, { encoding: "utf8" }), "must survive\n");
+
+  await git(py, repository, "switch", "-c", "unmerged-delete");
+  py.FS.writeFile(`${repository}/unmerged.txt`, "keep commit\n");
+  await git(py, repository, "add", "unmerged.txt");
+  await git(py, repository, "commit", "-m", "unmerged commit");
+  await git(py, repository, "switch", "main");
+  const safeDelete = await gitResult(py, repository, "branch", "-d", "unmerged-delete");
+  assert.notEqual(safeDelete.exitCode, 0);
+  assert.match(safeDelete.output, /not fully merged/);
+  assert.match(await git(py, repository, "branch"), /unmerged-delete/);
+  await git(py, repository, "branch", "-D", "unmerged-delete");
 });
 
 test("Git audit regressions and browser smart HTTP are compatible and script-safe", { timeout: 120_000 }, async () => {
@@ -346,6 +423,22 @@ test("Git audit regressions and browser smart HTTP are compatible and script-saf
       execFileSync("git", ["--git-dir", bare, "log", "-1", "--format=%s"], { encoding: "utf8" }),
       "browser smart push\n",
     );
+
+    await git(py, "/home/web/smart", "switch", "-c", "corrupt-unreachable");
+    py.FS.writeFile("/home/web/smart/corrupt.txt", "dangling\n");
+    await git(py, "/home/web/smart", "add", "corrupt.txt");
+    await git(py, "/home/web/smart", "commit", "-m", "unreachable object");
+    const unreachable = (await git(py, "/home/web/smart", "rev-parse", "HEAD")).trim();
+    await git(py, "/home/web/smart", "switch", "main");
+    await git(py, "/home/web/smart", "branch", "-D", "corrupt-unreachable");
+    const objectPath = `/home/web/smart/.git/objects/${unreachable.slice(0, 2)}/${unreachable.slice(2)}`;
+    const rawObject = inflateSync(Buffer.from(py.FS.readFile(objectPath) as Uint8Array));
+    rawObject[rawObject.length - 1] ^= 1;
+    py.FS.writeFile(objectPath, new Uint8Array(deflateSync(rawObject)));
+    const corruptFsck = await gitResult(py, "/home/web/smart", "fsck");
+    assert.notEqual(corruptFsck.exitCode, 0);
+    assert.match(corruptFsck.output, /object hash mismatch/);
+    assert.doesNotMatch(corruptFsck.output, /isomorphic-git|report this error/);
   } finally {
     await new Promise<void>((resolve) => server.close(() => resolve()));
     rmSync(temporary, { recursive: true, force: true });

@@ -7,6 +7,7 @@ import {
   verifyGitHubCredentials,
   type GitHubCredentials,
 } from "./git-remote.ts";
+import { runGitEngineCommand } from "./git-engine.ts";
 
 export { normalizeGitHubApiUrl, verifyGitHubCredentials };
 export type { GitHubCredentials };
@@ -38,7 +39,7 @@ export const GitParams = Type.Object({
   ),
   paths: Type.Optional(
     Type.Array(Type.String(), {
-      description: "Paths for add or diff, relative to the repository.",
+      description: "Paths for add, checkout, diff, or restore, relative to the repository.",
       maxItems: 100,
     }),
   ),
@@ -64,7 +65,7 @@ export const GitParams = Type.Object({
     Type.Boolean({ description: "Create the branch while switching or checking out." }),
   ),
   delete: Type.Optional(
-    Type.Boolean({ description: "Delete the named branch." }),
+    Type.Boolean({ description: "Safely delete the named branch if it is fully merged." }),
   ),
   abort: Type.Optional(
     Type.Boolean({ description: "Abort an in-progress merge." }),
@@ -73,7 +74,7 @@ export const GitParams = Type.Object({
     Type.Boolean({ description: "Continue an in-progress merge after conflicts are staged." }),
   ),
   staged: Type.Optional(
-    Type.Boolean({ description: "For diff, compare staged changes with HEAD." }),
+    Type.Boolean({ description: "For diff, compare staged changes with HEAD; for restore, restore only the index." }),
   ),
   limit: Type.Optional(
     Type.Number({
@@ -92,13 +93,18 @@ export interface GitDetails {
   exitCode: number;
 }
 
+interface GitInvocation {
+  args: string[];
+  cwd: string;
+}
+
 function text(value: string) {
   return { type: "text" as const, text: value };
 }
 
-function shellQuote(value: string): string {
+function validateArgument(value: string): string {
   if (value.includes("\0")) throw new Error("Git arguments cannot contain NUL bytes.");
-  return `'${value.replaceAll("'", `'\\''`)}'`;
+  return value;
 }
 
 function workspacePath(value: string | undefined): string {
@@ -126,79 +132,92 @@ function cloneDirectory(project: string): string {
 
 function requireBranch(params: GitParamsValue): string {
   if (!params.branch?.trim()) throw new Error(`${params.operation} requires branch.`);
-  return params.branch;
+  return validateArgument(params.branch);
 }
 
-function gitCommand(params: GitParamsValue): { command: string; cwd: string } {
+function gitInvocation(params: GitParamsValue): GitInvocation {
   const cwd = workspacePath(params.cwd);
-  const pathArgs = (params.paths ?? []).map(shellQuote).join(" ");
+  const paths = (params.paths ?? []).map(validateArgument);
+  let args: string[];
   switch (params.operation) {
     case "init":
-      return {
-        command: `git init${params.branch ? ` -b ${shellQuote(params.branch)}` : ""}`,
-        cwd,
-      };
+      args = ["init", ...(params.branch ? ["-b", validateArgument(params.branch)] : [])];
+      break;
     case "status":
-      return { command: "git status", cwd };
+      args = ["status"];
+      break;
     case "add":
-      return { command: pathArgs ? `git add -- ${pathArgs}` : "git add -A", cwd };
+      if (!paths.length) throw new Error("add requires paths; use ['.'] to stage all changes.");
+      args = ["add", "--", ...paths];
+      break;
     case "commit":
       if (!params.message?.trim()) throw new Error("commit requires message.");
-      return { command: `git commit -m ${shellQuote(params.message)}`, cwd };
+      args = ["commit", "-m", validateArgument(params.message)];
+      break;
     case "log":
-      return { command: `git log --oneline -n ${Math.min(50, Math.max(1, params.limit ?? 10))}`, cwd };
+      args = ["log", "--oneline", "-n", String(Math.min(50, Math.max(1, params.limit ?? 10)))];
+      break;
     case "diff":
-      return {
-        command: `git diff${params.staged ? " --staged" : ""}${pathArgs ? ` -- ${pathArgs}` : ""}`,
-        cwd,
-      };
+      args = ["diff", ...(params.staged ? ["--staged"] : []), ...(paths.length ? ["--", ...paths] : [])];
+      break;
     case "branch": {
       const branch = params.branch?.trim();
       if (params.delete && !branch) throw new Error("branch deletion requires branch.");
-      return {
-        command: branch
-          ? `git branch${params.delete ? " -d" : ""} ${shellQuote(branch)}`
-          : "git branch",
-        cwd,
-      };
+      args = branch ? ["branch", ...(params.delete ? ["-d"] : []), validateArgument(branch)] : ["branch"];
+      break;
     }
-    case "switch": {
-      const branch = requireBranch(params);
-      return { command: `git switch${params.create ? " -c" : ""} ${shellQuote(branch)}`, cwd };
-    }
-    case "checkout": {
-      const branch = requireBranch(params);
-      return { command: `git checkout${params.create ? " -b" : ""} ${shellQuote(branch)}`, cwd };
-    }
+    case "switch":
+      args = ["switch", ...(params.create ? ["-c"] : []), requireBranch(params)];
+      break;
+    case "checkout":
+      if (paths.length) {
+        if (params.create) throw new Error("checkout cannot create a branch while restoring paths.");
+        args = ["checkout", ...(params.branch ? [validateArgument(params.branch)] : []), "--", ...paths];
+      } else {
+        args = ["checkout", ...(params.create ? ["-b"] : []), requireBranch(params)];
+      }
+      break;
     case "clone": {
       if (!params.project?.trim()) throw new Error("clone requires project.");
       const destination = params.cwd ? cwd : cloneDirectory(params.project);
       const target = destination.slice("/home/web/".length);
-      return {
-        command:
-          `git clone${params.branch ? ` -b ${shellQuote(params.branch)}` : ""}` +
-          `${params.corsProxy ? ` --cors-proxy ${shellQuote(params.corsProxy)}` : ""} ` +
-          `${shellQuote(params.project)} ${shellQuote(target)}`,
-        cwd: "/home/web",
-      };
+      args = [
+        "clone",
+        ...(params.branch ? ["-b", validateArgument(params.branch)] : []),
+        ...(params.corsProxy ? ["--cors-proxy", validateArgument(params.corsProxy)] : []),
+        validateArgument(params.project),
+        validateArgument(target),
+      ];
+      return { args, cwd: "/home/web" };
     }
     case "fetch":
-      return { command: `git fetch${params.corsProxy ? ` --cors-proxy ${shellQuote(params.corsProxy)}` : ""}`, cwd };
+      args = ["fetch", ...(params.corsProxy ? ["--cors-proxy", validateArgument(params.corsProxy)] : [])];
+      break;
     case "pull":
-      return { command: `git pull${params.corsProxy ? ` --cors-proxy ${shellQuote(params.corsProxy)}` : ""}`, cwd };
+      args = ["pull", ...(params.corsProxy ? ["--cors-proxy", validateArgument(params.corsProxy)] : [])];
+      break;
     case "push":
-      return { command: `git push${params.branch ? ` origin ${shellQuote(params.branch)}` : ""}${params.corsProxy ? ` --cors-proxy ${shellQuote(params.corsProxy)}` : ""}`, cwd };
+      args = [
+        "push",
+        ...(params.branch ? ["origin", validateArgument(params.branch)] : []),
+        ...(params.corsProxy ? ["--cors-proxy", validateArgument(params.corsProxy)] : []),
+      ];
+      break;
     case "merge":
       if (params.abort && params.continue) throw new Error("merge abort and continue are mutually exclusive.");
-      if (params.abort) return { command: "git merge --abort", cwd };
-      if (params.continue) return { command: "git merge --continue", cwd };
-      return { command: `git merge ${shellQuote(requireBranch(params))}`, cwd };
+      args = params.abort ? ["merge", "--abort"]
+        : params.continue ? ["merge", "--continue"]
+        : ["merge", requireBranch(params)];
+      break;
     case "restore":
-      if (!pathArgs) throw new Error("restore requires paths.");
-      return { command: `git restore -- ${pathArgs}`, cwd };
+      if (!paths.length) throw new Error("restore requires paths.");
+      args = ["restore", ...(params.staged ? ["--staged"] : []), "--", ...paths];
+      break;
     case "fsck":
-      return { command: "git fsck", cwd };
+      args = ["fsck"];
+      break;
   }
+  return { args, cwd };
 }
 
 export function createGitTool(
@@ -209,38 +228,38 @@ export function createGitTool(
     name: "git",
     label: "Git",
     description:
-      "Use Slop's compiled Git frontend in /home/web. Repositories use canonical Git data. " +
+      "Use the browser Git engine in /home/web. Repositories use canonical Git data. " +
       "Full smart-HTTP clone/fetch/pull/push works with CORS-enabled servers or an explicitly " +
       "trusted CORS proxy. GitHub uses a bounded single-branch snapshot fallback without a " +
       "proxy; run /github for private repositories and pushes.",
     parameters: GitParams,
     executionMode: "sequential",
     async execute(_id, params, signal) {
-      const invocation = gitCommand(params);
+      const invocation = gitInvocation(params);
       if (params.operation === "init" && !fsExists(py, invocation.cwd)) {
         py.FS.mkdirTree(invocation.cwd);
       }
       if (!fsExists(py, invocation.cwd) || !fsIsDir(py, invocation.cwd)) {
         throw new Error(`Not a directory: ${invocation.cwd}`);
       }
-      const { runSlopCommand } = await import("./slop.ts");
-      let stdout = "";
-      let stderr = "";
-      const result = await runSlopCommand(py, invocation.command, {
+      const response = await runGitEngineCommand({
+        py,
         cwd: invocation.cwd,
+        args: ["git-engine", ...invocation.args],
         signal,
         getGitHubCredentials: getCredentials,
-        onStdout: (chunk) => { stdout += chunk; },
-        onStderr: (chunk) => { stderr += chunk; },
       });
-      const output = `${stdout}${stderr}` || `[exit ${result.exitCode}]\n`;
-      if (result.exitCode !== 0) throw new Error(output.trimEnd());
+      const decoder = new TextDecoder();
+      const stdout = decoder.decode(response.stdout ?? new Uint8Array());
+      const stderr = decoder.decode(response.stderr ?? new Uint8Array());
+      const output = `${stdout}${stderr}` || `[exit ${response.exitCode}]\n`;
+      if (response.exitCode !== 0) throw new Error(output.trimEnd());
       const resultCwd = params.operation === "clone"
         ? workspacePath(params.cwd ?? cloneDirectory(params.project!))
         : invocation.cwd;
       return {
         content: [text(output)],
-        details: { operation: params.operation, cwd: resultCwd, exitCode: result.exitCode },
+        details: { operation: params.operation, cwd: resultCwd, exitCode: response.exitCode },
       };
     },
   };

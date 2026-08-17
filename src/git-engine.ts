@@ -50,7 +50,7 @@ const COMMAND_HELP: Record<string, string> = {
   commit: "usage: git commit -m <message> | git commit -F -\n",
   diff: "usage: git diff [--cached] [revisions...] [-- paths...]\n",
   log: "usage: git log [--oneline] [-n count] [--all] [--graph] [--stat]\n",
-  branch: "usage: git branch [-a|-r|-v] | git branch <name> [start-point] | git branch -m [old] <new> | git branch -d <name>\n",
+  branch: "usage: git branch [-a|-r|-v] | git branch <name> [start-point] | git branch -m [old] <new> | git branch -d|-D <name>\n",
   switch: "usage: git switch [-c branch [start-point]] | [--detach] <branch-or-commit>\n",
   checkout: "usage: git checkout [-b branch] [start-point] | git checkout [ref] [--] [paths...]\n",
   merge: "usage: git merge <branch> | git merge --abort | git merge --continue\n",
@@ -120,11 +120,20 @@ async function invoke(
   return runLibgit2(context.py, args, cwd, identity(context));
 }
 
+function normalizeLibgitOutput(output: string): string {
+  return output
+    .replace(/Fetching ([^\r\n]+) for repo 0x[0-9a-f]+/gi, "Fetching $1")
+    .replaceAll("(null)", "")
+    .replace(/\/workspace(?=\/|\b)/g, "/home/web");
+}
+
 function render(value: Libgit2Result): HostCommandResult {
+  const stdout = normalizeLibgitOutput(value.stdout);
+  const stderr = normalizeLibgitOutput(value.stderr);
   return {
     exitCode: value.exitCode,
-    ...(value.stdout ? { stdout: encoder.encode(value.stdout) } : {}),
-    ...(value.stderr ? { stderr: encoder.encode(value.stderr) } : {}),
+    ...(stdout ? { stdout: encoder.encode(stdout) } : {}),
+    ...(stderr ? { stderr: encoder.encode(stderr) } : {}),
   };
 }
 
@@ -278,18 +287,36 @@ async function hasStagedChanges(context: HostCommandContext, cwd: string): Promi
 async function runAdd(context: HostCommandContext, args: string[]): Promise<HostCommandResult> {
   const root = repositoryRoot(context.py, context.cwd);
   const paths: string[] = [];
+  let all = false;
+  let options = true;
   for (const arg of args) {
-    if (arg === "-A" || arg === "--all" || arg === "--") continue;
-    if (arg.startsWith("-")) throw new Error(`unsupported add option: ${arg}`);
+    if (options && arg === "--") {
+      options = false;
+      continue;
+    }
+    if (options && (arg === "-A" || arg === "--all")) {
+      all = true;
+      continue;
+    }
+    if (options && arg.startsWith("-")) throw new Error(`unsupported add option: ${arg}`);
     paths.push(pathFromRepository(root, context.cwd, arg));
   }
-  const requested = paths.length ? paths : ["."];
-  const selected = (filepath: string) => requested.some((path) =>
-    path === "." || filepath === path || filepath.startsWith(`${path}/`)
-  );
+  if (!all && !paths.length) throw new Error("add requires at least one path (use -A or . to stage all changes)");
+  const requested = all ? ["."] : paths;
+  const selected = (filepath: string, path: string) =>
+    path === "." || filepath === path || filepath.startsWith(`${path}/`);
+  const matrix = await statusMatrix(context, root);
+  if (!all) {
+    for (const path of requested) {
+      if (path === "." || matrix.some(([filepath]) => selected(filepath, path))) continue;
+      const ignored = path !== "." && await isomorphicGit.isIgnored({ fs: gitFs(context), dir: root, filepath: path });
+      if (ignored) throw new Error(`path is ignored: ${path}`);
+      throw new Error(`pathspec '${path}' did not match any files`);
+    }
+  }
   const fs = gitFs(context);
-  for (const [filepath, , workdir] of await statusMatrix(context, root)) {
-    if (!selected(filepath)) continue;
+  for (const [filepath, , workdir] of matrix) {
+    if (!requested.some((path) => selected(filepath, path))) continue;
     if (workdir === 0) await isomorphicGit.remove({ fs, dir: root, filepath });
     else await isomorphicGit.add({ fs, dir: root, filepath });
   }
@@ -333,14 +360,18 @@ async function runBranch(context: HostCommandContext, args: string[]): Promise<H
   const cwd = repositoryRoot(context.py, context.cwd);
   currentBranch(context.py, cwd);
   let deletion = false;
+  let forceDelete = false;
   let rename = false;
   let all = false;
   let remotesOnly = false;
   let verbose = false;
   const positional: string[] = [];
   for (const arg of args) {
-    if (arg === "-d" || arg === "-D" || arg === "--delete") deletion = true;
-    else if (arg === "-m" || arg === "--move") rename = true;
+    if (arg === "-d" || arg === "--delete") deletion = true;
+    else if (arg === "-D") {
+      deletion = true;
+      forceDelete = true;
+    } else if (arg === "-m" || arg === "--move") rename = true;
     else if (arg === "-a" || arg === "--all") all = true;
     else if (arg === "-r" || arg === "--remotes") remotesOnly = true;
     else if (arg === "-v" || arg === "-vv" || arg === "--verbose") verbose = true;
@@ -393,6 +424,20 @@ async function runBranch(context: HostCommandContext, args: string[]): Promise<H
   if (deletion) {
     if (!exists) throw new Error(`branch '${name}' not found`);
     if (currentBranch(context.py, cwd) === name) throw new Error(`cannot delete checked out branch '${name}'`);
+    if (!forceDelete) {
+      const branchOid = fsExists(context.py, loose) ? fsReadText(context.py, loose).trim() : packed.get(name)!;
+      const head = await headId(context, cwd);
+      const merged = branchOid === head || await isomorphicGit.isDescendent({
+        fs: gitFs(context),
+        dir: cwd,
+        oid: head,
+        ancestor: branchOid,
+        depth: 100_000,
+      });
+      if (!merged) {
+        throw new Error(`branch '${name}' is not fully merged; use -D to force deletion`);
+      }
+    }
     if (fsExists(context.py, loose)) context.py.FS.unlink(loose);
     if (packed.has(name)) removePackedBranch(context.py, cwd, name);
     return result(0, `Deleted branch ${name}.\n`);
@@ -590,8 +635,21 @@ function localCloneSource(context: HostCommandContext, project: string): string 
   }
 }
 
+function cleanupFailedClone(py: Pyodide, destination: string, destinationExisted: boolean): void {
+  if (!fsExists(py, destination) || !fsIsDir(py, destination)) return;
+  for (const name of py.FS.readdir(destination)) {
+    if (name === "." || name === "..") continue;
+    const child = `${destination}/${name}`;
+    if (py.FS.isDir(py.FS.lstat(child).mode)) removeDirectory(py, child);
+    else py.FS.unlink(child);
+  }
+  if (!destinationExisted) py.FS.rmdir(destination);
+}
+
 async function runClone(context: HostCommandContext, args: string[]): Promise<HostCommandResult> {
   const parsed = cloneArguments(args, context.cwd);
+  if (parsed.branch) assertBranchName(parsed.branch);
+  const destinationExisted = fsExists(context.py, parsed.destination);
   const localSource = localCloneSource(context, parsed.project);
   if (localSource) {
     if (localSource === parsed.destination) throw new Error("source and destination are the same repository");
@@ -605,10 +663,16 @@ async function runClone(context: HostCommandContext, args: string[]): Promise<Ho
       ["clone", libgitPath(localSource), libgitPath(parsed.destination)],
       "/home/web",
     );
-    if (cloned.exitCode === 0 && parsed.branch) {
-      assertBranchName(parsed.branch);
+    if (cloned.exitCode !== 0) {
+      cleanupFailedClone(context.py, parsed.destination, destinationExisted);
+      return render(cloned);
+    }
+    if (parsed.branch) {
       const checkedOut = await invoke(context, ["checkout", parsed.branch], parsed.destination);
-      if (checkedOut.exitCode !== 0) return render(checkedOut);
+      if (checkedOut.exitCode !== 0) {
+        cleanupFailedClone(context.py, parsed.destination, destinationExisted);
+        return render(checkedOut);
+      }
       cloned.stdout += checkedOut.stdout;
       cloned.stderr += checkedOut.stderr;
     }
@@ -639,6 +703,7 @@ async function runClone(context: HostCommandContext, args: string[]): Promise<Ho
       });
       return result(0, `Cloned ${parsed.project} into ${parsed.destination}\n`);
     } catch (error) {
+      cleanupFailedClone(context.py, parsed.destination, destinationExisted);
       throw browserNetworkError(error, parsed.project);
     }
   }
@@ -649,19 +714,37 @@ async function runClone(context: HostCommandContext, args: string[]): Promise<Ho
   } else context.py.FS.mkdirTree(parsed.destination);
 
   const initialized = await invoke(context, ["init", "."], parsed.destination);
-  if (initialized.exitCode !== 0) return render(initialized);
-  const fetched = await runGitRemoteCommand({
-    ...context,
-    cwd: parsed.destination,
-    args: ["git-remote", "clone", parsed.project, parsed.branch || ""],
-  });
+  if (initialized.exitCode !== 0) {
+    cleanupFailedClone(context.py, parsed.destination, destinationExisted);
+    return render(initialized);
+  }
+  let fetched: HostCommandResult;
+  try {
+    fetched = await runGitRemoteCommand({
+      ...context,
+      cwd: parsed.destination,
+      args: ["git-remote", "clone", parsed.project, parsed.branch || ""],
+    });
+  } catch (error) {
+    cleanupFailedClone(context.py, parsed.destination, destinationExisted);
+    throw error;
+  }
   const fetchedText = new TextDecoder().decode(fetched.stdout ?? fetched.stderr ?? new Uint8Array());
-  if (fetched.exitCode !== 0) return fetched;
+  if (fetched.exitCode !== 0) {
+    cleanupFailedClone(context.py, parsed.destination, destinationExisted);
+    return fetched;
+  }
   const added = await runAdd({ ...context, cwd: parsed.destination }, ["."]);
-  if (added.exitCode !== 0) return added;
+  if (added.exitCode !== 0) {
+    cleanupFailedClone(context.py, parsed.destination, destinationExisted);
+    return added;
+  }
   const message = readGitRemoteMarker(context.py, parsed.destination, "remote-message") || "Import repository";
   const committed = await invoke(context, ["commit", "-m", message], parsed.destination);
-  if (committed.exitCode !== 0) return render(committed);
+  if (committed.exitCode !== 0) {
+    cleanupFailedClone(context.py, parsed.destination, destinationExisted);
+    return render(committed);
+  }
   const head = await headId(context, parsed.destination);
   markGitRemoteHead(context.py, parsed.destination, head);
   return result(
@@ -769,11 +852,11 @@ async function runPull(context: HostCommandContext, args: string[]): Promise<Hos
     return {
       exitCode: merged.exitCode,
       stdout: encoder.encode(
-        `${fetched.stdout}${new TextDecoder().decode(merged.stdout ?? new Uint8Array())}`,
+        `${normalizeLibgitOutput(fetched.stdout)}${new TextDecoder().decode(merged.stdout ?? new Uint8Array())}`,
       ),
       ...(fetched.stderr || merged.stderr ? {
         stderr: encoder.encode(
-          `${fetched.stderr}${new TextDecoder().decode(merged.stderr ?? new Uint8Array())}`,
+          `${normalizeLibgitOutput(fetched.stderr)}${new TextDecoder().decode(merged.stderr ?? new Uint8Array())}`,
         ),
       } : {}),
     };
@@ -1002,8 +1085,10 @@ async function runRestore(context: HostCommandContext, args: string[]): Promise<
       source = args[++index];
       if (!source) throw new Error(`${value} requires a ref`);
     } else if (value.startsWith("--source=")) source = value.slice(9);
-    else if (value === "--") paths.push(...args.slice(index + 1));
-    else if (value.startsWith("-")) throw new Error(`unsupported restore option: ${value}`);
+    else if (value === "--") {
+      paths.push(...args.slice(index + 1));
+      break;
+    } else if (value.startsWith("-")) throw new Error(`unsupported restore option: ${value}`);
     else paths.push(value);
   }
   if (!paths.length) throw new Error("restore requires at least one path");
@@ -1230,22 +1315,74 @@ function looseRefs(py: Pyodide, root: string): string[] {
   return refs;
 }
 
+function objectId(bytes: Uint8Array, offset: number): string {
+  let value = "";
+  for (let index = offset; index < offset + 20; index++) value += bytes[index].toString(16).padStart(2, "0");
+  return value;
+}
+
+function packedObjectIds(py: Pyodide, root: string): string[] {
+  const directory = `${root}/.git/objects/pack`;
+  if (!fsExists(py, directory)) return [];
+  const ids: string[] = [];
+  for (const name of py.FS.readdir(directory)) {
+    if (!name.endsWith(".idx")) continue;
+    const bytes = py.FS.readFile(`${directory}/${name}`) as Uint8Array;
+    const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+    const version2 = bytes.length >= 8 && view.getUint32(0) === 0xff744f63;
+    const fanout = version2 ? 8 : 0;
+    if (version2 && view.getUint32(4) !== 2) throw new Error(`unsupported pack index version in ${name}`);
+    if (bytes.length < fanout + 1024) throw new Error(`truncated pack index: ${name}`);
+    const count = view.getUint32(fanout + 255 * 4);
+    if (count > 100_000) throw new Error("fsck object limit exceeded (100000)");
+    if (version2) {
+      const table = fanout + 256 * 4;
+      if (bytes.length < table + count * 20) throw new Error(`truncated pack index: ${name}`);
+      for (let index = 0; index < count; index++) ids.push(objectId(bytes, table + index * 20));
+    } else {
+      const table = 256 * 4;
+      if (bytes.length < table + count * 24) throw new Error(`truncated pack index: ${name}`);
+      for (let index = 0; index < count; index++) ids.push(objectId(bytes, table + index * 24 + 4));
+    }
+  }
+  return ids;
+}
+
+function conciseObjectError(error: unknown): string {
+  const message = error instanceof Error ? error.message : String(error);
+  const mismatch = /SHA check failed! Expected ([0-9a-f]+), computed ([0-9a-f]+)/.exec(message);
+  if (mismatch) return `object hash mismatch (expected ${mismatch[1]}, computed ${mismatch[2]})`;
+  if (/incorrect data check|Cannot create property 'caller'/.test(message)) return "object is corrupt or unreadable";
+  return message.split(/\r?\n/, 1)[0];
+}
+
 async function runFsck(context: HostCommandContext): Promise<HostCommandResult> {
   const root = repositoryRoot(context.py, context.cwd);
   const fs = gitFs(context);
   const refs = new Set(["HEAD", ...looseRefs(context.py, root)]);
-  const packed = `${root}/.git/packed-refs`;
-  if (fsExists(context.py, packed)) {
-    for (const line of fsReadText(context.py, packed).split(/\r?\n/)) {
+  const packedRefs = `${root}/.git/packed-refs`;
+  if (fsExists(context.py, packedRefs)) {
+    for (const line of fsReadText(context.py, packedRefs).split(/\r?\n/)) {
       const match = /^[0-9a-f]{40}\s+(refs\/\S+)$/.exec(line);
       if (match) refs.add(match[1]);
     }
   }
-  const pending: string[] = [];
+  const objects = new Set<string>(packedObjectIds(context.py, root));
+  const loose = `${root}/.git/objects`;
+  if (fsExists(context.py, loose)) {
+    for (const prefix of context.py.FS.readdir(loose)) {
+      if (!/^[0-9a-f]{2}$/.test(prefix)) continue;
+      for (const suffix of context.py.FS.readdir(`${loose}/${prefix}`)) {
+        if (/^[0-9a-f]{38}$/.test(suffix)) objects.add(`${prefix}${suffix}`);
+      }
+    }
+  }
+  if (objects.size > 100_000) throw new Error("fsck object limit exceeded (100000)");
+  const pending = [...objects];
   const failures: string[] = [];
   for (const ref of refs) {
     try { pending.push(await isomorphicGit.resolveRef({ fs, dir: root, ref })); }
-    catch (error) { failures.push(`${ref}: ${error instanceof Error ? error.message : String(error)}`); }
+    catch (error) { failures.push(`${ref}: ${conciseObjectError(error)}`); }
   }
   const seen = new Set<string>();
   while (pending.length) {
@@ -1259,11 +1396,11 @@ async function runFsck(context: HostCommandContext): Promise<HostCommandResult> 
       else if (object.type === "tree") pending.push(...object.object.map((entry: { oid: string }) => entry.oid));
       else if (object.type === "tag") pending.push(object.object.object);
     } catch (error) {
-      failures.push(`${oid}: ${error instanceof Error ? error.message : String(error)}`);
+      failures.push(`${oid}: ${conciseObjectError(error)}`);
     }
   }
   if (failures.length) return errorResult(1, failures.map((line) => `error: ${line}\n`).join(""));
-  return result(0, `Checked ${seen.size} reachable object(s); no errors.\n`);
+  return result(0, `Checked ${seen.size} object(s); no errors.\n`);
 }
 
 async function runLsFiles(context: HostCommandContext, args: string[]): Promise<HostCommandResult> {
@@ -1635,10 +1772,14 @@ export async function runGitEngineCommand(context: HostCommandContext): Promise<
         }
       }
       if (target.length > 1) throw new Error("init accepts at most one directory");
+      const repository = target[0] ? workspacePath(cwd, target[0]) : cwd;
+      const reinitializing = fsExists(context.py, `${repository}/.git`);
       const initialized = await invoke(scoped, ["init", ...(target.length ? target : ["."])], cwd);
       if (initialized.exitCode === 0 && branch) {
-        const repository = target[0] ? workspacePath(cwd, target[0]) : cwd;
         fsWriteText(context.py, `${repository}/.git/HEAD`, `ref: refs/heads/${branch}\n`);
+      }
+      if (initialized.exitCode === 0 && reinitializing) {
+        initialized.stdout = initialized.stdout.replace("Initialized empty Git repository", "Reinitialized existing Git repository");
       }
       return render(initialized);
     }
