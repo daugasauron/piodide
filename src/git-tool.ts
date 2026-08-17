@@ -249,6 +249,10 @@ export function createGitTool(
         signal,
         getGitHubCredentials: getCredentials,
       });
+      const outputBytes = (response.stdout?.byteLength ?? 0) + (response.stderr?.byteLength ?? 0);
+      if (outputBytes > 1024 * 1024) {
+        throw new Error("Git output exceeds 1048576 bytes; narrow the command or write smaller output.");
+      }
       const decoder = new TextDecoder();
       const stdout = decoder.decode(response.stdout ?? new Uint8Array());
       const stderr = decoder.decode(response.stderr ?? new Uint8Array());
