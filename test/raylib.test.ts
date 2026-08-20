@@ -6,6 +6,7 @@ import { fileURLToPath } from "node:url";
 import { MemoryFs } from "../src/wasi/memory-fs.ts";
 import { runToolchain } from "../src/wasi/toolchain.ts";
 import { WasiHost } from "../src/wasi/host.ts";
+import { createRaylibDemoSource } from "../src/raylib-demo-source.ts";
 
 const here = dirname(fileURLToPath(import.meta.url));
 const root = join(here, "..");
@@ -30,6 +31,42 @@ void game_frame(float delta_seconds) {
     EndDrawing();
 }
 `;
+
+test(
+  "raylib: built-in demo source is compact and compiles",
+  { timeout: 300_000, skip: !toolchainAvailable },
+  async () => {
+    const source = createRaylibDemoSource(1400);
+    assert.ok(source.length <= 6_000);
+    assert.ok(source.split("\n").length <= 120);
+    assert.match(source, /#define PARTICLE_COUNT 1400/);
+    assert.doesNotMatch(source, /InitWindow|SetTargetFPS|CloseWindow/);
+
+    const fs = new MemoryFs();
+    fs.mkdirTree("/home/web/raylib");
+    fs.writeFile("/home/web/raylib/demo.c", source);
+    fs.writeFile("/home/web/raylib/raylib.h", readFileSync(join(raylibDir, "raylib.h")));
+    const compiled = await runToolchain(
+      {
+        operation: "compile",
+        sourcePath: "/home/web/raylib/demo.c",
+        outputPath: "/home/web/raylib/demo.o",
+        options: {
+          standard: "c17",
+          optimization: "3",
+          includePaths: ["/home/web/raylib"],
+          functionSections: true,
+        },
+      },
+      fs,
+      {
+        toolchain: arrayBuffer(join(toolchainDir, "clang.wasm")),
+        sysrootTar: arrayBuffer(join(toolchainDir, "clang-fs.tar.gz")),
+      },
+    );
+    assert.equal(compiled.exitCode, 0, compiled.diagnostics);
+  },
+);
 
 test(
   "raylib: WASI memory backend renders a packed BGRA framebuffer",

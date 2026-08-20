@@ -5,6 +5,7 @@ import { Type } from "typebox";
 import {
   createToolResponseFormat,
   parsePromptedToolCalls,
+  splitQwenThinkingOutput,
   toWebLLMMessages,
 } from "../src/webllm-model-stream.ts";
 
@@ -25,6 +26,56 @@ test("WebLLM prompt bridge parses tagged tool calls", () => {
       TOOLS,
     ),
     [{ name: "read", arguments: { path: "README.md" } }],
+  );
+});
+
+test("WebLLM prompt bridge recovers quoted and truncated source writes", () => {
+  assert.deepEqual(
+    parsePromptedToolCalls(
+      '<tool_calls>[{"name":"write","arguments":{"path":"raylib-demo.c","content":"#include "raylib.h"\\nint value = 1;\\n"}}]</tool_calls>',
+      TOOLS,
+    ),
+    [{
+      name: "write",
+      arguments: {
+        path: "raylib-demo.c",
+        content: '#include "raylib.h"\nint value = 1;\n',
+      },
+    }],
+  );
+  assert.deepEqual(
+    parsePromptedToolCalls(
+      '<tool_calls>[{"name":"write","arguments":{"path":"raylib-demo.c","content":"#include \\"raylib.h\\"\\nvoid game_',
+      TOOLS,
+    ),
+    [{
+      name: "write",
+      arguments: {
+        path: "raylib-demo.c",
+        content: '#include "raylib.h"\nvoid game_',
+      },
+    }],
+  );
+});
+
+test("WebLLM separates Qwen thinking from tool and answer content", () => {
+  assert.deepEqual(
+    splitQwenThinkingOutput(
+      '<think>Inspect the workspace first.</think>\n\n<tool_calls>[]</tool_calls>',
+      true,
+    ),
+    {
+      thinking: "Inspect the workspace first.",
+      content: "<tool_calls>[]</tool_calls>",
+    },
+  );
+  assert.deepEqual(
+    splitQwenThinkingOutput("<think>\n\n</think>\n\nDone", false),
+    { content: "Done" },
+  );
+  assert.deepEqual(
+    splitQwenThinkingOutput("Reason about it.</think>\nAnswer", true),
+    { thinking: "Reason about it.", content: "Answer" },
   );
 });
 

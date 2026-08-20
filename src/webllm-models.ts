@@ -18,6 +18,10 @@ export interface WebLLMModelDef extends LocalModelDef {
     temperature: number;
     topP: number;
   };
+  thinkingGeneration?: {
+    temperature: number;
+    topP: number;
+  };
 }
 
 export const REPLACED_WEBLLM_MODEL_IDS: Readonly<Record<string, string>> = {
@@ -37,8 +41,9 @@ export const WEBLLM_MODELS: readonly WebLLMModelDef[] = [
     vramRequiredBytes: 4_002_040_000,
     quantization: "q4f16",
     contextWindow: 8_192,
-    maxTokens: 1_024,
+    maxTokens: 2_048,
     tools: true,
+    thinking: true,
     license: "Apache-2.0",
     contextOptions: [8_192, 16_384, 32_768],
     webGpuKvBytesPerToken: 32_768,
@@ -55,6 +60,10 @@ export const WEBLLM_MODELS: readonly WebLLMModelDef[] = [
       temperature: 0.2,
       topP: 0.9,
     },
+    thinkingGeneration: {
+      temperature: 0.6,
+      topP: 0.95,
+    },
   },
   {
     id: "Qwen3.5-9B-q4f16_1-MLC",
@@ -63,8 +72,9 @@ export const WEBLLM_MODELS: readonly WebLLMModelDef[] = [
     vramRequiredBytes: 6_567_230_000,
     quantization: "q4f16",
     contextWindow: 8_192,
-    maxTokens: 1_024,
+    maxTokens: 2_048,
     tools: true,
+    thinking: true,
     license: "Apache-2.0",
     contextOptions: [8_192, 16_384, 32_768],
     webGpuKvBytesPerToken: 32_768,
@@ -81,6 +91,10 @@ export const WEBLLM_MODELS: readonly WebLLMModelDef[] = [
       temperature: 0.2,
       topP: 0.9,
     },
+    thinkingGeneration: {
+      temperature: 0.6,
+      topP: 0.95,
+    },
   },
   {
     id: "Qwen3.5-2B-q4f16_1-MLC",
@@ -89,8 +103,9 @@ export const WEBLLM_MODELS: readonly WebLLMModelDef[] = [
     vramRequiredBytes: 2_379_660_000,
     quantization: "q4f16",
     contextWindow: 8_192,
-    maxTokens: 1_024,
+    maxTokens: 2_048,
     tools: true,
+    thinking: true,
     license: "Apache-2.0",
     contextOptions: [8_192, 16_384, 32_768],
     webGpuKvBytesPerToken: 32_768,
@@ -106,6 +121,10 @@ export const WEBLLM_MODELS: readonly WebLLMModelDef[] = [
     generation: {
       temperature: 0.2,
       topP: 0.9,
+    },
+    thinkingGeneration: {
+      temperature: 0.6,
+      topP: 0.95,
     },
   },
   {

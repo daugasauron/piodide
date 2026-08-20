@@ -33,8 +33,19 @@ function readTool(executions: string[]) {
 function assistantText(message: unknown): string | undefined {
   const content = (message as { role?: string; content?: unknown }).content;
   if (!Array.isArray(content)) return undefined;
-  const first = content[0] as { type?: string; text?: string } | undefined;
-  return first?.type === "text" ? first.text : undefined;
+  const text = content.find((item) => (item as { type?: string }).type === "text") as
+    | { text?: string }
+    | undefined;
+  return text?.text;
+}
+
+function assistantThinking(message: unknown): string | undefined {
+  const content = (message as { role?: string; content?: unknown }).content;
+  if (!Array.isArray(content)) return undefined;
+  const thinking = content.find(
+    (item) => (item as { type?: string }).type === "thinking",
+  ) as { thinking?: string } | undefined;
+  return thinking?.thinking;
 }
 
 test("Wllama completes an assistant -> tool -> assistant agent loop", async () => {
@@ -53,7 +64,10 @@ test("Wllama completes an assistant -> tool -> assistant agent loop", async () =
     const followingTool = request.messages.some((message) => message.role === "tool");
     if (followingTool) {
       yield {
-        choices: [{ delta: { content: "wllama-complete" }, finish_reason: "stop" }],
+        choices: [{
+          delta: { reasoning_content: "Verify the tool result.", content: "wllama-complete" },
+          finish_reason: "stop",
+        }],
       } as never;
       return;
     }
@@ -61,6 +75,7 @@ test("Wllama completes an assistant -> tool -> assistant agent loop", async () =
       choices: [
         {
           delta: {
+            reasoning_content: "Inspect the file before answering.",
             tool_calls: [
               {
                 index: 0,
@@ -92,7 +107,7 @@ test("Wllama completes an assistant -> tool -> assistant agent loop", async () =
       initialState: {
         systemPrompt: "Use the available tool.",
         model,
-        thinkingLevel: "off",
+        thinkingLevel: "high",
         tools: [readTool(executions)],
         messages: [],
       },
@@ -111,7 +126,20 @@ test("Wllama completes an assistant -> tool -> assistant agent loop", async () =
       "assistant",
     ]);
     assert.equal(requests.length, 2);
+    assert.equal(
+      (requests[0] as unknown as { chat_template_kwargs?: { enable_thinking?: boolean } })
+        .chat_template_kwargs?.enable_thinking,
+      true,
+    );
     assert.equal(requests[1].messages.at(-1)?.role, "tool");
+    assert.equal(
+      assistantThinking(agent.state.messages[1]),
+      "Inspect the file before answering.",
+    );
+    assert.equal(
+      assistantThinking(agent.state.messages.at(-1)),
+      "Verify the tool result.",
+    );
     assert.equal(assistantText(agent.state.messages.at(-1)), "wllama-complete");
   } finally {
     runtime.ensureLoaded = originalEnsureLoaded;
@@ -126,7 +154,10 @@ test("WebLLM completes an assistant -> tool -> assistant agent loop", async () =
   };
   const originalEnsureLoaded = runtime.ensureLoaded;
   const originalStreamChat = runtime.streamChat;
-  const requests: Array<{ messages: Array<{ role: string; content?: unknown }> }> = [];
+  const requests: Array<{
+    messages: Array<{ role: string; content?: unknown }>;
+    extra_body?: { enable_thinking?: boolean };
+  }> = [];
   const executions: string[] = [];
 
   runtime.ensureLoaded = async () => {};
@@ -134,6 +165,7 @@ test("WebLLM completes an assistant -> tool -> assistant agent loop", async () =
     requests.push(
       request as unknown as {
         messages: Array<{ role: string; content?: unknown }>;
+        extra_body?: { enable_thinking?: boolean };
       },
     );
     const followingTool = request.messages.some(
@@ -147,8 +179,8 @@ test("WebLLM completes an assistant -> tool -> assistant agent loop", async () =
         {
           delta: {
             content: followingTool
-              ? "webllm-complete"
-              : '<tool_calls>[{"name":"read_file","arguments":{"path":"/home/web/e2e.txt"}}]</tool_calls>',
+              ? "<think>Verify the tool result.</think>webllm-complete"
+              : '<think>Inspect the file before answering.</think><tool_calls>[{"name":"read_file","arguments":{"path":"/home/web/e2e.txt"}}]</tool_calls>',
           },
           finish_reason: "stop",
         },
@@ -167,7 +199,7 @@ test("WebLLM completes an assistant -> tool -> assistant agent loop", async () =
       initialState: {
         systemPrompt: "Use the available tool.",
         model,
-        thinkingLevel: "off",
+        thinkingLevel: "high",
         tools: [readTool(executions)],
         messages: [],
       },
@@ -186,8 +218,17 @@ test("WebLLM completes an assistant -> tool -> assistant agent loop", async () =
       "assistant",
     ]);
     assert.equal(requests.length, 2);
+    assert.equal(requests[0].extra_body?.enable_thinking, true);
     assert.equal(requests[1].messages.at(-1)?.role, "user");
     assert.match(String(requests[1].messages.at(-1)?.content), /<tool_result>/);
+    assert.equal(
+      assistantThinking(agent.state.messages[1]),
+      "Inspect the file before answering.",
+    );
+    assert.equal(
+      assistantThinking(agent.state.messages.at(-1)),
+      "Verify the tool result.",
+    );
     assert.equal(assistantText(agent.state.messages.at(-1)), "webllm-complete");
   } finally {
     runtime.ensureLoaded = originalEnsureLoaded;

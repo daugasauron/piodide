@@ -46,8 +46,13 @@ async function run(
   await webLLMRuntime.ensureLoaded(model.id, options.signal);
   const events = new OpenAIEventAdapter(model, stream);
   const tools = context.tools?.length && descriptor.tools ? context.tools : [];
+  const thinking = descriptor.thinking === true && options.reasoning !== undefined;
+  const generation =
+    thinking && descriptor.thinkingGeneration
+      ? descriptor.thinkingGeneration
+      : descriptor.generation;
   const systemPrompt = tools.length
-    ? `${context.systemPrompt ?? ""}\n\n${toolProtocol(tools)}`.trim()
+    ? `${context.systemPrompt ?? ""}\n\n${toolProtocol(tools, thinking)}`.trim()
     : context.systemPrompt;
   const request: WebLLMChatRequest = {
     messages: toWebLLMMessages({
@@ -55,9 +60,12 @@ async function run(
       systemPrompt,
     }),
     max_tokens: model.maxTokens,
-    temperature: descriptor.generation.temperature,
-    top_p: descriptor.generation.topP,
+    temperature: generation.temperature,
+    top_p: generation.topP,
     stream_options: { include_usage: true },
+    ...(descriptor.thinking === true
+      ? { extra_body: { enable_thinking: thinking } }
+      : {}),
   };
   if (tools.length) {
     request.response_format = createToolResponseFormat(tools);
@@ -78,8 +86,12 @@ async function run(
     }
   }
 
+  const response = splitQwenThinkingOutput(output, thinking);
+  const reasoningDelta = response.thinking
+    ? { reasoning_content: response.thinking }
+    : {};
   const toolCalls = parsePromptedToolCalls(
-    output,
+    response.content,
     new Set(tools.map((tool) => tool.name)),
   );
   if (toolCalls?.length) {
@@ -87,6 +99,7 @@ async function run(
       choices: [
         {
           delta: {
+            ...reasoningDelta,
             tool_calls: toolCalls.map((toolCall, index) => ({
               index,
               id: `call_${crypto.randomUUID().replaceAll("-", "")}`,
@@ -106,7 +119,7 @@ async function run(
     events.accept({
       choices: [
         {
-          delta: { content: output },
+          delta: { ...reasoningDelta, content: response.content },
           finish_reason: finishReason,
         },
       ],
@@ -114,6 +127,48 @@ async function run(
     });
   }
   events.finish();
+}
+
+export interface QwenThinkingOutput {
+  thinking?: string;
+  content: string;
+}
+
+/** Separate Qwen's visible `<think>` block from answer/tool content. */
+export function splitQwenThinkingOutput(
+  output: string,
+  thinkingEnabled: boolean,
+): QwenThinkingOutput {
+  const opening = output.match(/^\s*<think>\s*/i);
+  if (opening) {
+    const reasoningStart = opening[0].length;
+    const closingIndex = output.toLowerCase().indexOf("</think>", reasoningStart);
+    if (closingIndex >= 0) {
+      const thinking = output.slice(reasoningStart, closingIndex).trim();
+      const content = output.slice(closingIndex + "</think>".length).trimStart();
+      return {
+        ...(thinkingEnabled && thinking ? { thinking } : {}),
+        content,
+      };
+    }
+    if (thinkingEnabled) {
+      const thinking = output.slice(reasoningStart).trim();
+      return { ...(thinking ? { thinking } : {}), content: "" };
+    }
+  }
+
+  // Some runtimes include the opening tag in the assistant prompt rather than
+  // in generated tokens, but still return the closing tag in the response.
+  if (thinkingEnabled) {
+    const closingIndex = output.toLowerCase().indexOf("</think>");
+    if (closingIndex >= 0) {
+      const thinking = output.slice(0, closingIndex).trim();
+      const content = output.slice(closingIndex + "</think>".length).trimStart();
+      return { ...(thinking ? { thinking } : {}), content };
+    }
+  }
+
+  return { content: output };
 }
 
 export function toWebLLMMessages(context: Context): ChatCompletionMessageParam[] {
@@ -161,6 +216,7 @@ interface PromptedToolCall {
 
 function toolProtocol(
   tools: NonNullable<Context["tools"]>,
+  thinking: boolean,
 ): string {
   const definitions = tools.map((tool) => ({
     name: tool.name,
@@ -169,11 +225,16 @@ function toolProtocol(
   }));
   return `Tool-call protocol for this WebLLM model:
 - If no tool is needed, answer the user normally. A greeting or general question never needs a tool.
-- If a tool is needed, output only this envelope and no prose:
+- If a tool is needed, ${
+    thinking
+      ? "first reason briefly inside <think>...</think>, then output only this envelope and no other prose"
+      : "output only this envelope and no prose"
+  }:
   <tool_calls>[{"name":"tool_name","arguments":{"argument":"value"}}]</tool_calls>
 - Use only a listed tool, preserve its exact name, and provide arguments matching its schema.
 - Multiple independent calls may appear in the JSON array.
 - Tool results are returned in <tool_result> JSON envelopes. Treat them as the results of your calls, then continue the task without repeating a successful call.
+- Never echo or output a <tool_result> envelope yourself.
 
 Available tools:
 ${JSON.stringify(definitions)}`;
@@ -240,7 +301,7 @@ export function parsePromptedToolCalls(
   try {
     parsed = JSON.parse(candidate);
   } catch {
-    return undefined;
+    return parseLooseWriteToolCall(output, allowedNames);
   }
   const values = Array.isArray(parsed) ? parsed : [parsed];
   if (values.length === 0) return undefined;
@@ -261,6 +322,88 @@ export function parsePromptedToolCalls(
     calls.push({ name: value.name, arguments: args });
   }
   return calls;
+}
+
+/**
+ * Recover a tagged `write` call when a small local model forgets to JSON-escape
+ * quotes in a large source string, or reaches its output limit before closing
+ * the envelope. The agent still validates the recovered arguments before the
+ * tool executes. Keeping this fallback specific to `write` avoids guessing at
+ * arbitrary malformed tool payloads.
+ */
+function parseLooseWriteToolCall(
+  output: string,
+  allowedNames: ReadonlySet<string>,
+): PromptedToolCall[] | undefined {
+  if (!allowedNames.has("write")) return undefined;
+  const start = output.match(/<tool_calls?>\s*/i);
+  if (!start || start.index === undefined) return undefined;
+  let body = output.slice(start.index + start[0].length);
+  const closingTag = body.search(/<\/tool_calls?>/i);
+  const complete = closingTag >= 0;
+  if (complete) body = body.slice(0, closingTag);
+
+  const prefix = body.match(
+    /^\s*\[?\s*\{\s*"name"\s*:\s*"write"\s*,\s*"arguments"\s*:\s*\{\s*"path"\s*:\s*("(?:\\.|[^"\\])*")\s*,\s*"content"\s*:\s*"/i,
+  );
+  if (!prefix) return undefined;
+
+  let path: unknown;
+  try {
+    path = JSON.parse(prefix[1]);
+  } catch {
+    return undefined;
+  }
+  if (typeof path !== "string") return undefined;
+
+  let encodedContent = body.slice(prefix[0].length);
+  if (complete) {
+    const suffix = encodedContent.match(/"\s*\}\s*\}\s*\]?\s*$/);
+    if (!suffix || suffix.index === undefined) return undefined;
+    encodedContent = encodedContent.slice(0, suffix.index);
+  }
+  // Do not swallow a second call into the file if the model attempted a batch.
+  if (/"\s*\}\s*\}\s*,\s*\{\s*"name"\s*:/i.test(encodedContent)) {
+    return undefined;
+  }
+
+  return [{
+    name: "write",
+    arguments: { path, content: decodeLooseJsonString(encodedContent) },
+  }];
+}
+
+function decodeLooseJsonString(value: string): string {
+  let decoded = "";
+  for (let index = 0; index < value.length; index++) {
+    const character = value[index];
+    if (character !== "\\" || index + 1 >= value.length) {
+      decoded += character;
+      continue;
+    }
+    const escape = value[++index];
+    const simple: Record<string, string> = {
+      '"': '"',
+      "\\": "\\",
+      "/": "/",
+      b: "\b",
+      f: "\f",
+      n: "\n",
+      r: "\r",
+      t: "\t",
+    };
+    if (escape in simple) {
+      decoded += simple[escape];
+      continue;
+    }
+    if (escape === "u" && /^[0-9a-f]{4}$/i.test(value.slice(index + 1, index + 5))) {
+      decoded += String.fromCharCode(Number.parseInt(value.slice(index + 1, index + 5), 16));
+      index += 4;
+      continue;
+    }
+    decoded += `\\${escape}`;
+  }
+  return decoded;
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {

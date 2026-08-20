@@ -1,6 +1,7 @@
 export const LOCAL_MODEL_HELP: readonly string[] = [
   "Local models run entirely in this browser and do not require /login.",
   "For tool use, select an 8K or larger context; the full agent prompt and tool schemas do not fit in 4K.",
+  "Qwen thinking is shown by default. Use /thinking off or /thinking high to change it.",
   "",
   "Wllama / GGUF:",
   "  Host: hf download unsloth/Qwen3.5-2B-GGUF Qwen3.5-2B-Q4_K_M.gguf --local-dir models/qwen3.5-2b-gguf",

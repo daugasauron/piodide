@@ -64,6 +64,7 @@ export const BROWSER_MODELS: readonly BrowserModelDef[] = [
     contextWindow: 8_192,
     maxTokens: 2_048,
     tools: true,
+    thinking: true,
     license: "Apache-2.0",
     contextOptions: [4_096, 8_192, 16_384, 32_768],
     load: {
@@ -76,6 +77,11 @@ export const BROWSER_MODELS: readonly BrowserModelDef[] = [
       temperature: 0.1,
       topP: 0.9,
       topK: 40,
+    },
+    thinkingGeneration: {
+      temperature: 0.6,
+      topP: 0.95,
+      topK: 20,
     },
   },
   {
@@ -88,6 +94,7 @@ export const BROWSER_MODELS: readonly BrowserModelDef[] = [
     contextWindow: 8_192,
     maxTokens: 2_048,
     tools: true,
+    thinking: true,
     license: "Apache-2.0",
     contextOptions: [4_096, 8_192, 16_384, 32_768],
     load: {
@@ -100,6 +107,11 @@ export const BROWSER_MODELS: readonly BrowserModelDef[] = [
       temperature: 0.1,
       topP: 0.9,
       topK: 40,
+    },
+    thinkingGeneration: {
+      temperature: 0.6,
+      topP: 0.95,
+      topK: 20,
     },
   },
   {
@@ -112,6 +124,7 @@ export const BROWSER_MODELS: readonly BrowserModelDef[] = [
     contextWindow: 8_192,
     maxTokens: 2_048,
     tools: true,
+    thinking: true,
     license: "Apache-2.0",
     contextOptions: [4_096, 8_192, 16_384, 32_768],
     load: {
@@ -124,6 +137,11 @@ export const BROWSER_MODELS: readonly BrowserModelDef[] = [
       temperature: 0.1,
       topP: 0.9,
       topK: 40,
+    },
+    thinkingGeneration: {
+      temperature: 0.6,
+      topP: 0.95,
+      topK: 20,
     },
   },
   {
@@ -136,6 +154,7 @@ export const BROWSER_MODELS: readonly BrowserModelDef[] = [
     contextWindow: 8_192,
     maxTokens: 2_048,
     tools: true,
+    thinking: true,
     license: "Apache-2.0",
     contextOptions: [4_096, 8_192, 16_384, 32_768],
     load: {
@@ -148,6 +167,11 @@ export const BROWSER_MODELS: readonly BrowserModelDef[] = [
       temperature: 0.1,
       topP: 0.9,
       topK: 40,
+    },
+    thinkingGeneration: {
+      temperature: 0.6,
+      topP: 0.95,
+      topK: 20,
     },
   },
 ];

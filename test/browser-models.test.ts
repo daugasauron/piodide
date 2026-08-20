@@ -71,7 +71,7 @@ test("Wllama provider is local, keyless, renamed, and keeps its aliases", async 
   }
 });
 
-test("Qwen3 8B exposes a binary thinking toggle and changes its request preset", async () => {
+test("local Qwen models expose a binary thinking toggle and change request presets", async () => {
   const provider = getProvider("wllama");
   assert.ok(provider);
   await provider.loadModels();
@@ -102,6 +102,11 @@ test("Qwen3 8B exposes a binary thinking toggle and changes its request preset",
   assert.equal(high.temperature, descriptor.thinkingGeneration?.temperature);
   assert.equal(high.top_p, descriptor.thinkingGeneration?.topP);
   assert.equal(high.top_k, descriptor.thinkingGeneration?.topK);
+
+  for (const qwen of BROWSER_MODELS) {
+    assert.equal(qwen.thinking, true, qwen.id);
+    assert.ok(qwen.thinkingGeneration, qwen.id);
+  }
 });
 
 test("Wllama includes the practical Qwen3.5 4B and 9B GGUF models", () => {
@@ -326,6 +331,9 @@ test("WebLLM is an independent WebGPU catalogue with tool support marked", async
     assert.equal(model.vramRequiredBytes, vramRequiredBytes);
     assert.equal(model.quantization, "q4f16");
     assert.equal(model.tools, true);
+    assert.equal(model.thinking, true);
+    assert.ok(model.thinkingGeneration);
+    assert.equal(model.maxTokens, 2_048);
   }
 
   for (const model of WEBLLM_MODELS) {

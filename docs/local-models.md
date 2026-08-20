@@ -88,6 +88,11 @@ GGUF file for Wllama or one MLC directory for WebLLM. Use an 8K or larger
 context when tools are enabled: Piodide's agent prompt and complete tool schemas
 do not fit in a 4K context.
 
+Qwen models start with visible thinking enabled for both Wllama and WebLLM.
+Thinking is rendered with the app's subdued reasoning style before tool calls;
+use `/thinking off` or `/thinking high` to change it. WebLLM requests use its
+`enable_thinking` control, while Wllama uses the GGUF chat-template toggle.
+
 `/model import [id]` imports without downloading the model weights again:
 
 - Wllama selects one GGUF whose size matches the catalogue entry.

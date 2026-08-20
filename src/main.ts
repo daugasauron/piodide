@@ -48,13 +48,20 @@ import {
 import { getLocalProviderBinding } from "./local-provider.ts";
 import type { LocalModelRuntime, LocalModelStatus } from "./local-model.ts";
 import { LOCAL_MODEL_HELP } from "./local-model-help.ts";
+import { createRaylibDemoSource } from "./raylib-demo-source.ts";
 import { browserModelRuntime } from "./browser-model-runtime.ts";
 import { webLLMRuntime } from "./webllm-runtime.ts";
 import {
   estimateWebLLMVramBytes,
   getWebLLMModel,
 } from "./webllm-models.ts";
-import { createAllTools, createHtmlTool, createImageTool } from "./tools.ts";
+import {
+  createAllTools,
+  createCompileRaylibTool,
+  createHtmlTool,
+  createImageTool,
+  createRaylibTool,
+} from "./tools.ts";
 import type { NeovimController } from "./neovim.ts";
 import {
   normalizeGitHubApiUrl,
@@ -476,25 +483,69 @@ function demoRequest(): string {
     : "Use keyboard and mouse interaction and make good use of the landscape screen.";
   const framebuffer = phone ? "320×568 (width 320, height 568)" : "640×360 (width 640, height 360)";
   const movingObjects = phone ? 500 : 1400;
-  return `Build and launch an original raylib performance showcase. This is an execution task: use the tools and finish with the running game, not a code listing or explanation. You have creative freedom over the concept, art direction, motion, and game rules.
+  return `Launch the prepared raylib performance showcase. This is an execution task: use the tools and finish with the running game, not a code listing or explanation.
 
 The current client is a ${phone ? "phone/touch device" : "desktop/laptop"} at ${window.innerWidth}×${window.innerHeight} CSS pixels. ${controls}
 
-The result must visibly demonstrate browser Wasm performance: continuously simulate and draw at least ${movingObjects} independently moving particles, projectiles, boids, trail segments, or similarly meaningful objects every frame. Add layered procedural effects, interaction, and a small HUD showing the live object count and controls. It must be a playable, changing scene—not a static picture or mostly text. Use fixed-size bounded arrays and delta_seconds; avoid unbounded allocation.
+The prepared /home/web/raylib-demo.c already implements a compact, valid showcase with ${movingObjects} independently moving particles, layered effects, pointer interaction, and a HUD. Do not replace or rewrite it. Compile it first; edit only in response to concrete compiler diagnostics.
 
 Use exactly this runtime contract:
-- Write one C17 source file to /home/web/raylib-demo.c. Include raylib.h and define void game_init(void) plus void game_frame(float delta_seconds).
+- The prepared C17 source is /home/web/raylib-demo.c. It includes raylib.h and defines void game_init(void) plus void game_frame(float delta_seconds).
 - Do not define main or call InitWindow, CloseWindow, SetTargetFPS, or create a frame loop. The browser owns those. Put BeginDrawing() and EndDrawing() inside game_frame.
 - Prefer dependable raylib 6 2D APIs such as DrawPixel, DrawRectangle, DrawLineV, DrawCircleV, DrawText, GetMousePosition, GetTouchPosition, and IsKeyDown. Audio and rmodels are unavailable.
 - The raylib preview already supplies every WASI import and instantiates the module. Do not create HTML, JavaScript, a WebAssembly.instantiate call, or a wasi_snapshot_preview1 import object. Do not use compile_c, link_wasi, run_wasi, Python, or slop for this demo.
 
 Required tool sequence:
-1. write /home/web/raylib-demo.c
+1. read /home/web/raylib-demo.c
 2. compile_raylib with path /home/web/raylib-demo.c, output /home/web/raylib-demo.wasm, and optimization "3"
-3. If compilation fails, read the diagnostics, edit the C source, and retry compile_raylib until it succeeds. Never launch a failed build.
+3. If compilation fails, use edit to fix only the reported issue and retry compile_raylib until it succeeds. Never launch a failed build.
 4. Call raylib exactly once with path /home/web/raylib-demo.wasm, framebuffer ${framebuffer}, and a short title.
 
 Do not stop before the raylib tool succeeds and opens the game.`;
+}
+
+async function launchBuiltInRaylibDemo() {
+  if (!py) throw new Error("Python filesystem is not ready.");
+  const phone = isPhoneClient();
+  const movingObjects = phone ? 500 : 1400;
+  const width = phone ? 320 : 640;
+  const height = phone ? 568 : 360;
+  fsWriteText(py, "/home/web/raylib-demo.c", createRaylibDemoSource(movingObjects));
+  say(dim("  local model did not finish the launch · compiling the built-in showcase"));
+  const compiled = await createCompileRaylibTool(py).execute(
+    "demo-fallback-compile",
+    {
+      path: "/home/web/raylib-demo.c",
+      output: "/home/web/raylib-demo.wasm",
+      optimization: "3",
+    },
+    undefined,
+  );
+  const compileDetails = compiled.details;
+  say(
+    green(
+      `  ↳ raylib compiled · ${compileDetails.bytes} bytes · ${(
+        compileDetails.durationMs / 1000
+      ).toFixed(1)}s`,
+    ),
+  );
+  const preview = await createRaylibTool(py).execute(
+    "demo-fallback-preview",
+    {
+      path: "/home/web/raylib-demo.wasm",
+      width,
+      height,
+      title: "Piodide particle field",
+    },
+    undefined,
+  );
+  await openRaylibPreview(
+    preview.details.path,
+    preview.details.width,
+    preview.details.height,
+    preview.details.title,
+  );
+  say(green("  ↳ built-in raylib showcase launched"));
 }
 
 function consumeLocalCodexProxyToken(): string {
@@ -670,6 +721,8 @@ function onBrowserModelStatus(runtime: LocalModelRuntime, status: LocalModelStat
 
 function applyConfigToAgent() {
   if (agent && provider) {
+    const previousModelReasoning = agent.state.model.reasoning;
+    const previousThinkingLevel = agent.state.thinkingLevel;
     const modelId = currentModelId();
     const loadedInfo = getLoadedModelInfo(provider.name, modelId);
     const selectedContext = selectedLocalContextSize(modelId);
@@ -691,10 +744,20 @@ function applyConfigToAgent() {
     });
     agent.state.model = model;
     agent.state.systemPrompt = currentSystemPrompt();
-    agent.state.thinkingLevel = clampThinkingLevel(
+    const clampedThinkingLevel = clampThinkingLevel(
       model,
-      agent.state.thinkingLevel,
+      previousThinkingLevel,
     ) as ThinkingLevel;
+    // Qwen's local templates think by default. Make that visible the first
+    // time a local reasoning model is selected; an explicit `/thinking off`
+    // remains sticky when switching between reasoning-capable local models.
+    agent.state.thinkingLevel =
+      provider.transport === "browser" &&
+      model.reasoning &&
+      !previousModelReasoning &&
+      clampedThinkingLevel === "off"
+        ? "high"
+        : clampedThinkingLevel;
   }
   renderFooter();
 }
@@ -1429,28 +1492,52 @@ async function runSlash(input: string) {
     case "demo":
       say(cyan(`  ◇ demo target: ${isPhoneClient() ? "phone · touch" : "desktop · keyboard/mouse"}`));
       {
+        if (!agent || !pyReady || !py) {
+          say(yellow("  python is still loading — try again in a moment"));
+          break;
+        }
+        const movingObjects = isPhoneClient() ? 500 : 1400;
+        fsWriteText(py, "/home/web/raylib-demo.c", createRaylibDemoSource(movingObjects));
+        const demoAgent = agent;
+        const allTools = demoAgent.state.tools;
+        const demoToolNames = new Set([
+          "read",
+          "edit",
+          "compile_raylib",
+          "raylib",
+        ]);
+        // A focused schema leaves small local models substantially more room
+        // for the C source and prevents them from selecting an incompatible
+        // compile/run path. Restore the normal toolset after both passes.
+        demoAgent.state.tools = allTools.filter((tool) => demoToolNames.has(tool.name));
         const messagesBefore = agent?.state.messages.length ?? 0;
         const launchesBefore = raylibLaunchCount;
-        await handleSubmit(demoRequest());
-        const messages = agent?.state.messages ?? [];
-        let lastAssistant: AgentMessage | undefined;
-        for (let index = messages.length - 1; index >= 0; index--) {
-          if (messages[index].role === "assistant") {
-            lastAssistant = messages[index];
-            break;
+        try {
+          await handleSubmit(demoRequest());
+          const messages = agent?.state.messages ?? [];
+          let lastAssistant: AgentMessage | undefined;
+          for (let index = messages.length - 1; index >= 0; index--) {
+            if (messages[index].role === "assistant") {
+              lastAssistant = messages[index];
+              break;
+            }
           }
-        }
-        const stopReason = (lastAssistant as { stopReason?: string } | undefined)?.stopReason;
-        if (
-          messages.length > messagesBefore &&
-          raylibLaunchCount === launchesBefore &&
-          stopReason !== "error" &&
-          stopReason !== "aborted"
-        ) {
-          say(yellow("  ◇ demo did not launch · requesting one repair pass"));
-          await handleSubmit(
-            "The raylib demo has not opened. Continue the existing task: inspect /home/web/raylib-demo.c and the previous compiler diagnostics, create or repair the source, run compile_raylib at optimization 3 until it succeeds, then call raylib exactly once. Do not switch to compile_c, link_wasi, run_wasi, HTML, JavaScript, Python, or slop, and do not stop with an explanation.",
-          );
+          const stopReason = (lastAssistant as { stopReason?: string } | undefined)?.stopReason;
+          const canRecover =
+            messages.length > messagesBefore &&
+            raylibLaunchCount === launchesBefore &&
+            stopReason !== "aborted";
+          if (canRecover && stopReason !== "error") {
+            say(yellow("  ◇ demo did not launch · requesting one repair pass"));
+            await handleSubmit(
+              "The prepared raylib demo has not opened. Compile /home/web/raylib-demo.c with compile_raylib at optimization 3. Edit only a concrete reported compiler error. After compilation succeeds, call raylib exactly once. Do not rewrite the source, switch tools, or stop with an explanation.",
+            );
+          }
+          if (canRecover && raylibLaunchCount === launchesBefore) {
+            await launchBuiltInRaylibDemo();
+          }
+        } finally {
+          demoAgent.state.tools = allTools;
         }
       }
       return;
@@ -1981,16 +2068,15 @@ function slopCommandPreview(value: string, maxLength: number): string {
       return magenta(token);
     }
     if (/^[<>]+$/.test(token)) return magenta(token);
-    if (token.startsWith("\"") || token.startsWith("'")) return green(token);
+    if (token.startsWith("\"") || token.startsWith("'")) return token;
     if (token.startsWith("$")) return magenta(token);
     if (expectsCommand && /^[A-Za-z_][A-Za-z0-9_]*=/.test(token)) {
       return magenta(token);
     }
     if (expectsCommand) {
       expectsCommand = false;
-      return cyan(token);
+      return green(token);
     }
-    if (token.startsWith("-")) return yellow(token);
     return token;
   }).join("");
 }
@@ -2002,9 +2088,9 @@ function printSlopCall(args: unknown) {
   const cwd = typeof values.cwd === "string" ? values.cwd : "/home/web";
   const valueWidth = Math.max(32, writer.cols - 15);
 
-  writer.writeln(`  ${cyan("⏺ slop")}`);
+  writer.writeln(`  ${magenta("⏺ slop")}`);
   writer.writeln(`    ${dim("cwd  ")} ${exactStringPreview(cwd, valueWidth)}`);
-  writer.writeln(`    ${yellow("input")} ${slopCommandPreview(command, valueWidth)}`);
+  writer.writeln(`    ${dim("input")} ${slopCommandPreview(command, valueWidth)}`);
 }
 
 function legacySlopOutputText(result: any, exitCode: unknown): string {
@@ -2025,8 +2111,7 @@ function printSlopChannel(
   name: "stdout" | "stderr",
   output: string,
 ) {
-  const headerColor = name === "stdout" ? green : red;
-  const textColor = name === "stdout" ? green : yellow;
+  const headerColor = name === "stdout" ? green : magenta;
   writer.writeln(`    ${headerColor(name)}`);
   if (!output) {
     writer.writeln(`    ${headerColor("│")} ${dim("(empty)")}`);
@@ -2043,7 +2128,7 @@ function printSlopChannel(
   const printLine = (line: string) => {
     const safe = line.replaceAll("\x1b", "\\x1b");
     writer.writeln(
-      `    ${headerColor("│")} ${textColor(truncateLine(safe, maxLineLength))}`,
+      `    ${headerColor("│")} ${truncateLine(safe, maxLineLength)}`,
     );
   };
 
@@ -2063,7 +2148,7 @@ function printSlopOutput(result: any, exitCode: unknown) {
   printSlopChannel("stdout", channels.stdout);
   printSlopChannel("stderr", channels.stderr);
   if (result?.details?.truncated) {
-    writer.writeln(yellow("    … slop output truncated"));
+    writer.writeln(magenta("    … slop output truncated"));
   }
 }
 
