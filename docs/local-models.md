@@ -74,6 +74,7 @@ javascript.options.wasm_js_promise_integration
 
 ```text
 /model
+/model help
 /thinking off|high
 /model status
 /model import [id]
@@ -81,6 +82,11 @@ javascript.options.wasm_js_promise_integration
 /model remove [id]
 /model clear-cache
 ```
+
+`/model help` prints a copyable quick-start for downloading and importing one
+GGUF file for Wllama or one MLC directory for WebLLM. Use an 8K or larger
+context when tools are enabled: Piodide's agent prompt and complete tool schemas
+do not fit in a 4K context.
 
 `/model import [id]` imports without downloading the model weights again:
 
@@ -97,3 +103,13 @@ hf download mlc-ai/Qwen3.5-4B-q4f16_1-MLC \
 
 The matching model-library WASM is optional in that directory. Without it,
 WebLLM downloads and caches the roughly 6 MiB library on first load.
+
+For a smaller download, the commands printed by `/model help` use the 2B model:
+
+```bash
+hf download unsloth/Qwen3.5-2B-GGUF Qwen3.5-2B-Q4_K_M.gguf \
+  --local-dir models/qwen3.5-2b-gguf
+
+hf download mlc-ai/Qwen3.5-2B-q4f16_1-MLC \
+  --local-dir models/Qwen3.5-2B-q4f16_1-MLC
+```

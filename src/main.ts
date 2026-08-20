@@ -47,6 +47,7 @@ import {
 } from "./browser-models.ts";
 import { getLocalProviderBinding } from "./local-provider.ts";
 import type { LocalModelRuntime, LocalModelStatus } from "./local-model.ts";
+import { LOCAL_MODEL_HELP } from "./local-model-help.ts";
 import { browserModelRuntime } from "./browser-model-runtime.ts";
 import { webLLMRuntime } from "./webllm-runtime.ts";
 import {
@@ -1410,7 +1411,7 @@ async function runSlash(input: string) {
   switch (cmd) {
     case "help":
       say(dim("  /provider  /model  /login  /logout       provider configuration"));
-      say(dim("  /model status|import|unload|remove|clear-cache   local model storage"));
+      say(dim("  /model help|status|import|unload|remove|clear-cache   local model setup/storage"));
       say(dim("  /github [api-url|status|logout]           session-only GitHub access"));
       say(dim("  /new  /tree  /resume  /fork  /clone     page-local sessions"));
       say(dim("  /name  /session  /copy  /export          session utilities"));
@@ -1479,7 +1480,9 @@ async function runSlash(input: string) {
 
     case "model": {
       const localProvider = currentLocalProvider();
-      if (!provider) {
+      if (arg.toLowerCase() === "help") {
+        for (const line of LOCAL_MODEL_HELP) say(dim(`  ${line}`));
+      } else if (!provider) {
         say(yellow("  pick a provider first: /provider"));
       } else if (provider.transport === "browser" && arg.toLowerCase() === "status") {
         await showBrowserModels();

@@ -118,6 +118,20 @@ async function run(
 
 export function toWebLLMMessages(context: Context): ChatCompletionMessageParam[] {
   return toBrowserChatMessages(context).map((message): ChatCompletionMessageParam => {
+    if (message.role === "tool") {
+      // The Qwen MLC conversation template only defines system, user, and
+      // assistant roles. Passing OpenAI's `tool` role reaches WebLLM's prompt
+      // builder and fails before generation with "Role is not supported:
+      // tool". Keep the result machine-readable while replaying it through a
+      // role every catalogue template accepts.
+      return {
+        role: "user",
+        content: `<tool_result>${JSON.stringify({
+          tool_call_id: message.tool_call_id,
+          content: message.content,
+        })}</tool_result>`,
+      };
+    }
     if (message.role !== "assistant") {
       return message as ChatCompletionMessageParam;
     }
@@ -159,6 +173,7 @@ function toolProtocol(
   <tool_calls>[{"name":"tool_name","arguments":{"argument":"value"}}]</tool_calls>
 - Use only a listed tool, preserve its exact name, and provide arguments matching its schema.
 - Multiple independent calls may appear in the JSON array.
+- Tool results are returned in <tool_result> JSON envelopes. Treat them as the results of your calls, then continue the task without repeating a successful call.
 
 Available tools:
 ${JSON.stringify(definitions)}`;

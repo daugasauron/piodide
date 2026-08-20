@@ -92,7 +92,7 @@ test("WebLLM prompt bridge accepts stringified arguments and rejects unknown too
   );
 });
 
-test("WebLLM follow-up history serializes assistant tool calls as string content", () => {
+test("WebLLM follow-up history uses supported roles and tagged tool results", () => {
   const messages = toWebLLMMessages({
     systemPrompt: "Use tools carefully.",
     messages: [
@@ -139,8 +139,8 @@ test("WebLLM follow-up history serializes assistant tool calls as string content
       'I will inspect it.\n<tool_calls>[{"name":"read","arguments":{"path":"README.md"}}]</tool_calls>',
   });
   assert.deepEqual(messages[3], {
-    role: "tool",
-    tool_call_id: "call_read",
-    content: "contents",
+    role: "user",
+    content:
+      '<tool_result>{"tool_call_id":"call_read","content":"contents"}</tool_result>',
   });
 });
