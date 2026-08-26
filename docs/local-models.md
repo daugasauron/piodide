@@ -17,6 +17,17 @@ The first load asks before downloading; later sessions use the browser cache.
 The q4f16 WebLLM catalogue and Wllama's WebGPU path require `shader-f16`.
 Wllama can run smaller models on multithreaded WASM when it is absent.
 
+Run `/model status` before downloading. It performs a live adapter probe and
+reports the GPU name, WebGPU and `shader-f16` readiness, logical CPU threads,
+available/persistent browser storage, the active backend and context, and all
+model caches it can discover. WebLLM is GPU-only. Wllama's wasm32 fallback can
+load GGUF files below 4 GiB; larger GGUF files require the WebGPU path.
+
+Model storage needs roughly the advertised download size plus working
+headroom. The selected WebLLM context must also fit the displayed VRAM
+estimate. If persistent browser storage is not granted, Chrome may evict model
+files under storage pressure.
+
 ## WebLLM catalogue
 
 | Model | Download | VRAM | Context | Tools |
@@ -34,6 +45,13 @@ Piodide serves each small WebLLM chat config from its own origin to avoid
 Hugging Face metadata-redirect CORS failures. Model weights still come from
 the upstream MLC repositories and remain in WebLLM's browser cache.
 
+The WebLLM package supplies its own runtime catalogue. `/model status`
+discovers its current size dynamically and reconciles the browser cache
+against it. Piodide labels the smaller subset verified for agent tools as
+`agent-ready`; cached older or custom MLC builds remain visible with their
+actual parameter size instead of silently disappearing, but are not offered
+for selection until their tool protocol and memory profile are verified.
+
 WebLLM offers 8K, 16K, and 32K contexts during model selection. The 8K
 default is the smallest size that fits Piodide's agent prompt and tool schemas.
 
@@ -42,10 +60,10 @@ default is the smallest size that fits Piodide's agent prompt and tool schemas.
 | Model | Download | Default context | Tools | Thinking |
 | --- | ---: | ---: | --- | --- |
 | Qwen3 8B Q4_K_M | 4.68 GiB | 16K | Yes | Off / high |
-| Qwen3.5 9B Q4_K_M | 5.29 GiB | 8K | Yes | No |
-| Qwen3.5 4B Q4_K_M | 2.55 GiB | 8K | Yes | No |
-| Qwen3.5 2B Q4_K_M | 1.19 GiB | 8K | Yes | No |
-| Qwen3.5 0.8B Q4_K_M | 508 MiB | 8K | Yes | No |
+| Qwen3.5 9B Q4_K_M | 5.29 GiB | 8K | Yes | Off / high |
+| Qwen3.5 4B Q4_K_M | 2.55 GiB | 8K | Yes | Off / high |
+| Qwen3.5 2B Q4_K_M | 1.19 GiB | 8K | Yes | Off / high |
+| Qwen3.5 0.8B Q4_K_M | 508 MiB | 8K | Yes | Off / high |
 
 Every Wllama model offers 4K, 8K, 16K, and 32K cache sizes. On the tested
 12 GiB RTX 5070, Qwen3 8B used about 5.5/5.8/6.4/7.7 GiB at those sizes.
@@ -89,9 +107,18 @@ context when tools are enabled: Piodide's agent prompt and complete tool schemas
 do not fit in a 4K context.
 
 Qwen models start with visible thinking enabled for both Wllama and WebLLM.
-Thinking is rendered with the app's subdued reasoning style before tool calls;
-use `/thinking off` or `/thinking high` to change it. WebLLM requests use its
+Thinking streams under an explicit purple `thinking` section, tool calls use
+the same purple/white trace language, successful results are green, and the
+final response starts with a green `answer` section. This keeps reasoning,
+actions, and user-facing output visually separate. Use `/thinking off` or
+`/thinking high` to change it. WebLLM requests use its
 `enable_thinking` control, while Wllama uses the GGUF chat-template toggle.
+
+While a request is waiting, the single-line indicator keeps an elapsed timer.
+Downloads show byte percentage and WebLLM shard progress; initialization shows
+GPU shader compilation, chosen backend, and context. Detailed WebLLM runtime
+messages are reduced to stable milestones rather than discarded or dumped as
+raw native logs.
 
 `/model import [id]` imports without downloading the model weights again:
 

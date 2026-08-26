@@ -7,8 +7,26 @@ import { WEBLLM_MODELS, getWebLLMModel } from "../src/webllm-models.ts";
 import {
   cacheBundledWebLLMConfig,
   validateWebLLMModelFiles,
+  webLLMModelIdFromCacheUrl,
   webLLMRuntime,
 } from "../src/webllm-runtime.ts";
+
+test("WebLLM cache discovery maps runtime and legacy model URLs", () => {
+  assert.equal(
+    webLLMModelIdFromCacheUrl(
+      "https://huggingface.co/mlc-ai/Qwen3.5-2B-q4f16_1-MLC/resolve/main/tensor-cache.json",
+      prebuiltAppConfig.model_list,
+    ),
+    "Qwen3.5-2B-q4f16_1-MLC",
+  );
+  assert.equal(
+    webLLMModelIdFromCacheUrl(
+      "https://huggingface.co/example/custom-agent-MLC/resolve/main/tensor-cache.json",
+      [],
+    ),
+    "custom-agent-MLC",
+  );
+});
 
 function localFile(
   name: string,

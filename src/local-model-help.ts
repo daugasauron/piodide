@@ -1,5 +1,6 @@
 export const LOCAL_MODEL_HELP: readonly string[] = [
   "Local models run entirely in this browser and do not require /login.",
+  "Run /model status first: it probes WebGPU/shader-f16, storage persistence, and every cached model the runtime can discover.",
   "For tool use, select an 8K or larger context; the full agent prompt and tool schemas do not fit in 4K.",
   "Qwen thinking is shown by default. Use /thinking off or /thinking high to change it.",
   "",
@@ -16,7 +17,8 @@ export const LOCAL_MODEL_HELP: readonly string[] = [
   "           /model                                (select Qwen3.5 2B and 8K+)",
   "  The model-library .wasm is optional; WebLLM fetches and caches it on first load.",
   "",
-  "GPU setup: fully quit Chrome, run npm run chrome:webgpu, then reopen Piodide.",
+  "Requirements: WebLLM needs WebGPU + shader-f16 + enough VRAM. Wllama can fall back to WASM only for GGUF files below 4 GiB.",
+  "GPU setup: fully quit Chrome, run npm run chrome:webgpu, then reopen Piodide. Loading shows download, shard, shader, backend, context, and elapsed-time progress.",
   "Use /model status to inspect cached models and /model unload to release RAM/VRAM without deleting them.",
   "More detail: docs/local-models.md",
 ];

@@ -6,7 +6,11 @@ import type {
   WebWorkerMLCEngine,
 } from "@mlc-ai/web-llm";
 
-import type { LocalModelStatus } from "./local-model.ts";
+import type {
+  LocalModelCacheEntry,
+  LocalModelCapabilities,
+  LocalModelStatus,
+} from "./local-model.ts";
 import {
   REPLACED_WEBLLM_MODEL_IDS,
   WEBLLM_MODELS,
@@ -29,6 +33,15 @@ interface WebLLMCacheEntry {
   url: string;
   file: WebLLMLocalFile;
   contentType: string;
+}
+
+interface WebLLMGpuAdapter {
+  features: { has(feature: string): boolean };
+  info?: {
+    description?: string;
+    vendor?: string;
+    architecture?: string;
+  };
 }
 
 export interface WebLLMLocalImportPlan {
@@ -103,6 +116,77 @@ class WebLLMRuntime {
       })),
     );
     return new Set(states.filter((state) => state.cached).map((state) => state.id));
+  }
+
+  async cachedModels(): Promise<readonly LocalModelCacheEntry[]> {
+    const module = await this.loadModule();
+    const cache = await caches.open("webllm/model");
+    const requests = await cache.keys();
+    const supported = new Map(WEBLLM_MODELS.map((model) => [model.id, model]));
+    const result: LocalModelCacheEntry[] = [];
+    const seen = new Set<string>();
+    for (const request of requests) {
+      if (!request.url.endsWith("/tensor-cache.json")) continue;
+      const id = webLLMModelIdFromCacheUrl(request.url, module.prebuiltAppConfig.model_list);
+      if (!id || seen.has(id)) continue;
+      seen.add(id);
+      const model = supported.get(id);
+      let bytes = model?.bytes;
+      if (bytes === undefined) {
+        try {
+          const response = await cache.match(request);
+          const manifest = response ? recordObject(await response.clone().json()) : {};
+          const metadata = recordObject(manifest.metadata);
+          if (typeof metadata.ParamBytes === "number" && metadata.ParamBytes > 0) {
+            bytes = metadata.ParamBytes;
+          }
+        } catch {
+          // A visible cache record is still useful when old metadata is unreadable.
+        }
+      }
+      result.push({
+        id,
+        label: model?.label ?? id,
+        bytes,
+        supported: Boolean(model),
+        source: "webllm",
+      });
+    }
+    return result.sort((left, right) => left.label.localeCompare(right.label));
+  }
+
+  async inspectCapabilities(): Promise<LocalModelCapabilities> {
+    const module = await this.loadModule();
+    const gpu = (navigator as Navigator & {
+      gpu?: { requestAdapter(): Promise<WebLLMGpuAdapter | null> };
+    }).gpu;
+    let adapter: WebLLMGpuAdapter | null = null;
+    try {
+      adapter = (await gpu?.requestAdapter()) ?? null;
+    } catch {
+      adapter = null;
+    }
+    const description = adapter?.info?.description?.trim();
+    const fallback = [adapter?.info?.vendor, adapter?.info?.architecture]
+      .filter(Boolean)
+      .join(" ")
+      .trim();
+    const [storageAvailableBytes, storagePersistent] = await Promise.all([
+      this.storageHeadroom(),
+      navigator.storage?.persisted
+        ? navigator.storage.persisted().catch(() => undefined)
+        : undefined,
+    ]);
+    return {
+      webGpu: adapter !== null,
+      shaderF16: adapter?.features.has("shader-f16") === true,
+      adapter: description || fallback || undefined,
+      wasmFallback: false,
+      crossOriginIsolated: globalThis.crossOriginIsolated === true,
+      storageAvailableBytes,
+      storagePersistent,
+      runtimeCatalogueSize: module.prebuiltAppConfig.model_list.length,
+    };
   }
 
   async storageHeadroom(): Promise<number | undefined> {
@@ -709,6 +793,23 @@ function findWebLLMModelRecord(modelId: string, appConfig: AppConfig): ModelReco
   const record = appConfig.model_list.find((candidate) => candidate.model_id === modelId);
   if (!record) throw new Error(`WebLLM has no prebuilt record for ${modelId}.`);
   return record;
+}
+
+export function webLLMModelIdFromCacheUrl(
+  url: string,
+  records: readonly ModelRecord[],
+): string | undefined {
+  for (const record of records) {
+    if (url.startsWith(cleanWebLLMModelUrl(record.model))) return record.model_id;
+  }
+  try {
+    const parts = new URL(url).pathname.split("/").filter(Boolean);
+    const resolveIndex = parts.indexOf("resolve");
+    if (resolveIndex >= 2) return decodeURIComponent(parts[resolveIndex - 1]);
+  } catch {
+    // Invalid legacy cache URLs remain ignored.
+  }
+  return undefined;
 }
 
 function cleanWebLLMModelUrl(value: string): string {

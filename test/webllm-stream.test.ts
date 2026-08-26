@@ -4,7 +4,9 @@ import { Type } from "typebox";
 
 import {
   createToolResponseFormat,
+  inspectPartialQwenOutput,
   parsePromptedToolCalls,
+  recoverWebLLMAnswer,
   splitQwenThinkingOutput,
   toWebLLMMessages,
 } from "../src/webllm-model-stream.ts";
@@ -76,6 +78,36 @@ test("WebLLM separates Qwen thinking from tool and answer content", () => {
   assert.deepEqual(
     splitQwenThinkingOutput("Reason about it.</think>\nAnswer", true),
     { thinking: "Reason about it.", content: "Answer" },
+  );
+});
+
+test("WebLLM streams only safe thinking and answer prefixes", () => {
+  assert.deepEqual(
+    inspectPartialQwenOutput("<think>Inspect the work", true),
+    { thinking: "Inspect the work", content: "", contentKind: "pending" },
+  );
+  assert.deepEqual(
+    inspectPartialQwenOutput("<think>Inspect</think><tool_", true),
+    { thinking: "Inspect", content: "<tool_", contentKind: "control" },
+  );
+  assert.deepEqual(
+    inspectPartialQwenOutput("<think>Inspect</think>Final answer", true),
+    { thinking: "Inspect", content: "Final answer", contentKind: "answer" },
+  );
+});
+
+test("WebLLM suppresses echoed tool-result envelopes and recovers appended answers", () => {
+  const result = "</file>\n1\t# heading\n";
+  assert.equal(
+    recoverWebLLMAnswer(
+      `<tool_result>${JSON.stringify({ tool_call_id: "call_1", content: `${result}\n# heading\n` })}</tool_result>`,
+      result,
+    ),
+    "# heading",
+  );
+  assert.equal(
+    recoverWebLLMAnswer('<tool_result>{"content":"opaque"}</tool_result>', result),
+    "",
   );
 });
 
@@ -192,6 +224,7 @@ test("WebLLM follow-up history uses supported roles and tagged tool results", ()
   assert.deepEqual(messages[3], {
     role: "user",
     content:
-      '<tool_result>{"tool_call_id":"call_read","content":"contents"}</tool_result>',
+      "[Tool result for call call_read]\ncontents\n[End tool result]\n" +
+      "Continue the original request. Do not quote or reproduce this result block.",
   });
 });

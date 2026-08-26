@@ -47,6 +47,10 @@ import {
 } from "./browser-models.ts";
 import { getLocalProviderBinding } from "./local-provider.ts";
 import type { LocalModelRuntime, LocalModelStatus } from "./local-model.ts";
+import {
+  formatLocalModelStatus,
+  localModelReadiness,
+} from "./local-model-ux.ts";
 import { LOCAL_MODEL_HELP } from "./local-model-help.ts";
 import { createRaylibDemoSource } from "./raylib-demo-source.ts";
 import { browserModelRuntime } from "./browser-model-runtime.ts";
@@ -287,6 +291,7 @@ const apiKeys = new Map<string, string>();
 let inputHandler: (data: string) => void = (data) => prompt.feed(data);
 let gitHubCredentials: GitHubCredentials | null = null;
 let modelOverride: string | null = null;
+let assistantTraceSection: "thinking" | "answer" | "tool" | null = null;
 const sessions = new BrowserSessions();
 
 /* ------------------------------------------------------------------ */
@@ -696,15 +701,14 @@ function formatTokenCount(value: number): string {
   return Math.round(value).toString();
 }
 
-function formatBrowserStatus(status: LocalModelStatus): string {
-  if (
-    (status.phase === "downloading" || status.phase === "importing") &&
-    status.loadedBytes !== undefined &&
-    status.totalBytes
-  ) {
-    return `${Math.min(100, Math.round((status.loadedBytes / status.totalBytes) * 100))}%`;
-  }
-  return status.phase;
+function formatBrowserStatus(
+  status: LocalModelStatus,
+  detail: "short" | "long" = "short",
+): string {
+  const label = status.modelId
+    ? currentLocalProvider()?.getModel(status.modelId)?.label
+    : undefined;
+  return formatLocalModelStatus(status, label, detail);
 }
 
 function onBrowserModelStatus(runtime: LocalModelRuntime, status: LocalModelStatus) {
@@ -719,9 +723,9 @@ function onBrowserModelStatus(runtime: LocalModelRuntime, status: LocalModelStat
       status.phase === "importing" ||
       status.phase === "loading")
   ) {
-    spinner.start(`local model · ${formatBrowserStatus(status)}`);
+    spinner.start(formatBrowserStatus(status, "long"));
   } else if (agent?.state.isStreaming && status.phase === "generating") {
-    spinner.start("thinking locally");
+    spinner.start(formatBrowserStatus(status, "long"));
   }
   renderFooter();
 }
@@ -1091,6 +1095,15 @@ async function confirmBrowserModelDownload(): Promise<boolean> {
   if (!localProvider) throw new Error("No local browser provider is active.");
   const model = localProvider.getModel(currentModelId());
   if (!model) throw new Error(`Unknown browser model: ${currentModelId()}`);
+  const capabilities = await localProvider.runtime.inspectCapabilities();
+  const readiness = localModelReadiness(
+    provider?.api === "browser-webllm" ? "webllm" : "wllama",
+    capabilities,
+    model.bytes,
+  );
+  if (!readiness.ready) {
+    throw new Error(`${readiness.summary}. ${readiness.requirements}`);
+  }
   if (await localProvider.runtime.isCached(model.id)) return true;
 
   const headroom = await localProvider.runtime.storageHeadroom();
@@ -1130,7 +1143,24 @@ async function activateProvider(next: ProviderDef) {
   say(cyan(`  ◇ provider: ${next.label}   model: ${currentModelId()}`));
   if (next.note) say(dim(`    ${next.note}`));
   if (next.auth === "none") {
-    say(green("  ◆ no login required · use /model to inspect local downloads"));
+    if (nextLocal) {
+      const capabilities = await nextLocal.runtime.inspectCapabilities();
+      const model = nextLocal.getModel(next.defaultModel);
+      const readiness = localModelReadiness(
+        next.api === "browser-webllm" ? "webllm" : "wllama",
+        capabilities,
+        model?.bytes,
+      );
+      say(
+        readiness.ready
+          ? green(`  ◆ local runtime ready · ${readiness.summary}`)
+          : yellow(`  ◇ local runtime needs setup · ${readiness.summary}`),
+      );
+      say(dim(`    ${readiness.requirements}`));
+      say(dim("    no login required · /model status shows hardware, storage, and cached models"));
+    } else {
+      say(green("  ◆ no login required"));
+    }
   } else if (!currentApiKey()) {
     say(yellow("  now run /login to set your API key"));
   }
@@ -1200,13 +1230,48 @@ async function selectBrowserContextSize(modelId: string): Promise<number | null>
 async function showBrowserModels(): Promise<void> {
   const localProvider = currentLocalProvider();
   if (!localProvider) throw new Error("No local browser provider is active.");
-  const cached = await localProvider.runtime.cachedModelIds();
+  const [inventory, capabilities] = await Promise.all([
+    localProvider.runtime.cachedModels(),
+    localProvider.runtime.inspectCapabilities(),
+  ]);
+  const cached = new Set(
+    inventory.filter((entry) => entry.supported).map((entry) => entry.id),
+  );
   const status = localProvider.runtime.status;
+  const activeModel = localProvider.getModel(currentModelId());
+  const readiness = localModelReadiness(
+    provider?.api === "browser-webllm" ? "webllm" : "wllama",
+    capabilities,
+    activeModel?.bytes,
+  );
+  const cachedBytes = inventory.reduce((total, entry) => total + (entry.bytes ?? 0), 0);
   say(
     `  runtime: ${formatBrowserStatus(status)}` +
-      `${status.backend ? ` · ${status.backend}` : ""}` +
-      `${status.contextSize ? ` · ${formatContextSize(status.contextSize)} context` : ""}`,
+      `${status.threads ? ` · ${status.threads} threads` : ""}`,
   );
+  say(
+    readiness.ready
+      ? green(`  hardware: ready · ${readiness.summary}`)
+      : yellow(`  hardware: setup required · ${readiness.summary}`),
+  );
+  say(dim(`    ${readiness.requirements}`));
+  say(
+    `  storage: ${
+      inventory.length
+        ? `${inventory.length} cached · ${formatModelBytes(cachedBytes)}`
+        : "no cached models"
+    }${
+      capabilities.storageAvailableBytes !== undefined
+        ? ` · ${formatModelBytes(capabilities.storageAvailableBytes)} available`
+        : ""
+    } · ${capabilities.storagePersistent ? "persistent" : "may be evicted"}`,
+  );
+  if (capabilities.runtimeCatalogueSize !== undefined) {
+    say(
+      `  discovery: ${capabilities.runtimeCatalogueSize} models from the installed WebLLM runtime` +
+        ` · ${localProvider.models.length} agent-ready`,
+    );
+  }
   for (const model of localProvider.models) {
     const active = model.id === currentModelId() ? cyan("active") : "";
     const details = localProvider.describeModel(model, cached.has(model.id));
@@ -1220,6 +1285,16 @@ async function showBrowserModels(): Promise<void> {
         `    ${[active, details, context, model.license].filter(Boolean).join(" · ")}`,
       ),
     );
+  }
+  const unsupported = inventory.filter((entry) => !entry.supported);
+  if (unsupported.length > 0) {
+    say(magenta("  cached models discovered outside the agent-ready catalogue:"));
+    for (const entry of unsupported) {
+      say(
+        `    ${entry.label}${entry.bytes ? ` · ${formatModelBytes(entry.bytes)}` : ""}` +
+          " · kept in browser storage but not selectable",
+      );
+    }
   }
 }
 
@@ -1347,11 +1422,7 @@ function showStatus() {
     ...(provider?.transport === "browser"
       ? [
           `  runtime: ${formatBrowserStatus(browserStatus)}${
-            browserStatus.backend ? ` · ${browserStatus.backend}` : ""
-          }${browserStatus.threads ? ` · ${browserStatus.threads} threads` : ""}${
-            browserStatus.contextSize
-              ? ` · ${formatContextSize(browserStatus.contextSize)} context`
-              : ""
+            browserStatus.threads ? ` · ${browserStatus.threads} threads` : ""
           }`,
         ]
       : []),
@@ -2095,7 +2166,7 @@ function printSlopCall(args: unknown) {
   const cwd = typeof values.cwd === "string" ? values.cwd : "/home/web";
   const valueWidth = Math.max(32, writer.cols - 15);
 
-  writer.writeln(`  ${magenta("⏺ slop")}`);
+  writer.writeln(`${magenta("  ◇ tool")} slop`);
   writer.writeln(`    ${dim("cwd  ")} ${exactStringPreview(cwd, valueWidth)}`);
   writer.writeln(`    ${dim("input")} ${slopCommandPreview(command, valueWidth)}`);
 }
@@ -2193,17 +2264,28 @@ function printCapped(text: string, maxLines: number) {
   for (const line of lines) writer.writeln(dim(`    ${line}`));
 }
 
+function beginAssistantTraceSection(section: "thinking" | "answer" | "tool") {
+  if (assistantTraceSection === section) return;
+  markdown.finish();
+  writer.ensureNewline();
+  if (section === "thinking") writer.writeln(magenta("  ◇ thinking"));
+  else if (section === "answer") writer.writeln(green("  ◆ answer"));
+  assistantTraceSection = section;
+}
+
 async function renderEvent(event: AgentEvent) {
   switch (event.type) {
     case "agent_start":
       prompt.setBusy(true);
       markdown.reset();
+      assistantTraceSection = null;
       spinner.start();
       break;
 
     case "message_start":
       if (event.message.role === "assistant") spinner.stop();
       markdown.reset();
+      if (event.message.role === "assistant") assistantTraceSection = null;
       break;
 
     case "message_end": {
@@ -2223,18 +2305,26 @@ async function renderEvent(event: AgentEvent) {
     case "message_update": {
       spinner.stop();
       const e = event.assistantMessageEvent;
-      if (e.type === "text_delta") markdown.push("text", e.delta);
-      else if (e.type === "thinking_delta") markdown.push("thinking", e.delta);
+      if (e.type === "text_delta") {
+        beginAssistantTraceSection("answer");
+        markdown.push("text", e.delta);
+      } else if (e.type === "thinking_delta") {
+        beginAssistantTraceSection("thinking");
+        markdown.push("thinking", e.delta);
+      }
       break;
     }
 
     case "tool_execution_start": {
       spinner.stop();
+      beginAssistantTraceSection("tool");
       writer.ensureNewline();
       if (event.toolName === "slop") {
         printSlopCall(event.args);
       } else {
-        writer.writeln(dim(`  ⏺ ${toolCallLabel(event.toolName, event.args)}`));
+        writer.writeln(
+          `${magenta("  ◇ tool")} ${toolCallLabel(event.toolName, event.args)}`,
+        );
       }
       if (event.toolName === "python") {
         const code = pythonSource(event.args);
@@ -2304,7 +2394,7 @@ async function renderEvent(event: AgentEvent) {
         if (event.toolName === "slop") {
           writer.writeln((d.exitCode ?? 1) === 0 ? green(footer) : red(footer));
         } else {
-          writer.writeln(dim(footer));
+          writer.writeln(green(footer));
         }
         for (const image of images) {
           try {

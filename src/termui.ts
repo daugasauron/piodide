@@ -12,6 +12,7 @@ const RESET = "\x1b[0m";
 const BOLD = "\x1b[1m";
 const DIM = "\x1b[2m";
 const CYAN = "\x1b[36m";
+const MAGENTA = "\x1b[35m";
 const GREEN = "\x1b[32m";
 const SPINNER_FRAMES = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 let terminalInitPromise: Promise<void> | null = null;
@@ -339,6 +340,7 @@ export async function createTerminal(mount: HTMLElement): Promise<TerminalHandle
 export class Spinner {
   private frame = 0;
   private label = "";
+  private startedAt = 0;
   private timer: number | null = null;
   private readonly writer: TermWriter;
 
@@ -349,6 +351,7 @@ export class Spinner {
   start(label = "thinking") {
     this.label = label;
     if (this.timer !== null) return;
+    this.startedAt = performance.now();
     this.writer.ensureNewline();
     this.render();
     this.timer = window.setInterval(() => {
@@ -361,12 +364,21 @@ export class Spinner {
     if (this.timer === null) return;
     window.clearInterval(this.timer);
     this.timer = null;
+    this.startedAt = 0;
     this.writer.replaceCurrentLine("");
   }
 
   private render() {
     const glyph = SPINNER_FRAMES[this.frame % SPINNER_FRAMES.length];
-    this.writer.replaceCurrentLine(`${CYAN}${glyph}${RESET} ${DIM}${this.label}${RESET}`);
+    const elapsedSeconds = Math.max(0, (performance.now() - this.startedAt) / 1000);
+    const elapsed = elapsedSeconds >= 1
+      ? ` · ${elapsedSeconds < 10 ? elapsedSeconds.toFixed(1) : Math.round(elapsedSeconds)}s`
+      : "";
+    const labelWidth = Math.max(8, this.writer.cols - stringWidth(`⠋  ${elapsed}`) - 1);
+    const label = truncateCells(this.label, labelWidth);
+    this.writer.replaceCurrentLine(
+      `${MAGENTA}${glyph}${RESET} ${DIM}${label}${elapsed}${RESET}`,
+    );
   }
 }
 

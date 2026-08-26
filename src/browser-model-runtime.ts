@@ -5,7 +5,11 @@ import type {
 import type { Wllama } from "@wllama/wllama/esm/wllama.js";
 
 import { BROWSER_MODELS, getBrowserModel } from "./browser-models.ts";
-import type { LocalModelStatus } from "./local-model.ts";
+import type {
+  LocalModelCacheEntry,
+  LocalModelCapabilities,
+  LocalModelStatus,
+} from "./local-model.ts";
 
 type WllamaModule = typeof import("@wllama/wllama/esm/index.js");
 type WllamaCacheManager = InstanceType<WllamaModule["CacheManager"]>;
@@ -41,13 +45,21 @@ interface WebGpuFeatureSet {
 
 interface NavigatorWithWebGpu {
   gpu?: {
-    requestAdapter(): Promise<{ features: WebGpuFeatureSet } | null>;
+    requestAdapter(): Promise<{
+      features: WebGpuFeatureSet;
+      info?: {
+        description?: string;
+        vendor?: string;
+        architecture?: string;
+      };
+    } | null>;
   };
 }
 
 interface WllamaWebGpuSupport {
   webGpu: boolean;
   shaderF16: boolean;
+  adapter?: string;
 }
 
 interface WllamaResultChunk {
@@ -324,6 +336,46 @@ class BrowserModelRuntime {
         .filter((model) => completeUrls.has(model.sourceUrl))
         .map((model) => model.id),
     );
+  }
+
+  async cachedModels(): Promise<readonly LocalModelCacheEntry[]> {
+    const entries = await (await this.getCacheManager()).list();
+    const byUrl = new Map(BROWSER_MODELS.map((model) => [model.sourceUrl, model]));
+    const seen = new Set<string>();
+    const result: LocalModelCacheEntry[] = [];
+    for (const entry of entries) {
+      const url = entry.metadata?.originalURL;
+      if (!url || seen.has(url) || entry.size <= 0) continue;
+      seen.add(url);
+      const model = byUrl.get(url);
+      const complete = entry.size === entry.metadata.originalSize;
+      result.push({
+        id: model?.id ?? cachedWllamaLabel(url),
+        label: model?.label ?? cachedWllamaLabel(url),
+        bytes: entry.size,
+        supported: Boolean(model && complete),
+        source: "wllama",
+      });
+    }
+    return result.sort((left, right) => left.label.localeCompare(right.label));
+  }
+
+  async inspectCapabilities(): Promise<LocalModelCapabilities> {
+    const [gpu, storageAvailableBytes, storagePersistent] = await Promise.all([
+      probeWllamaWebGpu(),
+      this.storageHeadroom(),
+      navigator.storage?.persisted?.().catch(() => undefined),
+    ]);
+    return {
+      webGpu: gpu.webGpu,
+      shaderF16: gpu.shaderF16,
+      adapter: gpu.adapter,
+      wasmFallback: true,
+      threads: Math.max(1, navigator.hardwareConcurrency || 1),
+      crossOriginIsolated: globalThis.crossOriginIsolated === true,
+      storageAvailableBytes,
+      storagePersistent,
+    };
   }
 
   async storageHeadroom(): Promise<number | undefined> {
@@ -974,9 +1026,27 @@ async function probeWllamaWebGpu(): Promise<WllamaWebGpuSupport> {
     return {
       webGpu: adapter !== null,
       shaderF16: hasWllamaWebGpuFeatures(adapter?.features),
+      adapter: adapter ? webGpuAdapterLabel(adapter.info) : undefined,
     };
   } catch {
     return { webGpu: true, shaderF16: false };
+  }
+}
+
+function webGpuAdapterLabel(
+  info: { description?: string; vendor?: string; architecture?: string } | undefined,
+): string | undefined {
+  const description = info?.description?.trim();
+  if (description) return description;
+  const fallback = [info?.vendor, info?.architecture].filter(Boolean).join(" ").trim();
+  return fallback || undefined;
+}
+
+function cachedWllamaLabel(url: string): string {
+  try {
+    return decodeURIComponent(new URL(url).pathname.split("/").pop() || url);
+  } catch {
+    return url;
   }
 }
 
