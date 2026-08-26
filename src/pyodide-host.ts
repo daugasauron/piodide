@@ -57,8 +57,14 @@ export interface Pyodide {
   loadPackage(names: string | string[]): Promise<unknown>;
   registerJsModule(name: string, module: Record<string, unknown>): void;
   FS: PyodideFS;
-  setStdout(opts: { batched?: (s: string) => void }): void;
-  setStderr(opts: { batched?: (s: string) => void }): void;
+  setStdout(opts: {
+    batched?: (s: string) => void;
+    write?: (buffer: Uint8Array) => number;
+  }): void;
+  setStderr(opts: {
+    batched?: (s: string) => void;
+    write?: (buffer: Uint8Array) => number;
+  }): void;
   version: string;
   /** Emscripten runtime internals used only for lightweight heap telemetry. */
   _module?: {
@@ -72,15 +78,27 @@ let pyodidePromise: Promise<Pyodide> | null = null;
 
 /** Per-call capture target for stdout/stderr. Set right before runPythonAsync. */
 let activeCapture: {
-  stdout: (s: string) => void;
-  stderr: (s: string) => void;
+  stdout: (chunk: Uint8Array) => void;
+  stderr: (chunk: Uint8Array) => void;
 } | null = null;
 
 /** Route Pyodide's process-wide stdout/stderr callbacks to the active call. */
 export function attachPythonStreamCapture(py: Pyodide): void {
-  // Pyodide's batched callbacks contain one logical line without its newline.
-  py.setStdout({ batched: (s: string) => activeCapture?.stdout(`${s}\n`) });
-  py.setStderr({ batched: (s: string) => activeCapture?.stderr(`${s}\n`) });
+  // Writer callbacks preserve exact bytes. Pyodide's line-batched callbacks
+  // treat NUL as a C-string terminator and retain unterminated suffixes until
+  // a later write, which can corrupt redirects and cross invocation boundaries.
+  py.setStdout({
+    write: (buffer: Uint8Array) => {
+      activeCapture?.stdout(buffer.slice());
+      return buffer.byteLength;
+    },
+  });
+  py.setStderr({
+    write: (buffer: Uint8Array) => {
+      activeCapture?.stderr(buffer.slice());
+      return buffer.byteLength;
+    },
+  });
 }
 
 /** Load the pyodide.js bootstrap script from the CDN (once). */
@@ -183,23 +201,36 @@ export async function runPythonCapture(
   onChunk?: (s: string) => void,
 ): Promise<RunResult> {
   const chunks: string[] = [];
+  const stdoutDecoder = new TextDecoder();
+  const stderrDecoder = new TextDecoder();
+  const emit = (decoder: TextDecoder, bytes: Uint8Array) => {
+    const text = decoder.decode(bytes, { stream: true });
+    if (text) {
+      chunks.push(text);
+      onChunk?.(text);
+    }
+  };
   await runPythonWithStreams(py, code, {
-    stdout: (s) => {
-      chunks.push(s);
-      onChunk?.(s);
-    },
-    stderr: (s) => {
-      chunks.push(s);
-      onChunk?.(s);
-    },
+    stdout: (bytes) => emit(stdoutDecoder, bytes),
+    stderr: (bytes) => emit(stderrDecoder, bytes),
   });
+  for (const decoder of [stdoutDecoder, stderrDecoder]) {
+    const tail = decoder.decode();
+    if (tail) {
+      chunks.push(tail);
+      onChunk?.(tail);
+    }
+  }
   return { output: chunks.join("") };
 }
 
 export async function runPythonWithStreams(
   py: Pyodide,
   code: string,
-  streams: { stdout: (s: string) => void; stderr: (s: string) => void },
+  streams: {
+    stdout: (chunk: Uint8Array) => void;
+    stderr: (chunk: Uint8Array) => void;
+  },
 ): Promise<unknown> {
   const prev = activeCapture;
   activeCapture = streams;

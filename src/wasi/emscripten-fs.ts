@@ -75,6 +75,51 @@ const S_IFDIR = 0o040000;
 const S_IFCHR = 0o020000;
 const S_IFIFO = 0o010000;
 
+// Pyodide 0.27's MEMFS canonicalizes relative symlink targets internally.
+// Preserve the text supplied through WASI so readlink(2) can still return the
+// POSIX payload. Keying by inode keeps the metadata valid across renames and
+// across the short-lived EmscriptenFs adapters used by nested workers.
+const rawSymlinkTargets = new WeakMap<EmscriptenLikeFs, Map<string, string>>();
+
+function symlinkKey(stat: EmscriptenStat): string {
+  return `${stat.dev}:${stat.ino}`;
+}
+
+function symlinkTargets(fs: EmscriptenLikeFs): Map<string, string> {
+  let targets = rawSymlinkTargets.get(fs);
+  if (!targets) {
+    targets = new Map();
+    rawSymlinkTargets.set(fs, targets);
+  }
+  return targets;
+}
+
+/** Preserve the exact POSIX payload when MEMFS canonicalizes a symlink. */
+export function preserveEmscriptenSymlinkTarget(
+  fs: EmscriptenLikeFs,
+  path: string,
+  target: string,
+): void {
+  symlinkTargets(fs).set(symlinkKey(fs.lstat(path)), target);
+}
+
+/** Return an exact payload previously registered for a MEMFS symlink. */
+export function preservedEmscriptenSymlinkTarget(
+  fs: EmscriptenLikeFs,
+  path: string,
+): string | undefined {
+  return symlinkTargets(fs).get(symlinkKey(fs.lstat(path)));
+}
+
+/** Drop exact-payload metadata before unlinking a MEMFS path. */
+export function forgetEmscriptenSymlinkTarget(fs: EmscriptenLikeFs, path: string): void {
+  try {
+    symlinkTargets(fs).delete(symlinkKey(fs.lstat(path)));
+  } catch {
+    // Missing paths have no metadata to forget.
+  }
+}
+
 /**
  * Convert a thrown Emscripten FS.ErrnoError into a WasiError. Modern
  * Emscripten (Pyodide ≥ 0.26) numbers its FS errors with WASI errno codes
@@ -307,6 +352,7 @@ export class EmscriptenFs implements WasiFs {
 
   unlink(path: string): void {
     try {
+      forgetEmscriptenSymlinkTarget(this.fs, path);
       this.fs.unlink(path);
     } catch (error) {
       rethrowAsWasiError(error, `unlink ${path}`);
@@ -315,7 +361,15 @@ export class EmscriptenFs implements WasiFs {
 
   rename(from: string, to: string): void {
     try {
+      const sourceKey = symlinkKey(this.fs.lstat(from));
+      let replacedKey: string | null = null;
+      try {
+        replacedKey = symlinkKey(this.fs.lstat(to));
+      } catch {
+        // A missing destination is the normal rename case.
+      }
       this.fs.rename(from, to);
+      if (replacedKey && replacedKey !== sourceKey) symlinkTargets(this.fs).delete(replacedKey);
     } catch (error) {
       rethrowAsWasiError(error, `rename ${from}`);
     }
@@ -333,6 +387,7 @@ export class EmscriptenFs implements WasiFs {
   symlink(target: string, path: string): void {
     try {
       this.fs.symlink(target, path);
+      preserveEmscriptenSymlinkTarget(this.fs, path, target);
     } catch (error) {
       rethrowAsWasiError(error, `symlink ${path}`);
     }
@@ -340,7 +395,8 @@ export class EmscriptenFs implements WasiFs {
 
   readlink(path: string): string {
     try {
-      return this.fs.readlink(path);
+      const preserved = preservedEmscriptenSymlinkTarget(this.fs, path);
+      return preserved ?? this.fs.readlink(path);
     } catch (error) {
       rethrowAsWasiError(error, `readlink ${path}`);
     }

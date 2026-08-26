@@ -10,12 +10,14 @@
 #include <stdlib.h>
 #include <string.h>
 
-#define ARG_BYTES (64 * 1024)
+#define ARG_BYTES (1024 * 1024)
 #define ENV_BYTES (64 * 1024)
 #define STDIN_BYTES (1024 * 1024)
 #define OUTPUT_BYTES (1024 * 1024)
+#define LS_FILES_OUTPUT_BYTES (16 * 1024 * 1024)
 #define PATH_BYTES 4096
 
+/* Spawn ABI v7, implemented by the browser host. */
 typedef struct {
   const char *stdin_data;
   int stdin_len;
@@ -29,11 +31,26 @@ typedef struct {
   const char *err_file;
   int err_append;
   int err_to_out;
+  int out_to_err;
+  int err_to_inherited_out;
+  int out_to_inherited_err;
+  int argc;
 } slop_io;
 
 extern int piodide_spawn(const char *path, const char *argv_blob, const char *cwd,
                          slop_io *io);
 extern char **environ;
+
+static int output_limit_for_command(int argc, char **argv) {
+  int index = 1;
+  while (index < argc && (!strcmp(argv[index], "-C") || !strcmp(argv[index], "-c"))) {
+    if (index + 1 >= argc) return OUTPUT_BYTES;
+    index += 2;
+  }
+  return index < argc && !strcmp(argv[index], "ls-files")
+    ? LS_FILES_OUTPUT_BYTES
+    : OUTPUT_BYTES;
+}
 
 int main(int argc, char **argv) {
   char cwd[PATH_BYTES];
@@ -44,10 +61,11 @@ int main(int argc, char **argv) {
     return 1;
   }
 
+  int output_limit = output_limit_for_command(argc, argv);
   char *arguments = malloc(ARG_BYTES);
   char *environment = malloc(ENV_BYTES);
   char *input = NULL;
-  char *output = malloc(OUTPUT_BYTES);
+  char *output = malloc((size_t)output_limit);
   if (!arguments || !environment || !output) {
     fprintf(stderr, "git: out of memory\n");
     free(arguments);
@@ -110,16 +128,18 @@ int main(int argc, char **argv) {
   slop_io io;
   memset(&io, 0, sizeof io);
   io.capture = output;
-  io.capture_cap = OUTPUT_BYTES;
+  io.capture_cap = output_limit;
   io.capture_len = &captured;
   io.env_data = environment;
   io.env_len = (int)env_used;
   io.stdin_data = input;
   io.stdin_len = (int)input_used;
+  /* The explicit count preserves empty arguments in the NUL-separated blob. */
+  io.argc = argc;
   int result = piodide_spawn(engine, arguments, cwd, &io);
-  if (captured > OUTPUT_BYTES) {
+  if (captured > output_limit) {
     fprintf(stderr, "git: output exceeds %d bytes; narrow the command or write smaller output\n",
-            OUTPUT_BYTES);
+            output_limit);
     result = 23;
     captured = 0;
   }

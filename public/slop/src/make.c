@@ -16,6 +16,7 @@
 #include <errno.h>
 #include <glob.h>
 #include <stdarg.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -71,10 +72,15 @@ typedef struct {
 } Rule;
 
 typedef struct {
+  int64_t seconds;
+  long nanoseconds;
+} FileTime;
+
+typedef struct {
   char *name;
   int state;                 /* 0 unseen, 1 visiting, 2 done */
   int updated, failed;
-  time_t mtime;
+  FileTime mtime;
 } Node;
 
 typedef struct {
@@ -153,11 +159,20 @@ static char *trim(char *s) {
   return s;
 }
 
-static int file_mtime(const char *path, time_t *out) {
+static int file_mtime(const char *path, FileTime *out) {
   struct stat st;
   if (stat(path, &st) != 0) return 0;
-  *out = st.st_mtime;
+  out->seconds = (int64_t)st.st_mtim.tv_sec;
+  out->nanoseconds = st.st_mtim.tv_nsec;
   return 1;
+}
+
+static int file_time_compare(FileTime left, FileTime right) {
+  if (left.seconds < right.seconds) return -1;
+  if (left.seconds > right.seconds) return 1;
+  if (left.nanoseconds < right.nanoseconds) return -1;
+  if (left.nanoseconds > right.nanoseconds) return 1;
+  return 0;
 }
 
 static Var *find_var(const char *name) {
@@ -809,11 +824,13 @@ static int expand_dependencies(Rule *r, const char *stem, Dep *deps, int max) {
   return out;
 }
 
-static char *join_deps(Dep *deps, int n, int newer_only, time_t target_time) {
+static char *join_deps(Dep *deps, int n, int newer_only, FileTime target_time) {
   Buf b; binit(&b); int first = 1;
   for (int i = 0; i < n; i++) {
-    time_t mt = 0;
-    if (newer_only && (!file_mtime(deps[i].name, &mt) || mt <= target_time)) continue;
+    if (newer_only && deps[i].order_only) continue;
+    FileTime mt = {0};
+    if (newer_only && (!file_mtime(deps[i].name, &mt) ||
+                       file_time_compare(mt, target_time) < 0)) continue;
     int duplicate = 0;
     char **old; int no;
     split_words(b.s, &old, &no);
@@ -914,7 +931,7 @@ static int build(const char *target) {
   char *stem = NULL;
   if (!r) r = find_pattern(target, &stem);
   int phony = is_phony(target);
-  time_t before = 0;
+  FileTime before = {0};
   int exists = file_mtime(target, &before);
   if (!r && !exists && !phony) {
     fprintf(stderr, "%s: *** No rule to make target '%s'.  Stop.\n", program, target);
@@ -928,8 +945,9 @@ static int build(const char *target) {
     int changed = build(deps[i].name);
     if (changed < 0) dep_failed = 1;
     else if (!deps[i].order_only && changed) need = 1;
-    time_t mt;
-    if (!deps[i].order_only && file_mtime(deps[i].name, &mt) && (!exists || mt > before)) need = 1;
+    FileTime mt;
+    if (!deps[i].order_only && file_mtime(deps[i].name, &mt) &&
+        (!exists || file_time_compare(mt, before) >= 0)) need = 1;
     if (dep_failed && !opt_keep) break;
   }
   if (dep_failed) {
@@ -944,19 +962,32 @@ static int build(const char *target) {
   }
   else if (need && opt_touch && !phony) {
     if (!opt_silent) printf("touch %s\n", target);
-    FILE *tf = fopen(target, "a");
-    if (!tf) { fprintf(stderr, "%s: cannot touch '%s': %s\n", program, target, strerror(errno)); node->failed = 1; }
-    else {
+    FILE *tf = fopen(target, "r+b");
+    if (!tf && errno == ENOENT) tf = fopen(target, "w+b");
+    int touch_failed = tf == NULL;
+    int touch_errno = errno;
+    if (!touch_failed) {
       struct stat st;
-      if (fstat(fileno(tf), &st) == 0) {
+      if (fstat(fileno(tf), &st)) { touch_failed = 1; touch_errno = errno; }
+      else {
         if (st.st_size > 0) {
-          int c; rewind(tf); c = fgetc(tf); rewind(tf);
-          if (c != EOF) { fputc(c, tf); fflush(tf); }
+          int c = fgetc(tf);
+          if (c == EOF || fseek(tf, 0, SEEK_SET) || fputc(c, tf) == EOF || fflush(tf)) {
+            touch_failed = 1; touch_errno = errno ? errno : EIO;
+          }
         } else {
-          fputc(0, tf); fflush(tf); ftruncate(fileno(tf), 0);
+          if (fputc(0, tf) == EOF || fflush(tf) || ftruncate(fileno(tf), 0)) {
+            touch_failed = 1; touch_errno = errno ? errno : EIO;
+          }
         }
       }
-      fclose(tf); node->updated = 1;
+      if (fclose(tf) && !touch_failed) { touch_failed = 1; touch_errno = errno; }
+    }
+    if (touch_failed) {
+      fprintf(stderr, "%s: cannot touch '%s': %s\n", program, target, strerror(touch_errno));
+      node->failed = 1; errors++;
+    } else {
+      node->updated = 1;
     }
   } else if (need && r && r->ncmd) {
     char *all = join_deps(deps, nd, 0, before);
@@ -1068,7 +1099,8 @@ static void usage(void) {
          "  -B       always build           -q       question mode\n"
          "  -t       touch targets          -k       keep going\n"
          "  -r       no built-in rules      -p       print database\n"
-         "  -j[N]    accepted; builds remain serial in the browser\n");
+         "  -j[N]    accepted; builds remain serial in the browser\n"
+         "Freshness: full filesystem subsecond mtimes; equal normal prerequisites are stale\n");
 }
 
 int main(int argc, char **argv) {

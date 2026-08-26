@@ -1,4 +1,4 @@
-"""Replace the linked piodide_spawn placeholder with the piodide.spawn_v3 wasm import.
+"""Replace the linked piodide_spawn placeholder with the current piodide.spawn import.
 
 The bounded linker intentionally rejects unresolved non-WASI symbols.  We link
 with one tiny placeholder, export it so its index is unambiguous, then use this
@@ -130,7 +130,13 @@ def parse_sections(module):
 
 
 def patch(src, dst):
-    import_name = "spawn_v4" if Path(src).name.startswith("slop.") else "spawn_v3"
+    source_name = Path(src).name
+    if source_name.startswith("env."):
+        import_name = "spawn_v8"
+    elif source_name.startswith(("slop.", "git.")):
+        import_name = "spawn_v7"
+    else:
+        import_name = "spawn_v3"
     sections = parse_sections(Path(src).read_bytes())
     import_funcs = 0
     stub_index = stub_type = stub_position = None

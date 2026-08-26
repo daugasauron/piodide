@@ -46,10 +46,17 @@ function createSpawnImport(
   fs: RpcFsClient,
   withEnvironment: boolean,
   withStderr: boolean,
+  withStdoutToStderr: boolean,
+  withOrderedDuplication: boolean,
+  withArgumentCount = false,
+  exactEnvironment = false,
 ) {
   return (pathPtr: number, argvPtr: number, cwdPtr: number, ioPtr: number): number => {
     const path = host.readCString(pathPtr);
-    const args = host.readCStringArray(argvPtr);
+    const argumentCount = withArgumentCount && ioPtr !== 0
+      ? host.readUint32(ioPtr + 60)
+      : undefined;
+    const args = host.readCStringArray(argvPtr, argumentCount);
     const cwd = host.readCString(cwdPtr);
 
     let stdinText: Uint8Array | undefined;
@@ -59,6 +66,9 @@ function createSpawnImport(
     let errFile: string | undefined;
     let errAppend = false;
     let stderrToStdout = false;
+    let stdoutToStderr = false;
+    let stderrToInheritedStdout = false;
+    let stdoutToInheritedStderr = false;
     let capturePtr = 0;
     let captureCap = 0;
     let captureLenPtr = 0;
@@ -86,11 +96,19 @@ function createSpawnImport(
         stderrToStdout = host.readUint32(ioPtr + 44) !== 0;
         if (errFilePtr !== 0) errFile = host.readCString(errFilePtr);
       }
+      if (withStdoutToStderr) {
+        stdoutToStderr = host.readUint32(ioPtr + 48) !== 0;
+      }
+      if (withOrderedDuplication) {
+        stderrToInheritedStdout = host.readUint32(ioPtr + 52) !== 0;
+        stdoutToInheritedStderr = host.readUint32(ioPtr + 56) !== 0;
+      }
     }
 
     const result = fs.spawnRpc({
       path, args, cwd, stdinText, capture, outFile, append,
-      errFile, errAppend, stderrToStdout, env,
+      errFile, errAppend, stderrToStdout, stdoutToStderr,
+      stderrToInheritedStdout, stdoutToInheritedStderr, env, exactEnvironment,
     });
     if (capture && result.stdout) {
       const copied = Math.min(captureCap, result.stdout.byteLength);
@@ -124,9 +142,17 @@ export function startWasiWorker(port: WorkerPort): void {
                 piodide: {
                   // v2 remains available to older shell binaries. v3 appends
                   // a NUL-separated exported-environment blob to slop_io.
-                  spawn: createSpawnImport(host, fs, false, false),
-                  spawn_v3: createSpawnImport(host, fs, true, false),
-                  spawn_v4: createSpawnImport(host, fs, true, true),
+                  spawn: createSpawnImport(host, fs, false, false, false, false),
+                  spawn_v3: createSpawnImport(host, fs, true, false, false, false),
+                  spawn_v4: createSpawnImport(host, fs, true, true, false, false),
+                  spawn_v5: createSpawnImport(host, fs, true, true, true, false),
+                  spawn_v6: createSpawnImport(host, fs, true, true, true, true),
+                  // v7 adds an argv count so empty arguments are data, not the
+                  // legacy NUL-list terminator.
+                  spawn_v7: createSpawnImport(host, fs, true, true, true, true, true),
+                  // v8 keeps v7's counted argv and marks the supplied
+                  // environment exact, including the empty environment.
+                  spawn_v8: createSpawnImport(host, fs, true, true, true, true, true, true),
                 },
               })
             : undefined,

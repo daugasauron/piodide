@@ -8,7 +8,7 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import { MemoryFs } from "../src/wasi/memory-fs.ts";
 import { EmscriptenFs, type EmscriptenLikeFs, type EmscriptenStat } from "../src/wasi/emscripten-fs.ts";
-import { FILETYPE, WasiError, type WasiStat } from "../src/wasi/abi.ts";
+import { ERRNO, FILETYPE, WasiError, resolvePath, type WasiStat } from "../src/wasi/abi.ts";
 import { executeWasi } from "../src/wasi/runner.ts";
 import { fixtureBinary } from "./helpers.ts";
 
@@ -179,7 +179,8 @@ class MockEmscriptenFs implements EmscriptenLikeFs {
   }
   symlink(target: string, path: string): void {
     try {
-      this.mem.symlink(target, path);
+      const parent = path.slice(0, path.lastIndexOf("/")) || "/";
+      this.mem.symlink(target.startsWith("/") ? target : resolvePath(parent, target), path);
     } catch (error) {
       toEmscriptenError(error);
     }
@@ -264,6 +265,7 @@ test("emscripten bridge: guest writes land in the underlying fs", async () => {
   assert.equal(run.exitCode, 0);
   // The full fops suite must succeed through the Emscripten-shaped adapter.
   assert.match(run.stdout, /link: ok\n/);
+  assert.match(run.stdout, /target: moved\.bin\n/);
   assert.match(run.stdout, /nlink: 2\n/);
   assert.match(run.stdout, /rmdir: ok\n/);
   assert.match(run.stdout, /rmdir-missing: No such file or directory/);
@@ -274,6 +276,48 @@ test("emscripten bridge: guest writes land in the underlying fs", async () => {
     )
     .filter((line) => !line.startsWith("rmdir-missing"));
   assert.deepEqual(failures, [], run.stdout);
+});
+
+test("emscripten bridge: preserves relative symlink text across adapters and renames", () => {
+  const mock = new MockEmscriptenFs();
+  mock.writeFile("/home/web/target", "value\n");
+  const first = new EmscriptenFs(mock);
+  first.symlink("target", "/home/web/link");
+  assert.equal(mock.readlink("/home/web/link"), "/home/web/target");
+
+  const second = new EmscriptenFs(mock);
+  assert.equal(second.readlink("/home/web/link"), "target");
+  first.rename("/home/web/link", "/home/web/renamed-link");
+  assert.equal(second.readlink("/home/web/renamed-link"), "target");
+
+  first.symlink("/home/web/target", "/home/web/absolute-link");
+  assert.equal(second.readlink("/home/web/absolute-link"), "/home/web/target");
+  second.unlink("/home/web/renamed-link");
+  assert.equal(mock.analyzePath("/home/web/renamed-link").exists, false);
+});
+
+test("emscripten bridge: open can reject a final symlink without following it", () => {
+  const mock = new MockEmscriptenFs();
+  mock.writeFile("/home/web/target", "value\n");
+  const fs = new EmscriptenFs(mock);
+  fs.symlink("target", "/home/web/link");
+  const options = {
+    read: true,
+    write: false,
+    create: false,
+    createExcl: false,
+    truncate: false,
+    append: false,
+    directory: false,
+    followSymlinks: false,
+  };
+  assert.throws(
+    () => fs.open("/home/web/link", options, 0o644),
+    (error: unknown) => error instanceof WasiError && error.errno === ERRNO.LOOP,
+  );
+  const handle = fs.open("/home/web/link", { ...options, followSymlinks: true }, 0o644);
+  assert.equal(new TextDecoder().decode(fs.read(handle, 0n, 64)), "value\n");
+  fs.close(handle);
 });
 
 test("emscripten bridge: missing file maps Emscripten errno to WASI ENOENT", async () => {

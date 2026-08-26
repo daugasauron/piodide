@@ -5,6 +5,10 @@ import {
   fsReadText,
   fsWriteText,
 } from "./pyodide-host.ts";
+import {
+  forgetEmscriptenSymlinkTarget,
+  preserveEmscriptenSymlinkTarget,
+} from "./wasi/emscripten-fs.ts";
 
 const MAX_REPOSITORY_BYTES = 32 * 1024 * 1024;
 const MAX_BLOB_BYTES = 8 * 1024 * 1024;
@@ -1043,7 +1047,9 @@ function writeSnapshotFiles(
     if (slash > 0) py.FS.mkdirTree(path.slice(0, slash));
     removeWorktreePath(py, cwd, relative);
     if (entry.mode === "120000") {
-      py.FS.symlink(new TextDecoder().decode(entry.bytes), path);
+      const target = new TextDecoder().decode(entry.bytes);
+      py.FS.symlink(target, path);
+      preserveEmscriptenSymlinkTarget(py.FS, path, target);
     } else {
       py.FS.writeFile(path, entry.bytes);
       py.FS.chmod(path, entry.mode === "100755" ? 0o755 : 0o644);
@@ -1067,7 +1073,10 @@ function removeWorktreePath(py: Pyodide, cwd: string, relative: string): void {
   try {
     const stat = py.FS.lstat(path);
     if (py.FS.isDir(stat.mode)) py.FS.rmdir(path);
-    else py.FS.unlink(path);
+    else {
+      forgetEmscriptenSymlinkTarget(py.FS, path);
+      py.FS.unlink(path);
+    }
   } catch {
     // Missing paths and non-empty parent directories require no action.
   }

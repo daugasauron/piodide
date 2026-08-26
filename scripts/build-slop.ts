@@ -24,7 +24,7 @@ const programs = [
   "slop", "make", "coreutils", "sed", "ar", "git",
   "ls", "cat", "fd-find", "echo", "env", "grep",
 ] as const;
-const spawnPrograms = new Set(["slop", "make", "coreutils", "git"]);
+const spawnPrograms = new Set(["slop", "make", "coreutils", "git", "env"]);
 
 function bytes(path: string): ArrayBuffer {
   const data = readFileSync(path);

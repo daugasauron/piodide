@@ -5,6 +5,15 @@ import http from "isomorphic-git/http/web";
 
 import type { Pyodide, PyodideFSStat } from "./pyodide-host.ts";
 import type { GitHubCredentials } from "./git-remote.ts";
+import {
+  gitIndexForIsomorphicGit,
+  preserveGitIndexIntentToAdd,
+} from "./git-index-compat.ts";
+import {
+  forgetEmscriptenSymlinkTarget,
+  preserveEmscriptenSymlinkTarget,
+  preservedEmscriptenSymlinkTarget,
+} from "./wasi/emscripten-fs.ts";
 
 const decoder = new TextDecoder();
 
@@ -48,6 +57,14 @@ function call<T>(operation: () => T): Promise<T> {
   }
 }
 
+async function asyncCall<T>(operation: () => Promise<T>): Promise<T> {
+  try {
+    return await operation();
+  } catch (error) {
+    throw translated(error);
+  }
+}
+
 function millis(value: number | Date): number {
   return value instanceof Date ? value.getTime() : Number(value);
 }
@@ -58,7 +75,7 @@ function millis(value: number | Date): number {
  * an in-workspace absolute target back into a path relative to the link's
  * parent. This preserves portable Git symlinks across add/checkout/status.
  */
-function gitSymlinkTarget(linkPath: string, target: string): string {
+export function gitSymlinkTarget(linkPath: string, target: string): string {
   if (!target.startsWith("/")) return target;
   const parent = linkPath.slice(0, linkPath.lastIndexOf("/")) || "/";
   const from = parent.split("/").filter(Boolean);
@@ -90,26 +107,54 @@ function stats(py: Pyodide, value: PyodideFSStat, symbolicLink: boolean) {
   };
 }
 
+interface IsomorphicGitFsOptions {
+  hideIntentToAdd?: boolean;
+}
+
+function isGitIndexBytes(bytes: Uint8Array): boolean {
+  return bytes.byteLength >= 4 && bytes[0] === 0x44 && bytes[1] === 0x49 &&
+    bytes[2] === 0x52 && bytes[3] === 0x43;
+}
+
 /** Adapt Emscripten MEMFS to the small Node fs.promises surface isomorphic-git uses. */
-export function createIsomorphicGitFs(py: Pyodide): NodeFs {
+export function createIsomorphicGitFs(
+  py: Pyodide,
+  options: IsomorphicGitFsOptions = {},
+): NodeFs {
   const fs = py.FS;
   const promises = {
-    readFile: (path: string, options?: unknown) => call(() => {
+    readFile: (path: string, readOptions?: unknown) => asyncCall(async () => {
       const value = fs.readFile(path);
-      const bytes = typeof value === "string" ? new TextEncoder().encode(value) : value;
-      const encoding = typeof options === "string"
-        ? options
-        : (options as { encoding?: string } | undefined)?.encoding;
+      let bytes = typeof value === "string" ? new TextEncoder().encode(value) : value;
+      if (isGitIndexBytes(bytes)) {
+        bytes = await gitIndexForIsomorphicGit(bytes, options.hideIntentToAdd);
+      }
+      const encoding = typeof readOptions === "string"
+        ? readOptions
+        : (readOptions as { encoding?: string } | undefined)?.encoding;
       return encoding ? decoder.decode(bytes) : bytes;
     }),
-    writeFile: (path: string, data: string | Uint8Array, options?: unknown) => call(() => {
-      fs.writeFile(path, data);
-      const mode = typeof options === "object" && options
-        ? (options as { mode?: number }).mode
+    writeFile: (path: string, data: string | Uint8Array, writeOptions?: unknown) => asyncCall(async () => {
+      let payload = typeof data === "string" ? new TextEncoder().encode(data) : data;
+      if (isGitIndexBytes(payload)) {
+        let current: Uint8Array | undefined;
+        if (fs.analyzePath(path).exists) {
+          const value = fs.readFile(path);
+          const bytes = typeof value === "string" ? new TextEncoder().encode(value) : value;
+          if (isGitIndexBytes(bytes)) current = bytes;
+        }
+        payload = await preserveGitIndexIntentToAdd(current, payload);
+      }
+      fs.writeFile(path, payload);
+      const mode = typeof writeOptions === "object" && writeOptions
+        ? (writeOptions as { mode?: number }).mode
         : undefined;
       if (mode !== undefined) fs.chmod(path, mode);
     }),
-    unlink: (path: string) => call(() => fs.unlink(path)),
+    unlink: (path: string) => call(() => {
+      forgetEmscriptenSymlinkTarget(fs, path);
+      fs.unlink(path);
+    }),
     readdir: (path: string) => call(() => fs.readdir(path).filter(
       (name) => name !== "." && name !== "..",
     )),
@@ -126,8 +171,12 @@ export function createIsomorphicGitFs(py: Pyodide): NodeFs {
       const value = fs.lstat(path);
       return stats(py, value, Boolean(fs.isLink?.(value.mode)));
     }),
-    readlink: (path: string) => call(() => gitSymlinkTarget(path, fs.readlink(path))),
-    symlink: (target: string, path: string) => call(() => fs.symlink(target, path)),
+    readlink: (path: string) => call(() =>
+      preservedEmscriptenSymlinkTarget(fs, path) ?? gitSymlinkTarget(path, fs.readlink(path))),
+    symlink: (target: string, path: string) => call(() => {
+      fs.symlink(target, path);
+      preserveEmscriptenSymlinkTarget(fs, path, target);
+    }),
     chmod: (path: string, mode: number) => call(() => fs.chmod(path, mode)),
     rename: (from: string, to: string) => call(() => fs.rename(from, to)),
   };

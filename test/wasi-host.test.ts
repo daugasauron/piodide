@@ -1,6 +1,9 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { runFixture, runFixtureOn } from "./helpers.ts";
+import { ERRNO, LOOKUPFLAG, RIGHTS } from "../src/wasi/abi.ts";
+import { MemoryFs } from "../src/wasi/memory-fs.ts";
+import { WasiHost } from "../src/wasi/host.ts";
 
 test("echo: argv and environment", async () => {
   const run = await runFixture("echo.wasm", {
@@ -39,6 +42,36 @@ test("cat: streams stdin to stdout", async () => {
   assert.equal(run.stdout, "piped through\n");
 });
 
+test("path_open: lookup flags enforce O_NOFOLLOW on the final symlink", () => {
+  const fs = new MemoryFs();
+  fs.mkdirTree("/home/web");
+  fs.writeFile("/home/web/target.txt", "target");
+  fs.symlink("target.txt", "/home/web/link.txt");
+  const host = new WasiHost({ fs, preopens: ["/home/web"] });
+  const memory = new WebAssembly.Memory({ initial: 1 });
+  host.bind({ exports: { memory } } as unknown as WebAssembly.Instance);
+  const path = new TextEncoder().encode("link.txt");
+  new Uint8Array(memory.buffer).set(path, 0);
+  const pathOpen = host.getImportObject().wasi_snapshot_preview1.path_open as (
+    fd: number,
+    dirflags: number,
+    pathPtr: number,
+    pathLength: number,
+    oflags: number,
+    rightsBase: bigint,
+    rightsInheriting: bigint,
+    fdflags: number,
+    resultFdPtr: number,
+  ) => number;
+
+  assert.equal(pathOpen(3, 0, 0, path.byteLength, 0, RIGHTS.FD_READ, 0n, 0, 64), ERRNO.LOOP);
+  assert.equal(
+    pathOpen(3, LOOKUPFLAG.SYMLINK_FOLLOW, 0, path.byteLength, 0, RIGHTS.FD_READ, 0n, 0, 64),
+    ERRNO.SUCCESS,
+  );
+  host.close();
+});
+
 test("ls: readdir reports names and WASI filetypes", async () => {
   const fs = new (await import("../src/wasi/memory-fs.ts")).MemoryFs();
   fs.writeFile("/home/web/file.txt", "x");
@@ -51,6 +84,20 @@ test("ls: readdir reports names and WASI filetypes", async () => {
   assert.ok(lines.includes(".. 3"), `expected ".. 3" in ${lines}`);
   assert.ok(lines.includes("file.txt 4"), `expected "file.txt 4" in ${lines}`);
   assert.ok(lines.includes("sub 3"), `expected "sub 3" in ${lines}`);
+});
+
+test("ls: readdir continues beyond the first WASI buffer", async () => {
+  const fs = new (await import("../src/wasi/memory-fs.ts")).MemoryFs();
+  for (let index = 0; index < 350; index++) {
+    fs.writeFile(`/home/web/file-${String(index).padStart(3, "0")}.txt`, "x");
+  }
+  const run = await runFixtureOn(fs, "ls.wasm", { args: ["ls.wasm", "/home/web"] });
+  assert.equal(run.exitCode, 0);
+  const lines = run.stdout.trim().split("\n");
+  assert.equal(lines.length, 352);
+  assert.equal(lines.filter((line) => /^file-[0-9]{3}\.txt 4$/.test(line)).length, 350);
+  assert.ok(lines.includes("file-000.txt 4"));
+  assert.ok(lines.includes("file-349.txt 4"));
 });
 
 test("fops: full file-operation surface", async () => {

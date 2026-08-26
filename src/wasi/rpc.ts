@@ -143,7 +143,11 @@ export class RpcFsClient implements WasiFs {
     errFile?: string;
     errAppend?: boolean;
     stderrToStdout?: boolean;
+    stdoutToStderr?: boolean;
+    stderrToInheritedStdout?: boolean;
+    stdoutToInheritedStderr?: boolean;
     env?: Record<string, string>;
+    exactEnvironment?: boolean;
   }): { exitCode: number; stdout?: Uint8Array; stdoutLength?: number } {
     const { response, blob } = this.request(
       "spawn",
@@ -157,7 +161,11 @@ export class RpcFsClient implements WasiFs {
         errFile: request.errFile ?? null,
         errAppend: request.errAppend ?? false,
         stderrToStdout: request.stderrToStdout ?? false,
+        stdoutToStderr: request.stdoutToStderr ?? false,
+        stderrToInheritedStdout: request.stderrToInheritedStdout ?? false,
+        stdoutToInheritedStderr: request.stdoutToInheritedStderr ?? false,
         env: request.env ?? null,
+        exactEnvironment: request.exactEnvironment ?? false,
       },
       request.stdinText,
     );
@@ -301,7 +309,11 @@ export interface RpcFsServerOptions {
     errFile?: string;
     errAppend?: boolean;
     stderrToStdout?: boolean;
+    stdoutToStderr?: boolean;
+    stderrToInheritedStdout?: boolean;
+    stdoutToInheritedStderr?: boolean;
     env?: Record<string, string>;
+    exactEnvironment?: boolean;
   }) => Promise<{ exitCode: number; stdout?: Uint8Array; stdoutLength?: number }>;
   signal?: AbortSignal;
 }
@@ -322,9 +334,12 @@ export function serveWasiFsRpc(options: RpcFsServerOptions): RpcFsServer {
   const data = new Uint8Array(options.buffer);
   const view = new DataView(options.buffer);
   const dataStart = CONTROL_BYTES;
+  const responseBlobCapacity = options.buffer.byteLength - CONTROL_BYTES - JSON_MARGIN;
   const handles = new Map<number, WasiHandle>();
   let nextHandle = 1;
   let stopped = false;
+  let pendingStdin: Uint8Array | null = null;
+  let stdinEnded = false;
 
   const respond = (payload: Record<string, unknown>, blob?: Uint8Array) => {
     const json = encodeJson(payload);
@@ -442,9 +457,23 @@ export function serveWasiFsRpc(options: RpcFsServerOptions): RpcFsServer {
         respond({ errno: 0 });
         return;
       case "stdinRead": {
-        const chunk = (await options.stdin?.()) ?? null;
-        if (chunk === null || chunk.byteLength === 0) respond({ errno: 0, eof: true });
-        else respond({ errno: 0 }, chunk);
+        const requested = args.length as number;
+        if (!Number.isSafeInteger(requested) || requested < 0) {
+          throw new Error("invalid stdin read length");
+        }
+        const limit = Math.min(requested, responseBlobCapacity);
+        if (limit === 0) { respond({ errno: 0 }, new Uint8Array()); return; }
+        if (stdinEnded) { respond({ errno: 0, eof: true }); return; }
+        const chunk = pendingStdin ?? (await options.stdin?.()) ?? null;
+        if (chunk === null || chunk.byteLength === 0) {
+          pendingStdin = null; stdinEnded = true;
+          respond({ errno: 0, eof: true }); return;
+        }
+        const delivered = chunk.subarray(0, limit);
+        pendingStdin = delivered.byteLength < chunk.byteLength
+          ? chunk.subarray(delivered.byteLength)
+          : null;
+        respond({ errno: 0 }, delivered);
         return;
       }
       case "spawn": {
@@ -464,7 +493,11 @@ export function serveWasiFsRpc(options: RpcFsServerOptions): RpcFsServer {
             errFile: (args.errFile as string) ?? undefined,
             errAppend: args.errAppend === true,
             stderrToStdout: args.stderrToStdout === true,
+            stdoutToStderr: args.stdoutToStderr === true,
+            stderrToInheritedStdout: args.stderrToInheritedStdout === true,
+            stdoutToInheritedStderr: args.stdoutToInheritedStderr === true,
             env: (args.env as Record<string, string>) ?? undefined,
+            exactEnvironment: args.exactEnvironment === true,
           });
           respond({
             errno: 0,

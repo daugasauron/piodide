@@ -24,6 +24,11 @@ import type { WasiRunJs } from "./python-module.ts";
 import type { WasiPreopen } from "./host.ts";
 
 const RPC_BUFFER_BYTES = 2 * 1024 * 1024;
+/* Slop normally transports at most a 1 MiB pipe stage through spawn. Its
+ * deliberately narrow base64 direct-redirection path can carry an exact
+ * 16 MiB input, while env may combine a 1 MiB environment and stdin. Give
+ * these spawning guests room for the payload plus JSON metadata. */
+const SHELL_RPC_BUFFER_BYTES = 17 * 1024 * 1024;
 const DEFAULT_TIMEOUT_MS = 30_000;
 const MAX_CAPTURE_CHARS = 100_000;
 const MAX_SPAWN_DEPTH = 4;
@@ -40,6 +45,8 @@ export interface WasiProgramRequest {
   /** Arguments without argv[0]. */
   args?: string[];
   env?: Record<string, string>;
+  /** Preserve `env` exactly, including an explicitly empty environment. */
+  exactEnvironment?: boolean;
   /** Pre-fed stdin (followed by EOF unless `stdinPush` is provided). */
   stdin?: string;
   /**
@@ -70,7 +77,11 @@ export interface WasiProgramRequest {
     errFile?: string;
     errAppend?: boolean;
     stderrToStdout?: boolean;
+    stdoutToStderr?: boolean;
+    stderrToInheritedStdout?: boolean;
+    stdoutToInheritedStderr?: boolean;
     env?: Record<string, string>;
+    exactEnvironment?: boolean;
   }) => Promise<{ exitCode: number; stdout?: Uint8Array; stdoutLength?: number }>;
   /** Internal: current spawn nesting depth. */
   spawnDepth?: number;
@@ -210,7 +221,12 @@ function startInWorker(
   if (!request.interactiveStdin) stdin.close();
   const stdinNext = request.stdinProvider ?? (() => stdin.next());
 
-  const rpcBuffer = new SharedArrayBuffer(RPC_BUFFER_BYTES);
+  const executable = request.executablePath.split("/").pop() ?? request.executablePath;
+  const rpcBuffer = new SharedArrayBuffer(
+    executable === "slop" || executable === "sh" || executable === "env"
+      ? SHELL_RPC_BUFFER_BYTES
+      : RPC_BUFFER_BYTES,
+  );
   const fs = new EmscriptenFs(py.FS);
   const spawnDepth = request.spawnDepth ?? 0;
   const spawn =
@@ -222,6 +238,7 @@ function startInWorker(
       stdinText,
       capture,
       env,
+      exactEnvironment,
     }: {
       path: string;
       args: string[];
@@ -233,7 +250,11 @@ function startInWorker(
       errFile?: string;
       errAppend?: boolean;
       stderrToStdout?: boolean;
+      stdoutToStderr?: boolean;
+      stderrToInheritedStdout?: boolean;
+      stdoutToInheritedStderr?: boolean;
       env?: Record<string, string>;
+      exactEnvironment?: boolean;
     }): Promise<{ exitCode: number; stdout?: Uint8Array; stdoutLength?: number }> => {
       if (spawnDepth >= MAX_SPAWN_DEPTH) return { exitCode: 126 };
       const captured: Uint8Array[] = [];
@@ -241,11 +262,14 @@ function startInWorker(
       const child = startWasiProgram(py, {
         executablePath: path,
         args: args.slice(1),
-        env: {
-          PATH: "/bin", PWD: cwd, ...(request.env ?? {}), ...(env ?? {}),
-          PIODIDE_CWD: cwd,
-          ...(stdinText !== undefined ? { PIODIDE_STDIN: "1" } : {}),
-        },
+        env: exactEnvironment
+          ? { ...(env ?? {}) }
+          : {
+              PATH: "/bin", PWD: cwd, ...(request.env ?? {}), ...(env ?? {}),
+              PIODIDE_CWD: cwd,
+              ...(stdinText !== undefined ? { PIODIDE_STDIN: "1" } : {}),
+            },
+        exactEnvironment,
         preopens: [{ name: ".", path: cwd }, "/home/web", "/", "/bin"],
         timeoutMs: request.timeoutMs ?? DEFAULT_TIMEOUT_MS,
         spawnDepth: spawnDepth + 1,
@@ -347,7 +371,9 @@ function startInWorker(
     const init: WasiWorkerInit = {
       binary: binary.slice().buffer as ArrayBuffer,
       args: [request.executablePath, ...(request.args ?? [])],
-      env: { PWD: "/home/web", ...(request.env ?? {}) },
+      env: request.exactEnvironment
+        ? { ...(request.env ?? {}) }
+        : { PWD: "/home/web", ...(request.env ?? {}) },
       preopens: request.preopens ?? WASI_PREOPENS,
       rpcBuffer,
       spawnApi: true,
@@ -384,7 +410,9 @@ function startOnMainThread(
     const { exitCode } = await executeWasi({
       binary: binary.slice(),
       args: [request.executablePath, ...(request.args ?? [])],
-      env: { PWD: "/home/web", ...(request.env ?? {}) },
+      env: request.exactEnvironment
+        ? { ...(request.env ?? {}) }
+        : { PWD: "/home/web", ...(request.env ?? {}) },
       fs: new EmscriptenFs(py.FS),
       preopens: request.preopens ?? WASI_PREOPENS,
       stdin: () => {
@@ -392,7 +420,10 @@ function startOnMainThread(
         stdinSent = true;
         return new TextEncoder().encode(stdinText);
       },
-      stdout: (chunk) => request.onStdout?.(decoder.decode(chunk, { stream: true })),
+      stdout: (chunk) => {
+        if (request.onStdoutBytes) request.onStdoutBytes(chunk);
+        else request.onStdout?.(decoder.decode(chunk, { stream: true }));
+      },
       stderr: (chunk) => request.onStderr?.(stderrDecoder.decode(chunk, { stream: true })),
     });
     return { exitCode };

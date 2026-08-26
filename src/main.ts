@@ -461,7 +461,14 @@ function currentSystemPrompt() {
   const base = provider?.transport === "browser"
     ? LOCAL_SYSTEM_PROMPT
     : REMOTE_SYSTEM_PROMPT;
-  return `${base}\n\n${clientEnvironmentDescription()}`;
+  return `${base}\n\n${clientEnvironmentDescription()}\n${agentRuntimeDescription()}`;
+}
+
+function agentRuntimeDescription(): string {
+  const connection = provider
+    ? `${provider.label}; model ${currentModelId()}; transport ${provider.transport}`
+    : "not configured";
+  return `Current agent connection: ${connection}. Browser UI slash commands such as /model and /demo are handled outside the agent tool schema; they are not Slop commands or executable paths.`;
 }
 
 function isPhoneClient(): boolean {
@@ -2378,11 +2385,28 @@ The agent's \`git\` tool creates standard Git repositories through Slop and
 libgit2 WebAssembly. GitHub clone/pull/push use browser fetch; register private
 access for the current page with \`/github\`.
 
+## Shell contract for agents
+
+Slop is a documented bounded command API, not full POSIX. Run
+\`COMMAND --help\` for the accepted flag subset. Accepted flags perform their
+stated semantics; unsupported flags fail explicitly before mutation. Status 0
+means the requested operation happened, stdout is payload, stderr is
+diagnostics, and accepted machine formats such as Git \`-z\` are byte-exact.
+Resource limits fail explicitly rather than truncating or silently pretending
+success. Use \`rg PATTERN -\` for piped stdin; no path searches the workspace.
+
 ## Host files
 
 Run \`/upload\` to import files from the host into \`/home/web\`. Run
 \`/download <path>\`, or ask the agent to download a file, to save it through
 the browser.
+
+## Browser UI commands
+
+Slash commands such as \`/model\`, \`/thinking\`, and \`/demo\` are handled by
+the browser prompt, not by Slop and not as executable files. The agent receives
+its current provider, model, and transport in the system message but cannot
+invoke those UI handlers as tools.
 `,
   );
   fsWriteText(

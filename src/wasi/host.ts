@@ -36,6 +36,7 @@ import type { WasiDirEntry, WasiFs, WasiHandle } from "./fs.ts";
 
 const DIRENT_HEADER_SIZE = 24;
 const SUBSCRIPTION_SIZE = 48;
+const SNAPSHOT0_SUBSCRIPTION_SIZE = 56;
 const EVENT_SIZE = 32;
 const IOV_SIZE = 8;
 
@@ -355,13 +356,19 @@ export class WasiHost {
     this.view().setUint32(pointer, value >>> 0, true);
   }
 
-  /** Read a sequence of NUL-terminated strings, ended by an empty string. */
-  readCStringArray(pointer: number): string[] {
+  /**
+   * Read adjacent NUL-terminated strings. Legacy callers use an empty-string
+   * terminator; counted callers can preserve empty strings as real values.
+   */
+  readCStringArray(pointer: number, count?: number): string[] {
+    if (count !== undefined && (!Number.isSafeInteger(count) || count < 0 || count > 1024)) {
+      throw new RangeError("C string array count is out of range");
+    }
     const values: string[] = [];
     let cursor = pointer;
-    for (;;) {
+    while (count === undefined || values.length < count) {
       const value = this.readCString(cursor);
-      if (value === "") break;
+      if (count === undefined && value === "") break;
       values.push(value);
       cursor += encoder.encode(value).byteLength + 1;
     }
@@ -885,21 +892,38 @@ export class WasiHost {
     while (index < entries.length) {
       const item = entries[index];
       const name = encoder.encode(item.name);
-      if (used + DIRENT_HEADER_SIZE > bufLength) break;
+      const recordLength = DIRENT_HEADER_SIZE + name.byteLength;
+      const remaining = bufLength - used;
+      if (recordLength > remaining) {
+        // Preview1 requires a non-final directory read to fill the supplied
+        // buffer, potentially with a truncated final record. wasi-libc treats
+        // a short read as EOF, so leaving even a header-sized tail unused
+        // would silently hide every later entry. Keep this entry's cookie
+        // pending; libc retries it after consuming the preceding full rows.
+        const header = new Uint8Array(DIRENT_HEADER_SIZE);
+        const headerView = new DataView(header.buffer);
+        headerView.setBigUint64(0, BigInt(index + 1), true);
+        headerView.setBigUint64(8, item.ino, true);
+        headerView.setUint32(16, name.byteLength, true);
+        headerView.setUint8(20, item.filetype);
+        const headerBytes = Math.min(remaining, DIRENT_HEADER_SIZE);
+        bytes.set(header.subarray(0, headerBytes), bufPtr + used);
+        if (remaining > DIRENT_HEADER_SIZE) {
+          bytes.set(name.subarray(0, remaining - DIRENT_HEADER_SIZE),
+                    bufPtr + used + DIRENT_HEADER_SIZE);
+        }
+        used = bufLength;
+        break;
+      }
       const headerPtr = bufPtr + used;
       view.setBigUint64(headerPtr, BigInt(index + 1), true); // d_next
       view.setBigUint64(headerPtr + 8, item.ino, true);
       view.setUint32(headerPtr + 16, name.byteLength, true);
       view.setUint8(headerPtr + 20, item.filetype);
       bytes.fill(0, headerPtr + 21, headerPtr + DIRENT_HEADER_SIZE);
-      // A name may be truncated to fill the buffer exactly; the next call
-      // resumes at d_next (wasmtime allows this partial write too).
-      const nameRoom = bufLength - used - DIRENT_HEADER_SIZE;
-      const nameBytes = Math.min(name.byteLength, nameRoom);
-      bytes.set(name.subarray(0, nameBytes), headerPtr + DIRENT_HEADER_SIZE);
-      used += DIRENT_HEADER_SIZE + nameBytes;
+      bytes.set(name, headerPtr + DIRENT_HEADER_SIZE);
+      used += recordLength;
       index += 1;
-      if (nameBytes < name.byteLength) break;
     }
 
     view.setUint32(sizePtr, used, true);
@@ -910,7 +934,7 @@ export class WasiHost {
 
   private pathOpen(
     fd: number,
-    _dirflags: number,
+    dirflags: number,
     pathPtr: number,
     pathLength: number,
     oflags: number,
@@ -924,6 +948,7 @@ export class WasiHost {
     const wantsWrite =
       (rightsBase & (RIGHTS.FD_WRITE | RIGHTS.FD_ALLOCATE | RIGHTS.FD_FILESTAT_SET_SIZE)) !== 0n;
     const isDirectory = (oflags & OFLAG.DIRECTORY) !== 0;
+    const followSymlinks = (dirflags & LOOKUPFLAG.SYMLINK_FOLLOW) !== 0;
 
     const handle = this.fs.open(
       resolved,
@@ -935,7 +960,7 @@ export class WasiHost {
         truncate: (oflags & OFLAG.TRUNC) !== 0,
         append: (fdflags & FDFLAG.APPEND) !== 0,
         directory: isDirectory,
-        followSymlinks: true,
+        followSymlinks,
       },
       0o644,
     );
@@ -1084,15 +1109,17 @@ export class WasiHost {
       fd: number;
     }
     const subscriptions: Subscription[] = [];
+    const snapshot0 = this.abiVersion === "snapshot0";
+    const subscriptionSize = snapshot0 ? SNAPSHOT0_SUBSCRIPTION_SIZE : SUBSCRIPTION_SIZE;
     for (let i = 0; i < nsubscriptions; i++) {
-      const base = inPtr + i * SUBSCRIPTION_SIZE;
+      const base = inPtr + i * subscriptionSize;
       const type = view.getUint8(base + 8);
       subscriptions.push({
         userdata: view.getBigUint64(base, true),
         type,
-        clockId: view.getUint32(base + 16, true),
-        timeoutNs: view.getBigUint64(base + 24, true),
-        absolute: (view.getUint16(base + 40, true) & SUBCLOCKFLAG.ABSTIME) !== 0,
+        clockId: view.getUint32(base + (snapshot0 ? 24 : 16), true),
+        timeoutNs: view.getBigUint64(base + (snapshot0 ? 32 : 24), true),
+        absolute: (view.getUint16(base + (snapshot0 ? 48 : 40), true) & SUBCLOCKFLAG.ABSTIME) !== 0,
         fd: view.getUint32(base + 16, true),
       });
     }

@@ -8,14 +8,15 @@ import {
 import { normalizePath } from "./wasi/abi.ts";
 
 const MAX_PYTHON_SOURCE_BYTES = 2 * 1024 * 1024;
+const encoder = new TextEncoder();
 
 export interface PythonEntrypointRequest {
   args: string[];
   cwd: string;
   env?: Record<string, string>;
   stdin?: Uint8Array;
-  stdout: (text: string) => void;
-  stderr: (text: string) => void;
+  stdout: (chunk: Uint8Array) => void;
+  stderr: (chunk: Uint8Array) => void;
 }
 
 type PythonInvocation =
@@ -81,7 +82,9 @@ export function parsePythonInvocation(args: string[], cwd: string): PythonInvoca
 function usage(): string {
   return (
     "usage: python [-B|-E|-I|-u] (-c code | -m module | script.py | -) [args ...]\n" +
-    "       interactive mode is not available inside Slop\n"
+    "       interactive mode is not available inside Slop\n" +
+    "       stdout/stderr are byte-exact and limited to 16777216 bytes each\n" +
+    "       shell pipelines/substitution capture 1048576 bytes; substitution rejects NUL\n"
   );
 }
 
@@ -135,6 +138,12 @@ function pythonProgram(
     "        _p_traceback.print_exc()",
     "        _p_exit_code = 1",
     "finally:",
+    "    try:",
+    "        _p_sys.stdout.flush()",
+    "        _p_sys.stderr.flush()",
+    "    except BaseException:",
+    "        _p_traceback.print_exc()",
+    "        _p_exit_code = 1",
     "    _p_sys.argv = _p_old_argv",
     "    _p_sys.stdin = _p_old_stdin",
     "    _p_sys.path[:] = _p_old_path",
@@ -151,15 +160,20 @@ export async function runPythonEntrypoint(
 ): Promise<number> {
   const invocation = parsePythonInvocation(request.args, request.cwd);
   if (invocation.kind === "help") {
-    request.stdout(usage());
+    request.stdout(encoder.encode(usage()));
     return 0;
   }
   if (invocation.kind === "version") {
-    request.stdout("Python " + py.version + "\n");
+    const version = String(
+      py.runPython(
+        "import sys as _p_sys; '.'.join(str(part) for part in _p_sys.version_info[:3])",
+      ),
+    );
+    request.stdout(encoder.encode("Python " + version + "\n"));
     return 0;
   }
   if (invocation.kind === "error") {
-    request.stderr("python: " + invocation.message + "\n" + usage());
+    request.stderr(encoder.encode("python: " + invocation.message + "\n" + usage()));
     return 2;
   }
 
@@ -168,11 +182,11 @@ export async function runPythonEntrypoint(
   let runnable: Exclude<PythonInvocation, { kind: "help" | "version" | "error" | "file" }>;
   if (invocation.kind === "file") {
     if (!fsExists(py, invocation.path) || fsIsDir(py, invocation.path)) {
-      request.stderr("python: can't open file '" + invocation.path + "': No such file\n");
+      request.stderr(encoder.encode("python: can't open file '" + invocation.path + "': No such file\n"));
       return 2;
     }
     if (py.FS.stat(invocation.path).size > MAX_PYTHON_SOURCE_BYTES) {
-      request.stderr("python: source exceeds the 2 MiB limit\n");
+      request.stderr(encoder.encode("python: source exceeds the 2 MiB limit\n"));
       return 2;
     }
     source = fsReadText(py, invocation.path);
@@ -200,7 +214,9 @@ export async function runPythonEntrypoint(
     );
     return typeof result === "number" && Number.isFinite(result) ? Math.trunc(result) : 1;
   } catch (error) {
-    request.stderr("python: " + (error instanceof Error ? error.message : String(error)) + "\n");
+    request.stderr(encoder.encode(
+      "python: " + (error instanceof Error ? error.message : String(error)) + "\n",
+    ));
     return 1;
   }
 }

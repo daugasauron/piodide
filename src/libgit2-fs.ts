@@ -1,4 +1,9 @@
 import type { Pyodide } from "./pyodide-host.ts";
+import {
+  forgetEmscriptenSymlinkTarget,
+  preserveEmscriptenSymlinkTarget,
+  preservedEmscriptenSymlinkTarget,
+} from "./wasi/emscripten-fs.ts";
 
 interface WasmGitModule {
   FS: any;
@@ -10,6 +15,7 @@ interface WasmGitModule {
 export function createPyodideGitFs(module: WasmGitModule, py: Pyodide) {
   const FS = module.FS;
   const source = py.FS as any;
+  const encoder = new TextEncoder();
   let mappingId = 0;
 
   const translateError = (error: unknown): never => {
@@ -50,7 +56,7 @@ export function createPyodideGitFs(module: WasmGitModule, py: Pyodide) {
     node.stream_ops = backend.stream_ops;
     return node;
   };
-  const attributes = (node: any, stat: any) => ({
+  const attributes = (node: any, stat: any, path: string) => ({
     dev: stat.dev ?? 1,
     ino: node.id,
     mode: stat.mode,
@@ -58,7 +64,9 @@ export function createPyodideGitFs(module: WasmGitModule, py: Pyodide) {
     uid: stat.uid ?? 0,
     gid: stat.gid ?? 0,
     rdev: stat.rdev ?? 0,
-    size: stat.size ?? 0,
+    size: FS.isLink(stat.mode)
+      ? encoder.encode(preservedEmscriptenSymlinkTarget(source, path) ?? source.readlink(path)).byteLength
+      : stat.size ?? 0,
     atime: stat.atime ?? new Date(0),
     mtime: stat.mtime ?? new Date(0),
     ctime: stat.ctime ?? stat.mtime ?? new Date(0),
@@ -91,7 +99,10 @@ export function createPyodideGitFs(module: WasmGitModule, py: Pyodide) {
     },
     node_ops: {
       getattr(node: any) {
-        return attempt(() => attributes(node, source.lstat(realPath(node))));
+        return attempt(() => {
+          const path = realPath(node);
+          return attributes(node, source.lstat(path), path);
+        });
       },
       setattr(node: any, attr: any) {
         return setAttributes(realPath(node), node, attr);
@@ -119,7 +130,11 @@ export function createPyodideGitFs(module: WasmGitModule, py: Pyodide) {
         oldNode.name = newName;
       },
       unlink(parent: any, name: string) {
-        return attempt(() => source.unlink(`${realPath(parent)}/${name}`));
+        return attempt(() => {
+          const path = `${realPath(parent)}/${name}`;
+          forgetEmscriptenSymlinkTarget(source, path);
+          source.unlink(path);
+        });
       },
       rmdir(parent: any, name: string) {
         return attempt(() => source.rmdir(`${realPath(parent)}/${name}`));
@@ -133,12 +148,20 @@ export function createPyodideGitFs(module: WasmGitModule, py: Pyodide) {
         // Emscripten resolves link targets inside the mounted /workspace tree.
         // Translate that virtual target before creating the link in Pyodide's
         // /home/web MEMFS or the link silently points outside the workspace.
-        return attempt(() => source.symlink(toSourcePath(oldPath), `${realPath(parent)}/${newName}`));
+        return attempt(() => {
+          const path = `${realPath(parent)}/${newName}`;
+          const target = toSourcePath(oldPath);
+          source.symlink(target, path);
+          preserveEmscriptenSymlinkTarget(source, path, target);
+        });
       },
       readlink(node: any) {
-        // Present Pyodide's absolute MEMFS target in wasm-git's mounted
-        // namespace. Emscripten will relativize it for the readlink syscall.
-        return attempt(() => toMountedPath(source.readlink(realPath(node))));
+        const path = realPath(node);
+        const preserved = preservedEmscriptenSymlinkTarget(source, path);
+        if (preserved !== undefined) return preserved;
+        // Fall back to the mounted namespace for links created before exact
+        // payload tracking was installed.
+        return attempt(() => toMountedPath(source.readlink(path)));
       },
       statfs() {
         return {
@@ -157,7 +180,10 @@ export function createPyodideGitFs(module: WasmGitModule, py: Pyodide) {
     },
     stream_ops: {
       getattr(stream: any) {
-        return attempt(() => attributes(stream.node, source.lstat(realPath(stream.node))));
+        return attempt(() => {
+          const path = realPath(stream.node);
+          return attributes(stream.node, source.lstat(path), path);
+        });
       },
       setattr(stream: any, attr: any) {
         return setAttributes(realPath(stream.node), stream.node, attr);

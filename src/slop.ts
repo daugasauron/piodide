@@ -32,8 +32,8 @@ import type { CompileOptions, LinkOptions } from "./wasi/toolchain.ts";
 const SHELL_BINARIES = ["slop", "make", "sed", "ar", "git", "ls", "cat", "fd-find", "echo", "env", "grep"];
 const COREUTILS = [
   "rm", "cp", "mv", "mkdir", "rmdir", "touch", "ln", "head", "tail", "wc", "sort",
-  "cut", "tr", "tee", "basename", "dirname", "seq", "cmp", "install", "readlink", "find", "mktemp",
-  "chmod", "uniq", "xargs",
+  "cut", "paste", "tr", "tee", "basename", "dirname", "seq", "cmp", "comm", "join", "xxd", "base64", "strings", "truncate", "install", "readlink", "realpath", "du", "find", "mktemp",
+  "chmod", "uniq", "xargs", "stat", "diff", "printf", "true", "false", "sha256sum", "date", "sleep",
 ];
 const SHELL_SOURCES = [
   "slop.c", "make.c", "coreutils.c", "sed.c", "ar.c", "git.c", "spawn_stub.c", "patch_import.py",
@@ -43,6 +43,7 @@ const SHELL_SOURCES = [
 const MAX_CHILDREN = 32;
 const MAX_C_SOURCE_BYTES = 512 * 1024;
 const MAX_TOOLCHAIN_INPUTS = 32;
+const MAX_PYTHON_STREAM_BYTES = 16 * 1024 * 1024;
 const HOST_ENTRYPOINT_MARKER = "piodide browser-hosted command\n";
 /** Pipe captures are bounded so a runaway producer can't eat the page. */
 const MAX_CAPTURE_BYTES = 1024 * 1024;
@@ -113,7 +114,7 @@ export function ensureSlopInstalled(py: Pyodide, note?: (text: string) => void):
 }
 
 function installHostEntrypoints(py: Pyodide): void {
-  for (const name of ["python", "python3", "curl"]) {
+  for (const name of ["python", "python3", "curl", "cc", "compile", "ld", "link"]) {
     const path = `/bin/${name}`;
     if (!fsExists(py, path)) py.FS.writeFile(path, HOST_ENTRYPOINT_MARKER);
     py.FS.chmod(path, 0o755);
@@ -150,8 +151,13 @@ interface SpawnRequest {
   errFile?: string;
   errAppend?: boolean;
   stderrToStdout?: boolean;
+  stdoutToStderr?: boolean;
+  stderrToInheritedStdout?: boolean;
+  stdoutToInheritedStderr?: boolean;
   /** Exported environment supplied by the spawning shell (spawn ABI v3). */
   env?: Record<string, string>;
+  /** Spawn ABI v8: do not inject runtime metadata into this environment. */
+  exactEnvironment?: boolean;
 }
 
 interface SpawnResult {
@@ -159,6 +165,14 @@ interface SpawnResult {
   stdout?: Uint8Array;
   /** Original size before RPC-safe truncation; lets the guest reject overflow. */
   stdoutLength?: number;
+}
+
+/** File descriptors inherited by a process spawned from another guest. */
+interface InheritedOutput {
+  stdout: (chunk: Uint8Array) => void;
+  stderr: (text: string) => void;
+  /** Byte-preserving route used by host-backed Python when available. */
+  stderrBytes?: (chunk: Uint8Array) => void;
 }
 
 interface SlopSpawnerDeps {
@@ -186,33 +200,35 @@ export class SlopSpawner {
     this.deps = deps;
   }
 
-  async onSpawn(request: SpawnRequest): Promise<SpawnResult> {
+  async onSpawn(request: SpawnRequest, inherited?: InheritedOutput): Promise<SpawnResult> {
     const {
       path, args, cwd, stdinText, capture, outFile, append,
-      errFile, errAppend, stderrToStdout, env,
+      errFile, errAppend, stderrToStdout, stdoutToStderr,
+      stderrToInheritedStdout, stdoutToInheritedStderr, env, exactEnvironment,
     } = request;
     if (["python", "python3"].includes(path.split("/").pop() ?? path)) {
-      return this.python(request);
+      return this.python(request, inherited);
     }
     const command = path.split("/").pop() ?? path;
     if (command === "curl") {
-      return this.hostCommand(request, runCurlCommand);
+      return this.hostCommand(request, runCurlCommand, inherited);
     }
     if (command === "git-remote") {
-      return this.hostCommand(request, runGitRemoteCommand);
+      return this.hostCommand(request, runGitRemoteCommand, inherited);
     }
     if (command === "git-engine") {
-      return this.hostCommand(request, runGitEngineCommand);
+      return this.hostCommand(request, runGitEngineCommand, inherited);
     }
-    if (path === "compile" || path === "cc") {
-      return this.toolchain(request, "compile");
+    if (command === "compile" || command === "cc") {
+      return this.toolchain(request, "compile", inherited);
     }
-    if (path === "link" || path === "ld") {
-      return this.toolchain(request, "link");
+    if (command === "link" || command === "ld") {
+      return this.toolchain(request, "link", inherited);
     }
 
     if (this.activeChildren >= MAX_CHILDREN) {
-      this.deps.writeError(`slop: too many nested programs\r\n`);
+      if (inherited) inherited.stderr("slop: too many nested programs\r\n");
+      else this.deps.writeError("slop: too many nested programs\r\n");
       return { exitCode: 126 };
     }
     this.activeChildren++;
@@ -240,7 +256,9 @@ export class SlopSpawner {
     }
     if (fileError) {
       if (fileStream !== null) this.deps.py.FS.close(fileStream);
-      this.deps.writeError(`slop: ${errFile ?? outFile}: ${fileError}\r\n`);
+      const message = `slop: ${errFile ?? outFile}: ${fileError}\r\n`;
+      if (inherited) inherited.stderr(message);
+      else this.deps.writeError(message);
       this.activeChildren--;
       return { exitCode: 1 };
     }
@@ -259,17 +277,49 @@ export class SlopSpawner {
       py.FS.write(fileStream, chunk, 0, chunk.byteLength);
     };
 
-    const writeError = (text: string) => {
-      if (stderrToStdout) {
-        if (capture || outFile) writeChunk(new TextEncoder().encode(text));
-        else this.deps.writeOut(text);
+    const outputDecoder = new TextDecoder();
+    const errorDecoder = new TextDecoder();
+    const redirectedOutputDecoder = new TextDecoder();
+    const writeInheritedOutput = (chunk: Uint8Array) => {
+      if (inherited) inherited.stdout(chunk);
+      else this.deps.writeOut(outputDecoder.decode(chunk, { stream: true }));
+    };
+    const writeInheritedError = (text: string) => {
+      if (inherited) inherited.stderr(text);
+      else this.deps.writeError(text);
+    };
+    const writeInheritedErrorBytes = (chunk: Uint8Array) => {
+      if (inherited?.stderrBytes) inherited.stderrBytes(chunk);
+      else writeInheritedError(errorDecoder.decode(chunk, { stream: true }));
+    };
+    const writeNaturalOutput = capture || outFile ? writeChunk : writeInheritedOutput;
+
+    const writeErrorBytes = (chunk: Uint8Array) => {
+      if (stderrToInheritedStdout) {
+        writeInheritedOutput(chunk);
+      } else if (stderrToStdout) {
+        writeNaturalOutput(chunk);
       } else if (errorStream !== null) {
-        const chunk = new TextEncoder().encode(text);
         this.deps.py.FS.write(errorStream, chunk, 0, chunk.byteLength);
       } else {
-        this.deps.writeError(text);
+        writeInheritedErrorBytes(chunk);
       }
     };
+    const writeError = (text: string) => writeErrorBytes(new TextEncoder().encode(text));
+    const writeOutput = stdoutToInheritedStderr
+      ? (chunk: Uint8Array) => {
+          if (inherited?.stderrBytes) inherited.stderrBytes(chunk);
+          else writeInheritedError(redirectedOutputDecoder.decode(chunk, { stream: true }));
+        }
+      : stdoutToStderr
+      ? (chunk: Uint8Array) => {
+          if (errorStream !== null) {
+            this.deps.py.FS.write(errorStream, chunk, 0, chunk.byteLength);
+          } else {
+            writeInheritedError(redirectedOutputDecoder.decode(chunk, { stream: true }));
+          }
+        }
+      : writeNaturalOutput;
 
     // Piped stdin replaces the session input for this child.
     const stdinProvider = stdinText
@@ -288,18 +338,24 @@ export class SlopSpawner {
       {
         executablePath: path,
         args: args.slice(1),
-        env: {
-          PATH: "/bin", PWD: cwd, TERM: "ghostty", ...(env ?? {}),
-          PIODIDE_CWD: cwd,
-          ...(stdinText !== undefined ? { PIODIDE_STDIN: "1" } : {}),
-        },
+        env: exactEnvironment
+          ? { ...(env ?? {}) }
+          : {
+              PATH: "/bin", PWD: cwd, TERM: "ghostty", ...(env ?? {}),
+              PIODIDE_CWD: cwd,
+              ...(stdinText !== undefined ? { PIODIDE_STDIN: "1" } : {}),
+            },
+        exactEnvironment,
         preopens: shellPreopens(cwd),
         interactiveStdin: true,
         stdinProvider,
         timeoutMs: 0,
-        spawnHandler: (nested) => this.onSpawn(nested),
-        onStdoutBytes: capture || outFile ? writeChunk : undefined,
-        onStdout: capture || outFile ? undefined : this.deps.writeOut,
+        spawnHandler: (nested) => this.onSpawn(nested, {
+          stdout: writeOutput,
+          stderr: writeError,
+          stderrBytes: writeErrorBytes,
+        }),
+        onStdoutBytes: writeOutput,
         onStderr: writeError,
       },
       this.deps.signal,
@@ -339,9 +395,11 @@ export class SlopSpawner {
   private async hostCommand(
     request: SpawnRequest,
     run: typeof runCurlCommand | typeof runGitRemoteCommand | typeof runGitEngineCommand,
+    inherited?: InheritedOutput,
   ): Promise<SpawnResult> {
     if (this.activeChildren >= MAX_CHILDREN) {
-      this.deps.writeError("slop: too many nested programs\r\n");
+      if (inherited) inherited.stderr("slop: too many nested programs\r\n");
+      else this.deps.writeError("slop: too many nested programs\r\n");
       return { exitCode: 126 };
     }
     this.activeChildren++;
@@ -363,14 +421,14 @@ export class SlopSpawner {
         signal: controller.signal,
         getGitHubCredentials: this.deps.getGitHubCredentials,
       });
-      return this.routeHostResult(request, result);
+      return this.routeHostResult(request, result, inherited);
     } catch (error) {
       return this.routeHostResult(request, {
         exitCode: controller.signal.aborted ? 130 : 1,
         stderr: new TextEncoder().encode(
           `${request.path}: ${error instanceof Error ? error.message : String(error)}\n`,
         ),
-      });
+      }, inherited);
     } finally {
       this.deps.signal?.removeEventListener("abort", abort);
       if (this.hostAbort === controller) this.hostAbort = null;
@@ -381,10 +439,14 @@ export class SlopSpawner {
   private routeHostResult(
     request: SpawnRequest,
     result: HostCommandResult,
+    inherited?: InheritedOutput,
   ): SpawnResult {
     let stdout = result.stdout ?? new Uint8Array();
     let stderr = result.stderr ?? new Uint8Array();
-    if (request.stderrToStdout && stderr.byteLength) {
+    if (request.stdoutToStderr && stdout.byteLength) {
+      stderr = joinBytes(stdout, stderr);
+      stdout = new Uint8Array();
+    } else if (request.stderrToStdout && stderr.byteLength) {
       const combined = new Uint8Array(stdout.byteLength + stderr.byteLength);
       combined.set(stdout);
       combined.set(stderr, stdout.byteLength);
@@ -401,15 +463,27 @@ export class SlopSpawner {
     };
     try {
       if (request.outFile) writeFile(request.outFile, request.append, stdout);
-      else if (!request.capture && stdout.byteLength) {
-        this.deps.writeOut(new TextDecoder().decode(stdout));
+      else if (request.stdoutToInheritedStderr && stdout.byteLength) {
+        const text = new TextDecoder().decode(stdout);
+        if (inherited) inherited.stderr(text);
+        else this.deps.writeError(text);
+      } else if (!request.capture && stdout.byteLength) {
+        if (inherited) inherited.stdout(stdout);
+        else this.deps.writeOut(new TextDecoder().decode(stdout));
       }
       if (request.errFile) writeFile(request.errFile, request.errAppend, stderr);
-      else if (stderr.byteLength) this.deps.writeError(new TextDecoder().decode(stderr));
+      else if (request.stderrToInheritedStdout && stderr.byteLength) {
+        if (inherited) inherited.stdout(stderr);
+        else this.deps.writeOut(new TextDecoder().decode(stderr));
+      } else if (stderr.byteLength) {
+        const text = new TextDecoder().decode(stderr);
+        if (inherited) inherited.stderr(text);
+        else this.deps.writeError(text);
+      }
     } catch (error) {
-      this.deps.writeError(
-        `${request.path}: ${error instanceof Error ? error.message : String(error)}\r\n`,
-      );
+      const text = `${request.path}: ${error instanceof Error ? error.message : String(error)}\r\n`;
+      if (inherited) inherited.stderr(text);
+      else this.deps.writeError(text);
       return { exitCode: 1 };
     }
     if (!request.capture) return { exitCode: result.exitCode };
@@ -423,16 +497,36 @@ export class SlopSpawner {
     return normalizePath(`${cwd}/${path}`);
   }
 
-  private async python(request: SpawnRequest): Promise<SpawnResult> {
+  private async python(request: SpawnRequest, inherited?: InheritedOutput): Promise<SpawnResult> {
     if (this.activeChildren >= MAX_CHILDREN) {
-      this.deps.writeError("slop: too many nested programs\r\n");
+      if (inherited) inherited.stderr("slop: too many nested programs\r\n");
+      else this.deps.writeError("slop: too many nested programs\r\n");
       return { exitCode: 126 };
     }
     this.activeChildren++;
     const captured: Uint8Array[] = [];
     let capturedBytes = 0;
+    let stdoutBytes = 0;
+    let stderrBytes = 0;
+    let stdoutExceeded = false;
+    let stderrExceeded = false;
     let fileStream: unknown = null;
     let errorStream: unknown = null;
+    const stdoutDecoder = new TextDecoder();
+    const stderrDecoder = new TextDecoder();
+    const redirectedOutputDecoder = new TextDecoder();
+    const writeDecoded = (
+      decoder: TextDecoder,
+      chunk: Uint8Array,
+      sink: (text: string) => void,
+    ) => {
+      const text = decoder.decode(chunk, { stream: true });
+      if (text) sink(text);
+    };
+    const writeInheritedErrorBytes = (chunk: Uint8Array) => {
+      if (inherited?.stderrBytes) inherited.stderrBytes(chunk);
+      else writeDecoded(stderrDecoder, chunk, inherited?.stderr ?? this.deps.writeError);
+    };
     try {
       if (request.outFile) {
         fileStream = this.deps.py.FS.open(request.outFile, request.append ? "a" : "w");
@@ -440,31 +534,66 @@ export class SlopSpawner {
       if (request.errFile) {
         errorStream = this.deps.py.FS.open(request.errFile, request.errAppend ? "a" : "w");
       }
-      const stdout = (text: string) => {
-        const chunk = new TextEncoder().encode(text);
-        if (request.capture) {
-          if (capturedBytes + chunk.byteLength <= MAX_CAPTURE_BYTES) captured.push(chunk);
+      const routeStdout = (chunk: Uint8Array) => {
+        if (request.stdoutToInheritedStderr) {
+          if (inherited?.stderrBytes) inherited.stderrBytes(chunk);
+          else writeDecoded(
+            redirectedOutputDecoder,
+            chunk,
+            inherited?.stderr ?? this.deps.writeError,
+          );
+        } else if (request.stdoutToStderr) {
+          if (errorStream !== null) {
+            this.deps.py.FS.write(errorStream, chunk, 0, chunk.byteLength);
+          } else {
+            writeInheritedErrorBytes(chunk);
+          }
+        } else if (request.capture) {
+          if (capturedBytes + chunk.byteLength <= MAX_CAPTURE_BYTES) captured.push(chunk.slice());
           else if (capturedBytes < MAX_CAPTURE_BYTES) {
             captured.push(chunk.slice(0, MAX_CAPTURE_BYTES - capturedBytes));
           }
           capturedBytes += chunk.byteLength;
         } else if (fileStream !== null) {
           this.deps.py.FS.write(fileStream, chunk, 0, chunk.byteLength);
+        } else if (inherited) {
+          inherited.stdout(chunk);
         } else {
-          this.deps.writeOut(text);
+          writeDecoded(stdoutDecoder, chunk, this.deps.writeOut);
         }
       };
-      const stderr = (text: string) => {
-        if (request.stderrToStdout) {
-          stdout(text);
+      const routeStderr = (chunk: Uint8Array) => {
+        if (request.stderrToInheritedStdout) {
+          if (inherited) inherited.stdout(chunk);
+          else writeDecoded(stdoutDecoder, chunk, this.deps.writeOut);
+        } else if (request.stderrToStdout) {
+          routeStdout(chunk);
         } else if (errorStream !== null) {
-          const chunk = new TextEncoder().encode(text);
           this.deps.py.FS.write(errorStream, chunk, 0, chunk.byteLength);
         } else {
-          this.deps.writeError(text);
+          writeInheritedErrorBytes(chunk);
         }
       };
-      const exitCode = await runPythonEntrypoint(this.deps.py, {
+      const bounded = (
+        chunk: Uint8Array,
+        stream: "stdout" | "stderr",
+        route: (selected: Uint8Array) => void,
+      ) => {
+        const count = stream === "stdout" ? stdoutBytes : stderrBytes;
+        const remaining = Math.max(0, MAX_PYTHON_STREAM_BYTES - count);
+        if (remaining > 0) route(chunk.subarray(0, remaining));
+        const exceeded = chunk.byteLength > remaining;
+        if (stream === "stdout") {
+          stdoutBytes = Math.min(MAX_PYTHON_STREAM_BYTES + 1, count + chunk.byteLength);
+          stdoutExceeded ||= exceeded;
+        } else {
+          stderrBytes = Math.min(MAX_PYTHON_STREAM_BYTES + 1, count + chunk.byteLength);
+          stderrExceeded ||= exceeded;
+        }
+      };
+      const stdout = (chunk: Uint8Array) => bounded(chunk, "stdout", routeStdout);
+      const stderr = (chunk: Uint8Array) => bounded(chunk, "stderr", routeStderr);
+      let exitCode = await runPythonEntrypoint(this.deps.py, {
         args: request.args,
         cwd: request.cwd,
         env: request.env,
@@ -472,19 +601,37 @@ export class SlopSpawner {
         stdout,
         stderr,
       });
+      if (stdoutExceeded || stderrExceeded) {
+        const streams = stdoutExceeded && stderrExceeded
+          ? "stdout and stderr"
+          : stdoutExceeded ? "stdout" : "stderr";
+        routeStderr(new TextEncoder().encode(
+          `python: ${streams} exceed the ${MAX_PYTHON_STREAM_BYTES}-byte invocation limit\n`,
+        ));
+        exitCode = 2;
+      }
       return request.capture
         ? {
             exitCode,
             stdout: concatChunks(captured, capturedBytes),
+            // Descriptor duplication can add stderr bytes to the stdout
+            // capture. Report the complete routed length so the spawning
+            // shell does not truncate the merged stream back to stdout's
+            // pre-duplication byte count.
             stdoutLength: capturedBytes,
           }
         : { exitCode };
     } catch (error) {
-      this.deps.writeError(
-        "python: " + (error instanceof Error ? error.message : String(error)) + "\r\n",
-      );
+      const text = "python: " + (error instanceof Error ? error.message : String(error)) + "\r\n";
+      writeInheritedErrorBytes(new TextEncoder().encode(text));
       return { exitCode: 1 };
     } finally {
+      const stdoutTail = stdoutDecoder.decode();
+      if (stdoutTail) this.deps.writeOut(stdoutTail);
+      const stderrTail = stderrDecoder.decode();
+      if (stderrTail) (inherited?.stderr ?? this.deps.writeError)(stderrTail);
+      const redirectedTail = redirectedOutputDecoder.decode();
+      if (redirectedTail) (inherited?.stderr ?? this.deps.writeError)(redirectedTail);
       if (fileStream !== null) this.deps.py.FS.close(fileStream);
       if (errorStream !== null) this.deps.py.FS.close(errorStream);
       this.activeChildren--;
@@ -505,6 +652,7 @@ export class SlopSpawner {
   private async toolchain(
     request: SpawnRequest,
     operation: "compile" | "link",
+    inherited?: InheritedOutput,
   ): Promise<SpawnResult> {
     let stdout = "";
     let stderr = "";
@@ -516,7 +664,10 @@ export class SlopSpawner {
       ? await this.toolchainCompile(args, request.cwd, command, writeOut, writeError)
       : await this.toolchainLink(args, request.cwd, command, writeOut, writeError);
 
-    if (request.stderrToStdout) {
+    if (request.stdoutToStderr) {
+      stderr = stdout + stderr;
+      stdout = "";
+    } else if (request.stderrToStdout) {
       stdout += stderr;
       stderr = "";
     }
@@ -531,13 +682,25 @@ export class SlopSpawner {
     };
     try {
       if (request.outFile) writeFile(request.outFile, request.append, stdout);
-      else if (!request.capture && stdout) this.deps.writeOut(stdout);
+      else if (request.stdoutToInheritedStderr && stdout) {
+        if (inherited) inherited.stderr(stdout);
+        else this.deps.writeError(stdout);
+      } else if (!request.capture && stdout) {
+        if (inherited) inherited.stdout(new TextEncoder().encode(stdout));
+        else this.deps.writeOut(stdout);
+      }
       if (request.errFile) writeFile(request.errFile, request.errAppend, stderr);
-      else if (stderr) this.deps.writeError(stderr);
+      else if (request.stderrToInheritedStdout && stderr) {
+        if (inherited) inherited.stdout(new TextEncoder().encode(stderr));
+        else this.deps.writeOut(stderr);
+      } else if (stderr) {
+        if (inherited) inherited.stderr(stderr);
+        else this.deps.writeError(stderr);
+      }
     } catch (error) {
-      this.deps.writeError(
-        `${command}: ${error instanceof Error ? error.message : String(error)}\r\n`,
-      );
+      const text = `${command}: ${error instanceof Error ? error.message : String(error)}\r\n`;
+      if (inherited) inherited.stderr(text);
+      else this.deps.writeError(text);
       return { exitCode: 1 };
     }
     if (request.capture) {
@@ -775,6 +938,13 @@ function concatChunks(chunks: Uint8Array[], total: number): Uint8Array {
     offset += selected.byteLength;
   }
   return out;
+}
+
+function joinBytes(left: Uint8Array, right: Uint8Array): Uint8Array {
+  const combined = new Uint8Array(left.byteLength + right.byteLength);
+  combined.set(left);
+  combined.set(right, left.byteLength);
+  return combined;
 }
 
 /* --------------------------- one-shot commands --------------------------- */
