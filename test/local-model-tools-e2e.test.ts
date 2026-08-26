@@ -172,7 +172,7 @@ test("WebLLM completes an assistant -> tool -> assistant agent loop", async () =
       (message) =>
         message.role === "user" &&
         typeof message.content === "string" &&
-        message.content.includes("[Tool result for call"),
+        message.content.includes("The application already executed read_file"),
     );
     yield {
       choices: [
@@ -220,7 +220,10 @@ test("WebLLM completes an assistant -> tool -> assistant agent loop", async () =
     assert.equal(requests.length, 2);
     assert.equal(requests[0].extra_body?.enable_thinking, true);
     assert.equal(requests[1].messages.at(-1)?.role, "user");
-    assert.match(String(requests[1].messages.at(-1)?.content), /\[Tool result for call/);
+    assert.match(
+      String(requests[1].messages.at(-1)?.content),
+      /The application already executed read_file/,
+    );
     assert.equal(
       assistantThinking(agent.state.messages[1]),
       "Inspect the file before answering.",

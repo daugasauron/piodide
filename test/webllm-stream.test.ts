@@ -3,6 +3,7 @@ import { test } from "node:test";
 import { Type } from "typebox";
 
 import {
+  completedSuccessfulToolCalls,
   createToolResponseFormat,
   inspectPartialQwenOutput,
   parsePromptedToolCalls,
@@ -224,7 +225,61 @@ test("WebLLM follow-up history uses supported roles and tagged tool results", ()
   assert.deepEqual(messages[3], {
     role: "user",
     content:
-      "[Tool result for call call_read]\ncontents\n[End tool result]\n" +
-      "Continue the original request. Do not quote or reproduce this result block.",
+      '[Tool call read({"path":"README.md"}) completed successfully; id call_read]\n' +
+      "contents\n[End completed successfully tool result]\n" +
+      'The application already executed read({"path":"README.md"}). Do not call it again with the same arguments.\n' +
+      "Continue the original request using this result. Your next response should answer the user unless a different tool is genuinely required. Do not quote or reproduce this result block.",
   });
+  assert.deepEqual(completedSuccessfulToolCalls({
+    messages: [
+      {
+        role: "assistant",
+        content: [
+          {
+            type: "toolCall",
+            id: "call_read",
+            name: "read",
+            arguments: { path: "README.md" },
+          },
+          {
+            type: "toolCall",
+            id: "call_failed",
+            name: "read",
+            arguments: { path: "missing.md" },
+          },
+        ],
+        api: "browser-webllm",
+        provider: "webllm",
+        model: "test",
+        usage: {
+          input: 0,
+          output: 0,
+          cacheRead: 0,
+          cacheWrite: 0,
+          totalTokens: 0,
+          cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+        },
+        stopReason: "toolUse",
+        timestamp: 2,
+      },
+      {
+        role: "toolResult",
+        toolCallId: "call_read",
+        toolName: "read",
+        content: [{ type: "text", text: "contents" }],
+        isError: false,
+        timestamp: 3,
+      },
+      {
+        role: "toolResult",
+        toolCallId: "call_failed",
+        toolName: "read",
+        content: [{ type: "text", text: "missing" }],
+        isError: true,
+        timestamp: 4,
+      },
+    ],
+  }), [
+    { name: "read", arguments: { path: "README.md" } },
+  ]);
 });

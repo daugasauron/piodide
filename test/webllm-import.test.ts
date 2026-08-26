@@ -260,3 +260,30 @@ test("WebLLM local import populates the cache layout used by WebLLM", async () =
     });
   }
 });
+
+test("WebLLM clear-cache removes discovered and legacy cache namespaces", async () => {
+  const originalCaches = globalThis.caches;
+  const deleted: string[] = [];
+  Object.defineProperty(globalThis, "caches", {
+    configurable: true,
+    value: {
+      delete: async (name: string) => {
+        deleted.push(name);
+        return true;
+      },
+    },
+  });
+  try {
+    await webLLMRuntime.clearCache();
+    assert.deepEqual(deleted.sort(), [
+      "webllm/config",
+      "webllm/model",
+      "webllm/wasm",
+    ]);
+  } finally {
+    Object.defineProperty(globalThis, "caches", {
+      configurable: true,
+      value: originalCaches,
+    });
+  }
+});

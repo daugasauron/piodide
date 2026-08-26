@@ -26,7 +26,6 @@ import {
   PROVIDERS,
 } from "../src/providers.ts";
 import {
-  REPLACED_WEBLLM_MODEL_IDS,
   WEBLLM_MODELS,
   describeWebLLMModel,
   estimateWebLLMVramBytes,
@@ -310,9 +309,6 @@ test("WebLLM is an independent WebGPU catalogue with tool support marked", async
     prebuiltAppConfig.model_list.map((model) => model.model_id),
   );
   assert.ok(WEBLLM_MODELS.every((model) => prebuiltIds.has(model.id)));
-  assert.ok(
-    Object.values(REPLACED_WEBLLM_MODEL_IDS).every((id) => prebuiltIds.has(id)),
-  );
   assert.equal(provider.defaultModel, WEBLLM_MODELS[0].id);
   assert.equal(provider.defaultModel, "Qwen3.5-4B-q4f16_1-MLC");
   assert.equal(WEBLLM_MODELS[0].tools, true);

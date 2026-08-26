@@ -2,8 +2,10 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 
 import {
+  chooseLocalModel,
   formatLocalModelStatus,
   localModelReadiness,
+  orderLocalModels,
 } from "../src/local-model-ux.ts";
 
 test("local model loading status surfaces useful WebLLM milestones", () => {
@@ -74,5 +76,36 @@ test("local model readiness explains GPU requirements and Wllama fallback", () =
       5 * 1024 ** 3,
     ).ready,
     false,
+  );
+});
+
+test("local model selection remembers intent and otherwise avoids downloads", () => {
+  const models = ["large", "medium", "small"];
+  assert.deepEqual(
+    chooseLocalModel("large", models, new Set(["small"])),
+    { id: "small", source: "cached" },
+  );
+  assert.deepEqual(
+    chooseLocalModel("large", models, new Set(["large", "small"])),
+    { id: "large", source: "cached" },
+  );
+  assert.deepEqual(
+    chooseLocalModel("large", models, new Set(["small"]), "medium"),
+    { id: "medium", source: "remembered" },
+  );
+  assert.deepEqual(
+    chooseLocalModel("large", models, new Set(), "removed"),
+    { id: "large", source: "default" },
+  );
+});
+
+test("local model menus keep active and cached choices easy to reach", () => {
+  assert.deepEqual(
+    orderLocalModels(
+      ["large", "medium", "small", "tiny"],
+      "medium",
+      new Set(["small", "tiny"]),
+    ),
+    ["medium", "small", "tiny", "large"],
   );
 });

@@ -48,8 +48,10 @@ import {
 import { getLocalProviderBinding } from "./local-provider.ts";
 import type { LocalModelRuntime, LocalModelStatus } from "./local-model.ts";
 import {
+  chooseLocalModel,
   formatLocalModelStatus,
   localModelReadiness,
+  orderLocalModels,
 } from "./local-model-ux.ts";
 import { LOCAL_MODEL_HELP } from "./local-model-help.ts";
 import { createRaylibDemoSource } from "./raylib-demo-source.ts";
@@ -291,6 +293,7 @@ const apiKeys = new Map<string, string>();
 let inputHandler: (data: string) => void = (data) => prompt.feed(data);
 let gitHubCredentials: GitHubCredentials | null = null;
 let modelOverride: string | null = null;
+const selectedLocalModels = new Map<string, string>();
 let assistantTraceSection: "thinking" | "answer" | "tool" | null = null;
 const sessions = new BrowserSessions();
 
@@ -1130,17 +1133,43 @@ async function activateProvider(next: ProviderDef) {
   const previousModel = currentModelId();
   const previousLocal = getLocalProviderBinding(previousProvider);
   const nextLocal = getLocalProviderBinding(next);
+  const modelIds = await next.loadModels();
+  let cachedIds = new Set<string>();
+  let cacheInspectionFailed = false;
+  let localChoice: ReturnType<typeof chooseLocalModel> | undefined;
+  if (nextLocal) {
+    say(dim(`  checking ${next.label} hardware and model cache…`));
+    try {
+      cachedIds = await nextLocal.runtime.cachedModelIds();
+    } catch {
+      cacheInspectionFailed = true;
+    }
+    localChoice = chooseLocalModel(
+      next.defaultModel,
+      modelIds,
+      cachedIds,
+      selectedLocalModels.get(next.name),
+    );
+  }
+  const nextModel = localChoice?.id ?? next.defaultModel;
   if (
     previousLocal &&
-    (previousLocal.runtime !== nextLocal?.runtime || previousModel !== next.defaultModel)
+    (previousLocal.runtime !== nextLocal?.runtime || previousModel !== nextModel)
   ) {
     await previousLocal.runtime.unload();
   }
   provider = next;
-  modelOverride = null;
-  await next.loadModels();
+  modelOverride = nextModel === next.defaultModel ? null : nextModel;
   applyConfigToAgent();
   say(cyan(`  ◇ provider: ${next.label}   model: ${currentModelId()}`));
+  if (localChoice?.source === "cached" && nextModel !== next.defaultModel) {
+    say(green(`  ◆ selected an existing cached model; no download is needed`));
+  } else if (localChoice?.source === "remembered") {
+    say(dim("    restored your model choice for this provider"));
+  }
+  if (cacheInspectionFailed) {
+    say(dim("    cache discovery was unavailable; using the provider default"));
+  }
   if (next.note) say(dim(`    ${next.note}`));
   if (next.auth === "none") {
     if (nextLocal) {
@@ -1181,6 +1210,7 @@ async function activateModel(modelId: string, contextSize?: number) {
     await setLocalContextSize(modelId, contextSize);
   }
   modelOverride = modelId === provider?.defaultModel ? null : modelId;
+  if (localProvider && provider) selectedLocalModels.set(provider.name, modelId);
   applyConfigToAgent();
   const selectedContext = selectedLocalContextSize(modelId);
   const context = selectedContext
@@ -1230,6 +1260,7 @@ async function selectBrowserContextSize(modelId: string): Promise<number | null>
 async function showBrowserModels(): Promise<void> {
   const localProvider = currentLocalProvider();
   if (!localProvider) throw new Error("No local browser provider is active.");
+  say(dim("  checking local hardware, browser storage, and model caches…"));
   const [inventory, capabilities] = await Promise.all([
     localProvider.runtime.cachedModels(),
     localProvider.runtime.inspectCapabilities(),
@@ -1279,23 +1310,54 @@ async function showBrowserModels(): Promise<void> {
     const context = selectedContext
       ? `${formatContextSize(selectedContext)} selected context`
       : "";
-    say(`  ${model.label.padEnd(24)} ${model.id}`);
-    say(
-      dim(
-        `    ${[active, details, context, model.license].filter(Boolean).join(" · ")}`,
-      ),
-    );
+    const title = `  ${model.label.padEnd(24)} ${model.id}`;
+    if (title.length <= writer.cols - 2) {
+      say(title);
+    } else {
+      say(`  ${model.label}`);
+      say(dim(`    ${model.id}`));
+    }
+    sayLocalModelDetails([
+      active,
+      ...details.split(" · "),
+      context,
+      model.license,
+    ]);
   }
   const unsupported = inventory.filter((entry) => !entry.supported);
   if (unsupported.length > 0) {
     say(magenta("  cached models discovered outside the agent-ready catalogue:"));
     for (const entry of unsupported) {
-      say(
-        `    ${entry.label}${entry.bytes ? ` · ${formatModelBytes(entry.bytes)}` : ""}` +
-          " · kept in browser storage but not selectable",
-      );
+      sayLocalModelDetails([
+        entry.label,
+        entry.bytes ? formatModelBytes(entry.bytes) : "",
+        "kept in browser storage but not selectable",
+      ]);
     }
   }
+}
+
+function sayLocalModelDetails(values: readonly string[]): void {
+  const segments = values.filter(Boolean);
+  const maxWidth = Math.max(24, writer.cols - 2);
+  let line = "    ";
+  for (const segment of segments) {
+    const separator = line.trim() ? " · " : "";
+    if (
+      terminalTextLength(line) + separator.length + terminalTextLength(segment) > maxWidth &&
+      line.trim()
+    ) {
+      say(dim(line));
+      line = `    ${segment}`;
+    } else {
+      line += `${separator}${segment}`;
+    }
+  }
+  if (line.trim()) say(dim(line));
+}
+
+function terminalTextLength(value: string): number {
+  return value.replace(/\x1b\[[0-9;]*m/g, "").length;
 }
 
 /* ------------------------------------------------------------------ */
@@ -1714,14 +1776,21 @@ async function runSlash(input: string) {
         }
       } else if (!arg) {
         const models = await provider.loadModels();
+        if (provider.transport === "browser") {
+          say(dim("  checking the local model cache…"));
+        }
         const cached =
           provider.transport === "browser"
             ? await localProvider!.runtime.cachedModelIds()
             : new Set<string>();
+        const orderedModels =
+          provider.transport === "browser"
+            ? orderLocalModels(models, currentModelId(), cached)
+            : models;
         const modelId = await prompt.select({
           title: `Select model · ${provider.label}`,
           active: currentModelId(),
-          options: models.map((id) => {
+          options: orderedModels.map((id) => {
             const local = localProvider?.getModel(id);
             return {
               value: id,

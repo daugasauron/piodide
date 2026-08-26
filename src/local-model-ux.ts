@@ -65,6 +65,50 @@ export interface LocalModelReadiness {
   requirements: string;
 }
 
+export interface LocalModelChoice {
+  id: string;
+  source: "remembered" | "cached" | "default";
+}
+
+/**
+ * Pick a local model without surprising the user with a download. An explicit
+ * choice made earlier in this session wins; otherwise prefer the provider
+ * default when it is already cached, followed by the first cached model in the
+ * provider's quality order.
+ */
+export function chooseLocalModel(
+  defaultId: string,
+  modelIds: readonly string[],
+  cachedIds: ReadonlySet<string>,
+  rememberedId?: string,
+): LocalModelChoice {
+  if (rememberedId && modelIds.includes(rememberedId)) {
+    return { id: rememberedId, source: "remembered" };
+  }
+  if (cachedIds.has(defaultId)) return { id: defaultId, source: "cached" };
+  const cached = modelIds.find((id) => cachedIds.has(id));
+  return cached
+    ? { id: cached, source: "cached" }
+    : { id: defaultId, source: "default" };
+}
+
+/** Keep the active model visible first, then cached choices, without changing
+ * the provider's relative quality order inside either group. */
+export function orderLocalModels(
+  modelIds: readonly string[],
+  activeId: string,
+  cachedIds: ReadonlySet<string>,
+): string[] {
+  return [...modelIds]
+    .map((id, index) => ({
+      id,
+      index,
+      rank: id === activeId ? 0 : cachedIds.has(id) ? 1 : 2,
+    }))
+    .sort((left, right) => left.rank - right.rank || left.index - right.index)
+    .map(({ id }) => id);
+}
+
 export function localModelReadiness(
   runtime: "wllama" | "webllm",
   capabilities: LocalModelCapabilities,

@@ -12,7 +12,6 @@ import type {
   LocalModelStatus,
 } from "./local-model.ts";
 import {
-  REPLACED_WEBLLM_MODEL_IDS,
   WEBLLM_MODELS,
   type WebLLMModelDef,
   getWebLLMModel,
@@ -342,7 +341,6 @@ class WebLLMRuntime {
 
     const alreadyCached = await module.hasModelInCache(modelId, appConfig);
     if (!alreadyCached) {
-      await this.removeReplacedCachedModel(modelId);
       await this.assertStorageCapacity(plan.bytes);
     }
 
@@ -420,15 +418,12 @@ class WebLLMRuntime {
 
   async clearCache(): Promise<void> {
     await this.unload();
-    const module = await this.loadModule();
-    const appConfig = this.appConfig(module);
-    const modelIds = new Set([
-      ...WEBLLM_MODELS.map((model) => model.id),
-      ...Object.values(REPLACED_WEBLLM_MODEL_IDS),
-    ]);
+    if (typeof caches === "undefined") {
+      throw new Error("WebLLM cache removal requires the browser Cache API.");
+    }
     await Promise.all(
-      [...modelIds].map((modelId) =>
-        module.deleteModelAllInfoInCache(modelId, appConfig),
+      ["webllm/model", "webllm/config", "webllm/wasm"].map((name) =>
+        caches.delete(name),
       ),
     );
   }
@@ -460,7 +455,6 @@ class WebLLMRuntime {
 
     const cached = await module.hasModelInCache(modelId, appConfig);
     if (!cached) {
-      await this.removeReplacedCachedModel(modelId);
       await this.assertStorageCapacity(model.bytes);
     }
     if (signal?.aborted) throw abortError("WebLLM model loading was cancelled.");
@@ -544,16 +538,6 @@ class WebLLMRuntime {
         `Not enough browser storage for this model: ${formatBytes(available)} available, ` +
           `${formatBytes(requiredBytes)} required.`,
       );
-    }
-  }
-
-  private async removeReplacedCachedModel(modelId: string): Promise<void> {
-    const replacedModelId = REPLACED_WEBLLM_MODEL_IDS[modelId];
-    if (!replacedModelId) return;
-    const module = await this.loadModule();
-    const appConfig = this.appConfig(module);
-    if (await module.hasModelInCache(replacedModelId, appConfig)) {
-      await module.deleteModelAllInfoInCache(replacedModelId, appConfig);
     }
   }
 

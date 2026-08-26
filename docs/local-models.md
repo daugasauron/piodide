@@ -51,6 +51,10 @@ against it. Piodide labels the smaller subset verified for agent tools as
 `agent-ready`; cached older or custom MLC builds remain visible with their
 actual parameter size instead of silently disappearing, but are not offered
 for selection until their tool protocol and memory profile are verified.
+When a verified cached model exists, switching to WebLLM selects it instead of
+defaulting to a new multi-gigabyte download. Piodide remembers an explicit
+model choice while the page remains open, and `/model` keeps the active and
+cached choices at the top without changing their relative quality order.
 
 WebLLM offers 8K, 16K, and 32K contexts during model selection. The 8K
 default is the smallest size that fits Piodide's agent prompt and tool schemas.
@@ -105,6 +109,10 @@ javascript.options.wasm_js_promise_integration
 GGUF file for Wllama or one MLC directory for WebLLM. Use an 8K or larger
 context when tools are enabled: Piodide's agent prompt and complete tool schemas
 do not fit in a 4K context.
+
+Discovered legacy/custom caches are never deleted to make room for another
+model. `/model clear-cache` is the explicit, confirmed operation that removes
+all model, config, and model-library data owned by the active local runtime.
 
 Qwen models start with visible thinking enabled for both Wllama and WebLLM.
 Thinking streams under an explicit purple `thinking` section, tool calls use

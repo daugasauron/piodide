@@ -24,15 +24,6 @@ export interface WebLLMModelDef extends LocalModelDef {
   };
 }
 
-export const REPLACED_WEBLLM_MODEL_IDS: Readonly<Record<string, string>> = {
-  "Qwen3.5-4B-q4f16_1-MLC": "Qwen3.5-4B-q4f32_1-MLC",
-  "Qwen3.5-9B-q4f16_1-MLC": "Qwen3.5-9B-q4f32_1-MLC",
-  "Hermes-3-Llama-3.1-8B-q4f16_1-MLC":
-    "Hermes-3-Llama-3.1-8B-q4f32_1-MLC",
-  "Hermes-3-Llama-3.2-3B-q4f16_1-MLC":
-    "Hermes-3-Llama-3.2-3B-q4f32_1-MLC",
-};
-
 export const WEBLLM_MODELS: readonly WebLLMModelDef[] = [
   {
     id: "Qwen3.5-4B-q4f16_1-MLC",

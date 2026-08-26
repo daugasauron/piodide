@@ -19,6 +19,6 @@ export const LOCAL_MODEL_HELP: readonly string[] = [
   "",
   "Requirements: WebLLM needs WebGPU + shader-f16 + enough VRAM. Wllama can fall back to WASM only for GGUF files below 4 GiB.",
   "GPU setup: fully quit Chrome, run npm run chrome:webgpu, then reopen Piodide. Loading shows download, shard, shader, backend, context, and elapsed-time progress.",
-  "Use /model status to inspect cached models and /model unload to release RAM/VRAM without deleting them.",
+  "Cached compatible models are selected before new downloads. /model keeps active and cached choices first; /model unload releases RAM/VRAM without deleting them.",
   "More detail: docs/local-models.md",
 ];

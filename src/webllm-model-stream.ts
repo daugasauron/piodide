@@ -5,6 +5,7 @@ import type {
   Context,
   Model,
   SimpleStreamOptions,
+  ToolCall,
 } from "@earendil-works/pi-ai";
 import type { StreamFn } from "@earendil-works/pi-agent-core";
 import type {
@@ -52,7 +53,11 @@ async function run(
       ? descriptor.thinkingGeneration
       : descriptor.generation;
   const systemPrompt = tools.length
-    ? `${context.systemPrompt ?? ""}\n\n${toolProtocol(tools, thinking)}`.trim()
+    ? `${context.systemPrompt ?? ""}\n\n${toolProtocol(
+        tools,
+        thinking,
+        completedSuccessfulToolCalls(context),
+      )}`.trim()
     : context.systemPrompt;
   const request: WebLLMChatRequest = {
     messages: toWebLLMMessages({
@@ -283,6 +288,18 @@ function withoutPartialSuffix(value: string, suffix: string): string {
 }
 
 export function toWebLLMMessages(context: Context): ChatCompletionMessageParam[] {
+  const callById = new Map<string, Pick<ToolCall, "name" | "arguments">>();
+  const resultById = new Map(
+    context.messages
+      .filter((message) => message.role === "toolResult")
+      .map((message) => [message.toolCallId, message] as const),
+  );
+  for (const message of context.messages) {
+    if (message.role !== "assistant") continue;
+    for (const item of message.content) {
+      if (item.type === "toolCall") callById.set(item.id, item);
+    }
+  }
   return toBrowserChatMessages(context).map((message): ChatCompletionMessageParam => {
     if (message.role === "tool") {
       // The Qwen MLC conversation template only defines system, user, and
@@ -291,12 +308,22 @@ export function toWebLLMMessages(context: Context): ChatCompletionMessageParam[]
       // tool". Replay it through a role every catalogue template accepts,
       // but avoid an XML/JSON envelope that small Qwen models may imitate in
       // their final answer.
+      const call = callById.get(message.tool_call_id);
+      const result = resultById.get(message.tool_call_id);
+      const callLabel = call
+        ? `${call.name}(${compactToolArguments(call.arguments)})`
+        : `call ${message.tool_call_id}`;
+      const outcome = result?.isError ? "failed" : "completed successfully";
+      const nextStep = result?.isError
+        ? "The call failed. Correct the arguments or choose a different approach."
+        : `The application already executed ${callLabel}. Do not call it again with the same arguments.`;
       return {
         role: "user",
         content:
-          `[Tool result for call ${message.tool_call_id}]\n` +
+          `[Tool call ${callLabel} ${outcome}; id ${message.tool_call_id}]\n` +
           `${message.content}\n` +
-          "[End tool result]\nContinue the original request. Do not quote or reproduce this result block.",
+          `[End ${outcome} tool result]\n${nextStep}\n` +
+          "Continue the original request using this result. Your next response should answer the user unless a different tool is genuinely required. Do not quote or reproduce this result block.",
       };
     }
     if (message.role !== "assistant") {
@@ -326,9 +353,34 @@ interface PromptedToolCall {
   arguments: Record<string, unknown>;
 }
 
+interface CompletedToolCall {
+  name: string;
+  arguments: Record<string, unknown>;
+}
+
+export function completedSuccessfulToolCalls(context: Context): CompletedToolCall[] {
+  const calls = new Map<string, CompletedToolCall>();
+  for (const message of context.messages) {
+    if (message.role !== "assistant") continue;
+    for (const item of message.content) {
+      if (item.type === "toolCall") {
+        calls.set(item.id, { name: item.name, arguments: item.arguments });
+      }
+    }
+  }
+  const completed: CompletedToolCall[] = [];
+  for (const message of context.messages) {
+    if (message.role !== "toolResult" || message.isError) continue;
+    const call = calls.get(message.toolCallId);
+    if (call) completed.push(call);
+  }
+  return completed.slice(-8);
+}
+
 function toolProtocol(
   tools: NonNullable<Context["tools"]>,
   thinking: boolean,
+  completedCalls: readonly CompletedToolCall[],
 ): string {
   const definitions = tools.map((tool) => ({
     name: tool.name,
@@ -347,9 +399,26 @@ function toolProtocol(
 - Multiple independent calls may appear in the JSON array.
 - Tool results are returned in clearly delimited result blocks. Treat them as the results of your calls, then continue the original task without repeating a successful call.
 - Never quote, reproduce, or wrap a tool result in your answer.
+${
+  completedCalls.length
+    ? `- These exact calls already completed successfully. Never emit them again:\n${completedCalls
+        .map((call) => `  - ${call.name}(${compactToolArguments(call.arguments)})`)
+        .join("\n")}`
+    : ""
+}
 
 Available tools:
 ${JSON.stringify(definitions)}`;
+}
+
+function compactToolArguments(argumentsValue: Record<string, unknown>): string {
+  let value: string;
+  try {
+    value = JSON.stringify(argumentsValue);
+  } catch {
+    return "{…}";
+  }
+  return value.length <= 400 ? value : `${value.slice(0, 399)}…`;
 }
 
 export function createToolResponseFormat(
