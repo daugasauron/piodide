@@ -55,7 +55,7 @@ import {
   orderLocalModels,
 } from "./local-model-ux.ts";
 import { LOCAL_MODEL_HELP } from "./local-model-help.ts";
-import { createRaylibDemoSource } from "./raylib-demo-source.ts";
+import { createRaylibDemoRequest } from "./raylib-demo.ts";
 import { browserModelRuntime } from "./browser-model-runtime.ts";
 import { webLLMRuntime } from "./webllm-runtime.ts";
 import {
@@ -64,10 +64,8 @@ import {
 } from "./webllm-models.ts";
 import {
   createAllTools,
-  createCompileRaylibTool,
   createHtmlTool,
   createImageTool,
-  createRaylibTool,
 } from "./tools.ts";
 import type { NeovimController } from "./neovim.ts";
 import {
@@ -288,7 +286,6 @@ let activeView: "agent" | "nvim" | "slop" = "agent";
 let neovim: NeovimController | null = null;
 let slop: SlopSession | null = null;
 let raylibPreview: RaylibCanvasSession | null = null;
-let raylibLaunchCount = 0;
 let neovimStarting: Promise<NeovimController> | null = null;
 let viewToggleRunning = false;
 
@@ -381,7 +378,6 @@ async function openRaylibPreview(
   raylibPreview = session;
   try {
     await session.start();
-    raylibLaunchCount++;
     raylibPreviewStatusEl.textContent = `${width}×${height} · CPU framebuffer`;
     raylibPreviewCanvasEl.focus();
   } catch (error) {
@@ -501,75 +497,11 @@ function clientEnvironmentDescription(): string {
 }
 
 function demoRequest(): string {
-  const phone = isPhoneClient();
-  const controls = phone
-    ? "Make touch the primary control and keep every instruction readable in portrait."
-    : "Use keyboard and mouse interaction and make good use of the landscape screen.";
-  const framebuffer = phone ? "320×568 (width 320, height 568)" : "640×360 (width 640, height 360)";
-  const movingObjects = phone ? 500 : 1400;
-  return `Launch the prepared raylib performance showcase. This is an execution task: use the tools and finish with the running game, not a code listing or explanation.
-
-The current client is a ${phone ? "phone/touch device" : "desktop/laptop"} at ${window.innerWidth}×${window.innerHeight} CSS pixels. ${controls}
-
-The prepared /home/web/raylib-demo.c already implements a compact, valid showcase with ${movingObjects} independently moving particles, layered effects, pointer interaction, and a HUD. Do not replace or rewrite it. Compile it first; edit only in response to concrete compiler diagnostics.
-
-Use exactly this runtime contract:
-- The prepared C17 source is /home/web/raylib-demo.c. It includes raylib.h and defines void game_init(void) plus void game_frame(float delta_seconds).
-- Do not define main or call InitWindow, CloseWindow, SetTargetFPS, or create a frame loop. The browser owns those. Put BeginDrawing() and EndDrawing() inside game_frame.
-- Prefer dependable raylib 6 2D APIs such as DrawPixel, DrawRectangle, DrawLineV, DrawCircleV, DrawText, GetMousePosition, GetTouchPosition, and IsKeyDown. Audio and rmodels are unavailable.
-- The raylib preview already supplies every WASI import and instantiates the module. Do not create HTML, JavaScript, a WebAssembly.instantiate call, or a wasi_snapshot_preview1 import object. Do not use compile_c, link_wasi, run_wasi, Python, or slop for this demo.
-
-Required tool sequence:
-1. read /home/web/raylib-demo.c
-2. compile_raylib with path /home/web/raylib-demo.c, output /home/web/raylib-demo.wasm, and optimization "3"
-3. If compilation fails, use edit to fix only the reported issue and retry compile_raylib until it succeeds. Never launch a failed build.
-4. Call raylib exactly once with path /home/web/raylib-demo.wasm, framebuffer ${framebuffer}, and a short title.
-
-Do not stop before the raylib tool succeeds and opens the game.`;
-}
-
-async function launchBuiltInRaylibDemo() {
-  if (!py) throw new Error("Python filesystem is not ready.");
-  const phone = isPhoneClient();
-  const movingObjects = phone ? 500 : 1400;
-  const width = phone ? 320 : 640;
-  const height = phone ? 568 : 360;
-  fsWriteText(py, "/home/web/raylib-demo.c", createRaylibDemoSource(movingObjects));
-  say(dim("  local model did not finish the launch · compiling the built-in showcase"));
-  const compiled = await createCompileRaylibTool(py).execute(
-    "demo-fallback-compile",
-    {
-      path: "/home/web/raylib-demo.c",
-      output: "/home/web/raylib-demo.wasm",
-      optimization: "3",
-    },
-    undefined,
-  );
-  const compileDetails = compiled.details;
-  say(
-    green(
-      `  ↳ raylib compiled · ${compileDetails.bytes} bytes · ${(
-        compileDetails.durationMs / 1000
-      ).toFixed(1)}s`,
-    ),
-  );
-  const preview = await createRaylibTool(py).execute(
-    "demo-fallback-preview",
-    {
-      path: "/home/web/raylib-demo.wasm",
-      width,
-      height,
-      title: "Piodide particle field",
-    },
-    undefined,
-  );
-  await openRaylibPreview(
-    preview.details.path,
-    preview.details.width,
-    preview.details.height,
-    preview.details.title,
-  );
-  say(green("  ↳ built-in raylib showcase launched"));
+  return createRaylibDemoRequest({
+    phone: isPhoneClient(),
+    viewportWidth: window.innerWidth,
+    viewportHeight: window.innerHeight,
+  });
 }
 
 function consumeLocalCodexProxyToken(): string {
@@ -1638,58 +1570,12 @@ async function runSlash(input: string) {
       say(dim("  /status  /clear  /hotkeys                  terminal utilities"));
       break;
 
-    case "demo":
-      say(cyan(`  ◇ demo target: ${isPhoneClient() ? "phone · touch" : "desktop · keyboard/mouse"}`));
-      {
-        if (!agent || !pyReady || !py) {
-          say(yellow("  python is still loading — try again in a moment"));
-          break;
-        }
-        const movingObjects = isPhoneClient() ? 500 : 1400;
-        fsWriteText(py, "/home/web/raylib-demo.c", createRaylibDemoSource(movingObjects));
-        const demoAgent = agent;
-        const allTools = demoAgent.state.tools;
-        const demoToolNames = new Set([
-          "read",
-          "edit",
-          "compile_raylib",
-          "raylib",
-        ]);
-        // A focused schema leaves small local models substantially more room
-        // for the C source and prevents them from selecting an incompatible
-        // compile/run path. Restore the normal toolset after both passes.
-        demoAgent.state.tools = allTools.filter((tool) => demoToolNames.has(tool.name));
-        const messagesBefore = agent?.state.messages.length ?? 0;
-        const launchesBefore = raylibLaunchCount;
-        try {
-          await handleSubmit(demoRequest());
-          const messages = agent?.state.messages ?? [];
-          let lastAssistant: AgentMessage | undefined;
-          for (let index = messages.length - 1; index >= 0; index--) {
-            if (messages[index].role === "assistant") {
-              lastAssistant = messages[index];
-              break;
-            }
-          }
-          const stopReason = (lastAssistant as { stopReason?: string } | undefined)?.stopReason;
-          const canRecover =
-            messages.length > messagesBefore &&
-            raylibLaunchCount === launchesBefore &&
-            stopReason !== "aborted";
-          if (canRecover && stopReason !== "error") {
-            say(yellow("  ◇ demo did not launch · requesting one repair pass"));
-            await handleSubmit(
-              "The prepared raylib demo has not opened. Compile /home/web/raylib-demo.c with compile_raylib at optimization 3. Edit only a concrete reported compiler error. After compilation succeeds, call raylib exactly once. Do not rewrite the source, switch tools, or stop with an explanation.",
-            );
-          }
-          if (canRecover && raylibLaunchCount === launchesBefore) {
-            await launchBuiltInRaylibDemo();
-          }
-        } finally {
-          demoAgent.state.tools = allTools;
-        }
-      }
+    case "demo": {
+      const request = demoRequest();
+      prompt.showSubmittedPrompt(request);
+      await handleSubmit(request);
       return;
+    }
 
     case "provider": {
       if (!arg) {

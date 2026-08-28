@@ -6,7 +6,7 @@ import { fileURLToPath } from "node:url";
 import { MemoryFs } from "../src/wasi/memory-fs.ts";
 import { runToolchain } from "../src/wasi/toolchain.ts";
 import { WasiHost } from "../src/wasi/host.ts";
-import { createRaylibDemoSource } from "../src/raylib-demo-source.ts";
+import { createRaylibDemoRequest } from "../src/raylib-demo.ts";
 
 const here = dirname(fileURLToPath(import.meta.url));
 const root = join(here, "..");
@@ -32,41 +32,34 @@ void game_frame(float delta_seconds) {
 }
 `;
 
-test(
-  "raylib: built-in demo source is compact and compiles",
-  { timeout: 300_000, skip: !toolchainAvailable },
-  async () => {
-    const source = createRaylibDemoSource(1400);
-    assert.ok(source.length <= 6_000);
-    assert.ok(source.split("\n").length <= 120);
-    assert.match(source, /#define PARTICLE_COUNT 1400/);
-    assert.doesNotMatch(source, /InitWindow|SetTargetFPS|CloseWindow/);
+test("raylib: /demo creates ambitious device-specific visible requests", () => {
+  const desktop = createRaylibDemoRequest({
+    phone: false,
+    viewportWidth: 1440,
+    viewportHeight: 900,
+  });
+  assert.match(desktop, /desktop\/laptop.*1440×900/);
+  assert.match(desktop, /mouse movement\/clicks/);
+  assert.match(desktop, /640×360 \(width 640, height 360\)/);
 
-    const fs = new MemoryFs();
-    fs.mkdirTree("/home/web/raylib");
-    fs.writeFile("/home/web/raylib/demo.c", source);
-    fs.writeFile("/home/web/raylib/raylib.h", readFileSync(join(raylibDir, "raylib.h")));
-    const compiled = await runToolchain(
-      {
-        operation: "compile",
-        sourcePath: "/home/web/raylib/demo.c",
-        outputPath: "/home/web/raylib/demo.o",
-        options: {
-          standard: "c17",
-          optimization: "3",
-          includePaths: ["/home/web/raylib"],
-          functionSections: true,
-        },
-      },
-      fs,
-      {
-        toolchain: arrayBuffer(join(toolchainDir, "clang.wasm")),
-        sysrootTar: arrayBuffer(join(toolchainDir, "clang-fs.tar.gz")),
-      },
-    );
-    assert.equal(compiled.exitCode, 0, compiled.diagnostics);
-  },
-);
+  const phone = createRaylibDemoRequest({
+    phone: true,
+    viewportWidth: 390,
+    viewportHeight: 844,
+  });
+  assert.match(phone, /phone\/touch device.*390×844/);
+  assert.match(phone, /touch as the primary interaction/);
+  assert.match(phone, /360×640 \(width 360, height 640\)/);
+
+  for (const request of [desktop, phone]) {
+    assert.match(request, /original, unusually polished/);
+    assert.match(request, /at least three cohesive visual systems/);
+    assert.match(request, /write.*\/home\/web\/raylib-demo\.c/is);
+    assert.match(request, /compile_raylib/);
+    assert.match(request, /call raylib exactly once/);
+    assert.doesNotMatch(request, /prepared .*source/i);
+  }
+});
 
 test(
   "raylib: WASI memory backend renders a packed BGRA framebuffer",

@@ -74,3 +74,22 @@ test("the main prompt highlights conversation but leaves slash commands plain", 
   assert.deepEqual(command.lines, [""]);
   assert.doesNotMatch(command.writes.join(""), /\x1b\[48;2;36;40;59m/);
 });
+
+test("app-generated prompts can be shown as normal user turns", () => {
+  const transcript = captureWriter(40);
+  const prompt = new PromptLine({
+    writer: transcript.writer,
+    onSubmit() {},
+    onAbort() {},
+  });
+
+  prompt.showSubmittedPrompt("Build something spectacular");
+
+  assert.equal(transcript.lines.length, 3);
+  assert.deepEqual([transcript.lines[0], transcript.lines[2]], ["", ""]);
+  assert.match(transcript.lines[1], /\x1b\[48;2;36;40;59m/);
+  assert.equal(
+    transcript.lines[1].replace(ANSI, "").trim(),
+    "Build something spectacular",
+  );
+});

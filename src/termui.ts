@@ -483,6 +483,17 @@ export class PromptLine {
     return true;
   }
 
+  /** Show an app-generated request as a normal user turn in the transcript. */
+  showSubmittedPrompt(value: string): void {
+    if (!value.trim()) return;
+    this.hideCommandPopup();
+    this.opts.writer.ensureNewline();
+    this.writeSubmittedPrompt(value);
+    if (this.history[this.history.length - 1] !== value) {
+      this.history.push(value);
+    }
+  }
+
   /** Draw a fresh, empty prompt at the current cursor (assumed at col 0). */
   start() {
     this.prefix = CHEVRON;
@@ -699,6 +710,11 @@ export class PromptLine {
     const cursorRow = Math.max(0, Math.ceil(cursorCells / cols) - 1);
     const clear = `${cursorRow > 0 ? `\x1b[${cursorRow}A` : ""}\r\x1b[J`;
     this.opts.writer.write(clear);
+    this.writeSubmittedPrompt(value);
+  }
+
+  private writeSubmittedPrompt(value: string) {
+    const cols = Math.max(1, this.opts.writer.cols);
     this.opts.writer.writeln("");
     for (const line of formatSubmittedPrompt(value, cols)) {
       this.opts.writer.writeln(line);
