@@ -699,9 +699,11 @@ export class PromptLine {
     const cursorRow = Math.max(0, Math.ceil(cursorCells / cols) - 1);
     const clear = `${cursorRow > 0 ? `\x1b[${cursorRow}A` : ""}\r\x1b[J`;
     this.opts.writer.write(clear);
+    this.opts.writer.writeln("");
     for (const line of formatSubmittedPrompt(value, cols)) {
       this.opts.writer.writeln(line);
     }
+    this.opts.writer.writeln("");
   }
 
   private cancel() {
@@ -1075,16 +1077,21 @@ export class PromptLine {
 export function formatSubmittedPrompt(value: string, columns: number): string[] {
   const cols = Math.max(1, Math.floor(columns));
   const marginWidth = cols >= 10 ? 2 : 0;
-  const contentWidth = Math.max(1, cols - marginWidth * 2 - 2);
+  const horizontalPadding = cols >= 10 ? 2 : 1;
+  const contentWidth = Math.max(
+    1,
+    cols - marginWidth * 2 - horizontalPadding * 2,
+  );
   const chunks = wrapCells(value, contentWidth);
   const margin = " ".repeat(marginWidth);
+  const inset = " ".repeat(horizontalPadding);
   const boxWidth = Math.max(1, ...chunks.map((chunk) => stringWidth(chunk)));
 
   return chunks.map((chunk) => {
     const padding = " ".repeat(
       Math.max(0, boxWidth - stringWidth(chunk)),
     );
-    return `${margin}${USER_PROMPT_BACKGROUND}${USER_PROMPT_TEXT} ${chunk}${padding} ${RESET}`;
+    return `${margin}${USER_PROMPT_BACKGROUND}${USER_PROMPT_TEXT}${inset}${chunk}${padding}${inset}${RESET}`;
   });
 }
 

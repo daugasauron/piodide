@@ -34,8 +34,8 @@ test("submitted prompts use the app palette and wrap inside one background block
 
   assert.equal(lines.length, 2);
   assert.ok(lines.every((line) => line.includes("\x1b[48;2;36;40;59m")));
-  assert.equal(lines[0].replace(ANSI, ""), "   abcdefghijklmnopqr ");
-  assert.equal(lines[1].replace(ANSI, ""), "   st                 ");
+  assert.equal(lines[0].replace(ANSI, ""), "    abcdefghijklmnop  ");
+  assert.equal(lines[1].replace(ANSI, ""), "    qrst              ");
 
   const prose = formatSubmittedPrompt("model setup works", 20)
     .map((line) => line.replace(ANSI, "").trim());
@@ -56,9 +56,10 @@ test("the main prompt highlights conversation but leaves slash commands plain", 
   prompt.feed("explain this\r");
 
   assert.deepEqual(submitted, ["explain this"]);
-  assert.equal(conversation.lines.length, 1);
-  assert.match(conversation.lines[0], /\x1b\[48;2;36;40;59m/);
-  assert.equal(conversation.lines[0].replace(ANSI, "").trim(), "explain this");
+  assert.equal(conversation.lines.length, 3);
+  assert.deepEqual([conversation.lines[0], conversation.lines[2]], ["", ""]);
+  assert.match(conversation.lines[1], /\x1b\[48;2;36;40;59m/);
+  assert.equal(conversation.lines[1].replace(ANSI, "").trim(), "explain this");
 
   const command = captureWriter();
   const commandPrompt = new PromptLine({
