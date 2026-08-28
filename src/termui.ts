@@ -14,8 +14,7 @@ const DIM = "\x1b[2m";
 const CYAN = "\x1b[36m";
 const MAGENTA = "\x1b[35m";
 const GREEN = "\x1b[32m";
-const USER_PROMPT_BACKGROUND = "\x1b[48;2;40;52;87m";
-const USER_PROMPT_LABEL = "\x1b[38;2;200;163;255m";
+const USER_PROMPT_BACKGROUND = "\x1b[48;2;36;40;59m";
 const USER_PROMPT_TEXT = "\x1b[38;2;192;202;245m";
 const SPINNER_FRAMES = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 let terminalInitPromise: Promise<void> | null = null;
@@ -1075,23 +1074,17 @@ export class PromptLine {
 /** Render a submitted conversational prompt as a stable transcript block. */
 export function formatSubmittedPrompt(value: string, columns: number): string[] {
   const cols = Math.max(1, Math.floor(columns));
-  const marginWidth = cols >= 16 ? 2 : 0;
-  const blockWidth = Math.max(1, cols - marginWidth * 2);
-  const label = blockWidth >= 8 ? " YOU  " : "";
-  const labelWidth = stringWidth(label);
-  const contentWidth = Math.max(1, blockWidth - labelWidth);
+  const marginWidth = cols >= 10 ? 2 : 0;
+  const contentWidth = Math.max(1, cols - marginWidth * 2 - 2);
   const chunks = wrapCells(value, contentWidth);
   const margin = " ".repeat(marginWidth);
+  const boxWidth = Math.max(1, ...chunks.map((chunk) => stringWidth(chunk)));
 
-  return chunks.map((chunk, index) => {
-    const lead = index === 0 ? label : " ".repeat(labelWidth);
+  return chunks.map((chunk) => {
     const padding = " ".repeat(
-      Math.max(0, blockWidth - labelWidth - stringWidth(chunk)),
+      Math.max(0, boxWidth - stringWidth(chunk)),
     );
-    const styledLead = index === 0 && label
-      ? `${BOLD}${USER_PROMPT_LABEL}${lead}\x1b[22m${USER_PROMPT_TEXT}`
-      : `${USER_PROMPT_TEXT}${lead}`;
-    return `${margin}${USER_PROMPT_BACKGROUND}${styledLead}${chunk}${padding}${RESET}`;
+    return `${margin}${USER_PROMPT_BACKGROUND}${USER_PROMPT_TEXT} ${chunk}${padding} ${RESET}`;
   });
 }
 

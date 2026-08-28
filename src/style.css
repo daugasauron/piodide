@@ -34,6 +34,10 @@ body {
   height: calc(100% - var(--footer-height));
 }
 
+#agent-view {
+  position: relative;
+}
+
 #agent-view[hidden],
 #slop-view[hidden],
 #neovim-view[hidden] {
@@ -59,6 +63,54 @@ body {
 #terminal textarea,
 #slop-terminal textarea {
   font-size: 16px !important;
+}
+
+#thinking-overlay {
+  position: absolute;
+  z-index: 8;
+  top: 10px;
+  right: 12px;
+  display: flex;
+  width: min(720px, calc(100% - 24px));
+  max-height: min(36%, 280px);
+  overflow: hidden;
+  box-sizing: border-box;
+  flex-direction: column;
+  border: 1px solid #283457;
+  border-left: 3px solid #bb9af7;
+  border-radius: 5px;
+  background: rgb(17 19 26 / 96%);
+  box-shadow: 0 8px 24px rgb(0 0 0 / 42%);
+  color: #a9b1d6;
+  font: 13px/19px "IosevkaTerm Nerd Font", monospace;
+  pointer-events: none;
+}
+
+#thinking-overlay[hidden] {
+  display: none;
+}
+
+#thinking-overlay header {
+  display: flex;
+  justify-content: space-between;
+  padding: 4px 8px;
+  border-bottom: 1px solid #283457;
+  color: #bb9af7;
+}
+
+#thinking-overlay header > :last-child {
+  color: #565f89;
+}
+
+#thinking-overlay-content {
+  min-height: 0;
+  overflow: hidden;
+  margin: 0;
+  padding: 7px 9px 9px;
+  color: #a9b1d6;
+  font: inherit;
+  overflow-wrap: anywhere;
+  white-space: pre-wrap;
 }
 
 #neovim-view {

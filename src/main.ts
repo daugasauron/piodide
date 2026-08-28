@@ -31,6 +31,7 @@ import {
 import { BrowserSessions, type BrowserSession } from "./browser-sessions.ts";
 import { deleteKittyImages, renderKittyImage } from "./kitty-image.ts";
 import { AssistantMarkdown } from "./markdown.ts";
+import { ThinkingOverlay } from "./thinking-overlay.ts";
 import { makeModel } from "./model.ts";
 import { streamDispatch } from "./stream.ts";
 import {
@@ -226,6 +227,10 @@ const COMMANDS: readonly CommandSuggestion[] = [
 /* ------------------------------------------------------------------ */
 
 const mount = document.getElementById("terminal") as HTMLElement;
+const thinkingOverlayEl = document.getElementById("thinking-overlay") as HTMLElement;
+const thinkingOverlayContentEl = document.getElementById(
+  "thinking-overlay-content",
+) as HTMLElement;
 const agentViewEl = document.getElementById("agent-view") as HTMLElement;
 const slopViewEl = document.getElementById("slop-view") as HTMLElement;
 const slopMountEl = document.getElementById("slop-terminal") as HTMLElement;
@@ -271,6 +276,10 @@ let prompt!: PromptLine;
 let mobileCommands!: MobileCommandUi;
 let markdown!: AssistantMarkdown;
 let spinner!: Spinner;
+const thinkingOverlay = new ThinkingOverlay(
+  thinkingOverlayEl,
+  thinkingOverlayContentEl,
+);
 
 let agent: Agent | null = null;
 let py: Pyodide | null = null;
@@ -294,7 +303,7 @@ let inputHandler: (data: string) => void = (data) => prompt.feed(data);
 let gitHubCredentials: GitHubCredentials | null = null;
 let modelOverride: string | null = null;
 const selectedLocalModels = new Map<string, string>();
-let assistantTraceSection: "thinking" | "answer" | "tool" | null = null;
+let assistantTraceSection: "answer" | "tool" | null = null;
 const sessions = new BrowserSessions();
 
 /* ------------------------------------------------------------------ */
@@ -2333,12 +2342,10 @@ function printCapped(text: string, maxLines: number) {
   for (const line of lines) writer.writeln(dim(`    ${line}`));
 }
 
-function beginAssistantTraceSection(section: "thinking" | "answer" | "tool") {
+function beginAssistantTraceSection(section: "answer" | "tool") {
   if (assistantTraceSection === section) return;
   markdown.finish();
   writer.ensureNewline();
-  if (section === "thinking") writer.writeln(magenta("  ◇ thinking"));
-  else if (section === "answer") writer.writeln(green("  ◆ answer"));
   assistantTraceSection = section;
 }
 
@@ -2347,6 +2354,7 @@ async function renderEvent(event: AgentEvent) {
     case "agent_start":
       prompt.setBusy(true);
       markdown.reset();
+      thinkingOverlay.clear();
       assistantTraceSection = null;
       spinner.start();
       break;
@@ -2354,10 +2362,14 @@ async function renderEvent(event: AgentEvent) {
     case "message_start":
       if (event.message.role === "assistant") spinner.stop();
       markdown.reset();
-      if (event.message.role === "assistant") assistantTraceSection = null;
+      if (event.message.role === "assistant") {
+        thinkingOverlay.clear();
+        assistantTraceSection = null;
+      }
       break;
 
     case "message_end": {
+      thinkingOverlay.clear();
       markdown.finish();
       // Streamed text already went out via text_delta; only surface failures
       // here (errors/aborts are not streamed as text deltas).
@@ -2375,17 +2387,18 @@ async function renderEvent(event: AgentEvent) {
       spinner.stop();
       const e = event.assistantMessageEvent;
       if (e.type === "text_delta") {
+        thinkingOverlay.clear();
         beginAssistantTraceSection("answer");
-        markdown.push("text", e.delta);
+        markdown.push(e.delta);
       } else if (e.type === "thinking_delta") {
-        beginAssistantTraceSection("thinking");
-        markdown.push("thinking", e.delta);
+        thinkingOverlay.append(e.delta);
       }
       break;
     }
 
     case "tool_execution_start": {
       spinner.stop();
+      thinkingOverlay.clear();
       beginAssistantTraceSection("tool");
       writer.ensureNewline();
       if (event.toolName === "slop") {
@@ -2504,6 +2517,7 @@ async function renderEvent(event: AgentEvent) {
 
     case "agent_end":
       spinner.stop();
+      thinkingOverlay.clear();
       markdown.finish();
       writer.ensureNewline();
       prompt.setBusy(false);
