@@ -1,0 +1,75 @@
+import assert from "node:assert/strict";
+import test from "node:test";
+
+import {
+  formatSubmittedPrompt,
+  PromptLine,
+  type TermWriter,
+} from "../src/termui.ts";
+
+const ANSI = /\x1b\[[0-9;]*m/g;
+
+function captureWriter(columns = 24) {
+  const writes: string[] = [];
+  const lines: string[] = [];
+  const writer: TermWriter = {
+    cols: columns,
+    rows: 20,
+    write(value) {
+      writes.push(value);
+    },
+    writeln(value) {
+      lines.push(value);
+    },
+    ensureNewline() {},
+    replaceCurrentLine() {},
+    clearPreviousLines() {},
+    setCursorVisible() {},
+  };
+  return { writer, writes, lines };
+}
+
+test("submitted prompts use the app palette and wrap inside one background block", () => {
+  const lines = formatSubmittedPrompt("abcdefghijklmnopqrst", 24);
+
+  assert.equal(lines.length, 2);
+  assert.ok(lines.every((line) => line.includes("\x1b[48;2;40;52;87m")));
+  assert.equal(lines[0].replace(ANSI, ""), "   YOU  abcdefghijklmn");
+  assert.equal(lines[1].replace(ANSI, ""), "        opqrst        ");
+
+  const prose = formatSubmittedPrompt("model setup works", 20)
+    .map((line) => line.replace(ANSI, "").slice(8).trim());
+  assert.deepEqual(prose, ["model", "setup", "works"]);
+});
+
+test("the main prompt highlights conversation but leaves slash commands plain", () => {
+  const submitted: string[] = [];
+  const conversation = captureWriter();
+  const prompt = new PromptLine({
+    writer: conversation.writer,
+    onSubmit: (value) => submitted.push(value),
+    onAbort() {},
+    highlightSubmitted: (value) => !value.startsWith("/"),
+  });
+
+  prompt.start();
+  prompt.feed("explain this\r");
+
+  assert.deepEqual(submitted, ["explain this"]);
+  assert.equal(conversation.lines.length, 1);
+  assert.match(conversation.lines[0], /\x1b\[48;2;40;52;87m/);
+  assert.match(conversation.lines[0].replace(ANSI, ""), /YOU  explain this/);
+
+  const command = captureWriter();
+  const commandPrompt = new PromptLine({
+    writer: command.writer,
+    onSubmit() {},
+    onAbort() {},
+    highlightSubmitted: (value) => !value.startsWith("/"),
+  });
+  commandPrompt.start();
+  commandPrompt.feed("/status\r");
+
+  assert.deepEqual(command.lines, [""]);
+  assert.doesNotMatch(command.writes.join(""), /\x1b\[48;2;40;52;87m/);
+});

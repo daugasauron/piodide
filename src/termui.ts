@@ -14,6 +14,9 @@ const DIM = "\x1b[2m";
 const CYAN = "\x1b[36m";
 const MAGENTA = "\x1b[35m";
 const GREEN = "\x1b[32m";
+const USER_PROMPT_BACKGROUND = "\x1b[48;2;40;52;87m";
+const USER_PROMPT_LABEL = "\x1b[38;2;200;163;255m";
+const USER_PROMPT_TEXT = "\x1b[38;2;192;202;245m";
 const SPINNER_FRAMES = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 let terminalInitPromise: Promise<void> | null = null;
 
@@ -388,6 +391,7 @@ export interface PromptOptions {
   writer: TermWriter;
   onSubmit: (text: string) => void;
   onAbort: () => void;
+  highlightSubmitted?: (text: string) => boolean;
   onCycleThinking?: () => void;
   commands?: readonly CommandSuggestion[];
   commandMenu?: HTMLElement;
@@ -655,6 +659,15 @@ export class PromptLine {
       w.write("\r");
       if (this.prefixVisible > 0) w.write(`\x1b[${this.prefixVisible}C`);
       w.write("\x1b[K\r\n");
+    } else if (
+      value.trim().length > 0 &&
+      !reading &&
+      this.opts.highlightSubmitted?.(value)
+    ) {
+      this.replaceWithSubmittedPrompt(value);
+      if (this.history[this.history.length - 1] !== value) {
+        this.history.push(value);
+      }
     } else {
       const back = this.text.length - this.pos;
       if (back > 0) this.opts.writer.write(`\x1b[${back}C`);
@@ -677,6 +690,18 @@ export class PromptLine {
       reading(value);
     } else {
       this.opts.onSubmit(value);
+    }
+  }
+
+  private replaceWithSubmittedPrompt(value: string) {
+    const cols = Math.max(1, this.opts.writer.cols);
+    const beforeCursor = this.text.slice(0, this.pos);
+    const cursorCells = this.prefixVisible + stringWidth(beforeCursor);
+    const cursorRow = Math.max(0, Math.ceil(cursorCells / cols) - 1);
+    const clear = `${cursorRow > 0 ? `\x1b[${cursorRow}A` : ""}\r\x1b[J`;
+    this.opts.writer.write(clear);
+    for (const line of formatSubmittedPrompt(value, cols)) {
+      this.opts.writer.writeln(line);
     }
   }
 
@@ -1045,6 +1070,65 @@ export class PromptLine {
     menu.hidden = true;
     menu.replaceChildren();
   }
+}
+
+/** Render a submitted conversational prompt as a stable transcript block. */
+export function formatSubmittedPrompt(value: string, columns: number): string[] {
+  const cols = Math.max(1, Math.floor(columns));
+  const marginWidth = cols >= 16 ? 2 : 0;
+  const blockWidth = Math.max(1, cols - marginWidth * 2);
+  const label = blockWidth >= 8 ? " YOU  " : "";
+  const labelWidth = stringWidth(label);
+  const contentWidth = Math.max(1, blockWidth - labelWidth);
+  const chunks = wrapCells(value, contentWidth);
+  const margin = " ".repeat(marginWidth);
+
+  return chunks.map((chunk, index) => {
+    const lead = index === 0 ? label : " ".repeat(labelWidth);
+    const padding = " ".repeat(
+      Math.max(0, blockWidth - labelWidth - stringWidth(chunk)),
+    );
+    const styledLead = index === 0 && label
+      ? `${BOLD}${USER_PROMPT_LABEL}${lead}\x1b[22m${USER_PROMPT_TEXT}`
+      : `${USER_PROMPT_TEXT}${lead}`;
+    return `${margin}${USER_PROMPT_BACKGROUND}${styledLead}${chunk}${padding}${RESET}`;
+  });
+}
+
+function wrapCells(value: string, maxWidth: number): string[] {
+  const lines: string[] = [];
+  for (const paragraph of value.split("\n")) {
+    let remaining = paragraph;
+    if (!remaining) {
+      lines.push("");
+      continue;
+    }
+    while (stringWidth(remaining) > maxWidth) {
+      let prefix = "";
+      let prefixWidth = 0;
+      let consumed = 0;
+      let lastBreak = -1;
+      for (const character of remaining) {
+        const characterWidth = stringWidth(character);
+        if (prefixWidth > 0 && prefixWidth + characterWidth > maxWidth) break;
+        prefix += character;
+        prefixWidth += characterWidth;
+        consumed += character.length;
+        if (/\s/u.test(character)) lastBreak = consumed;
+      }
+      const splitAt = lastBreak > 0 ? lastBreak : consumed;
+      const line = remaining.slice(0, splitAt).trimEnd();
+      if (!line) {
+        lines.push(prefix);
+        remaining = remaining.slice(consumed);
+      } else {
+        lines.push(line);
+        remaining = remaining.slice(splitAt).trimStart();
+      }
+    }
+    lines.push(remaining);
+  }
+  return lines.length > 0 ? lines : [""];
 }
 
 function truncateCells(value: string, maxWidth: number): string {

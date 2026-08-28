@@ -2671,6 +2671,7 @@ async function main() {
     writer,
     onSubmit,
     onAbort,
+    highlightSubmitted: (text) => !text.trimStart().startsWith("/"),
     onCycleThinking: cycleThinkingLevel,
     commands: COMMANDS,
     commandMenu: commandMenuEl,
