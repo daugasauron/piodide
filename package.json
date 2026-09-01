@@ -21,22 +21,22 @@
     "test:fetch-toolchain": "node scripts/fetch-toolchain-assets.mjs"
   },
   "devDependencies": {
-    "pyodide": "^314.0.3",
+    "pyodide": "^314.0.6",
     "typescript": "~6.0.2",
-    "vite": "^8.1.1"
+    "vite": "^8.2.2"
   },
   "dependencies": {
-    "@earendil-works/pi-agent-core": "^0.81.1",
-    "@earendil-works/pi-ai": "^0.81.1",
+    "@earendil-works/pi-agent-core": "^0.84.4",
+    "@earendil-works/pi-ai": "^0.84.4",
     "@mlc-ai/web-llm": "^0.2.84",
     "@monaco-neovim-wasm/wasm-async": "0.1.28",
-    "@wllama/wllama": "3.5.1",
-    "@wllama/wllama-compat": "3.5.1",
+    "@wllama/wllama": "3.6.1",
+    "@wllama/wllama-compat": "3.6.1",
     "buffer": "6.0.3",
     "ghostty-web": "https://github.com/NimbleMarkets/ghostty-web/archive/20b270562b6829dc05d3478b7c83feb2a3054713.tar.gz",
-    "isomorphic-git": "1.40.0",
-    "markdansi": "^0.3.2",
-    "monaco-editor": "0.55.1",
+    "isomorphic-git": "1.41.9",
+    "markdansi": "^0.3.3",
+    "monaco-editor": "0.56.0",
     "string-width": "^8.2.2",
     "typebox": "^1.1.38",
     "wasm-git": "0.0.17"
