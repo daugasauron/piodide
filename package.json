@@ -23,7 +23,7 @@
   "devDependencies": {
     "pyodide": "^314.0.3",
     "typescript": "~6.0.2",
-    "vite": "^8.1.1"
+    "vite": "^8.1.6"
   },
   "dependencies": {
     "@earendil-works/pi-agent-core": "^0.81.1",
